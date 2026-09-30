@@ -233,13 +233,8 @@ EOF
 # master so kubeadm stores the control-plane certs and joins stacked etcd.
 write_kubeadm_join_conf() {
 	mkdir -p /etc/zek
-	local control_plane=""
 	if [ "${1:-worker}" = control-plane ]; then
-		control_plane="controlPlane:
-  certificateKey: ${JOIN_CERT_KEY}
-"
-	fi
-	cat >"$KUBEADM_JOIN_CONF" <<EOF
+		cat >"$KUBEADM_JOIN_CONF" <<EOF
 apiVersion: ${KUBEADM_API_VERSION}
 kind: JoinConfiguration
 discovery:
@@ -248,10 +243,27 @@ discovery:
     apiServerEndpoint: ${API_ENDPOINT}
     caCertHashes:
       - sha256:${CA_HASH}
-${control_plane}nodeRegistration:
+controlPlane:
+  certificateKey: ${JOIN_CERT_KEY}
+nodeRegistration:
   name: ${NODENAME}
   criSocket: unix:///run/containerd/containerd.sock
 EOF
+	else
+		cat >"$KUBEADM_JOIN_CONF" <<EOF
+apiVersion: ${KUBEADM_API_VERSION}
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    token: ${TOKEN}
+    apiServerEndpoint: ${API_ENDPOINT}
+    caCertHashes:
+      - sha256:${CA_HASH}
+nodeRegistration:
+  name: ${NODENAME}
+  criSocket: unix:///run/containerd/containerd.sock
+EOF
+	fi
 }
 
 patch_kube_proxy() {
