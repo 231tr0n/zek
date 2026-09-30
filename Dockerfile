@@ -6,6 +6,7 @@ ARG TARGETARCH
 
 RUN apk add --no-cache \
     bash ca-certificates containerd containerd-ctr runc cni-plugins iptables ip6tables nftables cri-tools \
+    haproxy \
     gcompat \
     coreutils findutils grep gawk sed diffutils \
     procps-ng \
