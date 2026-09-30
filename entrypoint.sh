@@ -27,7 +27,7 @@
 set -euo pipefail
 
 readonly CLUSTER_DIR="${CLUSTER_DIR:-/etc/cluster}"
-readonly NODENAME="${NODE_NAME:-$(hostname)}"
+readonly NODE_NAME="${NODE_NAME:-$(hostname)}"
 readonly POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 readonly KUBELET_CONFIG=/var/lib/kubelet/config.yaml
 readonly KUBEADM_FLAGS=/var/lib/kubelet/kubeadm-flags.env
@@ -93,9 +93,9 @@ preflight_host() {
 	# for the whole host (best effort, kept on purpose after exit: the
 	# other zek containers still need it).
 	if [ -w /proc/sys/fs/inotify/max_user_instances ]; then
-		local cur
-		cur="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"
-		{ [ "$cur" -ge 1024 ] || sysctl -w fs.inotify.max_user_instances=1024; } 2>/dev/null || true
+		local limit
+		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"
+		{ [ "$limit" -ge 1024 ] || sysctl -w fs.inotify.max_user_instances=1024; } 2>/dev/null || true
 	fi
 }
 
@@ -175,10 +175,11 @@ import_k8s_images() {
 		return 0
 	fi
 	log "importing preloaded kubeadm images"
-	local t
-	for t in /opt/zek/images/*.tar; do
-		[ -e "$t" ] || continue
-		ctr --namespace k8s.io images import --no-unpack "$t" >/dev/null 2>&1 || log "WARNING: failed to import $t"
+	local tarball
+	for tarball in /opt/zek/images/*.tar; do
+		[ -e "$tarball" ] || continue
+		ctr --namespace k8s.io images import --no-unpack "$tarball" >/dev/null 2>&1 ||
+			log "WARNING: failed to import $tarball"
 	done
 }
 
@@ -209,7 +210,7 @@ localAPIEndpoint:
   advertiseAddress: $(master_ip)
   bindPort: 6443
 nodeRegistration:
-  name: ${NODENAME}
+  name: ${NODE_NAME}
   criSocket: unix:///run/containerd/containerd.sock
 ---
 apiVersion: ${KUBEADM_API_VERSION}
@@ -246,7 +247,7 @@ discovery:
 controlPlane:
   certificateKey: ${JOIN_CERT_KEY}
 nodeRegistration:
-  name: ${NODENAME}
+  name: ${NODE_NAME}
   criSocket: unix:///run/containerd/containerd.sock
 EOF
 	else
@@ -260,7 +261,7 @@ discovery:
     caCertHashes:
       - sha256:${CA_HASH}
 nodeRegistration:
-  name: ${NODENAME}
+  name: ${NODE_NAME}
   criSocket: unix:///run/containerd/containerd.sock
 EOF
 	fi
@@ -310,11 +311,11 @@ kubelet_supervisor() {
 				# Drop any deprecated CLI copy kubeadm may still ship
 				# in KUBELET_KUBEADM_ARGS; the config file carries
 				# the setting now.
-				local a
-				for a in ${KUBELET_KUBEADM_ARGS:-}; do
-					case "$a" in
+				local flag
+				for flag in ${KUBELET_KUBEADM_ARGS:-}; do
+					case "$flag" in
 					--fail-swap-on | --fail-swap-on=*) ;;
-					*) args="$args $a" ;;
+					*) args="$args $flag" ;;
 					esac
 				done
 			fi
@@ -323,7 +324,7 @@ kubelet_supervisor() {
 			elif [ -f /etc/kubernetes/kubelet.conf ]; then
 				args="$args --kubeconfig=/etc/kubernetes/kubelet.conf"
 			fi
-			kubelet --config "$KUBELET_CONFIG" --hostname-override "$NODENAME" \
+			kubelet --config "$KUBELET_CONFIG" --hostname-override "$NODE_NAME" \
 				--v=2 $args &
 			local pid=$!
 			log "kubelet running (pid $pid)"
@@ -380,11 +381,11 @@ node_setup() {
 # it is missing). The token and upload-certs both need a serving API, so
 # they are retried briefly.
 publish_cluster_credentials() {
-	local token="" cert_key="" hash uploaded i
+	local token="" cert_key="" ca_hash uploaded i
 	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
 	mkdir -p "$CLUSTER_DIR"
 	[ -n "${KUBECONFIG:-}" ] || export KUBECONFIG=/etc/kubernetes/admin.conf
-	hash="$(ca_hash)"
+	ca_hash="$(ca_hash)"
 	# Generate the certificate key ourselves and pass it to upload-certs
 	# instead of scraping it from kubeadm's human-readable output - that
 	# wording changed between releases before (v1.37 moved it to its own
@@ -399,12 +400,12 @@ publish_cluster_credentials() {
 		[ -n "$token" ] && [ -n "$uploaded" ] && break
 		sleep 2
 	done
-	[ -n "$token" ] && [ -n "$uploaded" ] && [ -n "$hash" ] ||
+	[ -n "$token" ] && [ -n "$uploaded" ] && [ -n "$ca_hash" ] ||
 		die "could not extract the join credentials (token/certificate key/CA hash)"
 	printf '%s' "$token" >"$CLUSTER_DIR/token"
 	printf '%s' "$cert_key" >"$CLUSTER_DIR/cert-key"
 	echo "$API_ENDPOINT" >"$CLUSTER_DIR/api-endpoint"
-	printf '%s' "$hash" >"$CLUSTER_DIR/ca-hash"
+	printf '%s' "$ca_hash" >"$CLUSTER_DIR/ca-hash"
 	cp /etc/kubernetes/admin.conf "$CLUSTER_DIR/admin.conf"
 	log "published join credentials to $CLUSTER_DIR (endpoint: ${API_ENDPOINT})"
 }
@@ -415,7 +416,7 @@ init_control_plane() {
 	local ip_addr
 	ip_addr="$(master_ip)"
 	API_ENDPOINT="${API_ENDPOINT:-${ip_addr}:6443}"
-	log "initializing control plane on ${NODENAME} (${ip_addr})"
+	log "initializing control plane on ${NODE_NAME} (${ip_addr})"
 	mkdir -p "$CLUSTER_DIR"
 	import_k8s_images
 	write_kubeadm_init_conf
@@ -439,7 +440,7 @@ join_control_plane() {
 	TOKEN="$JOIN_TOKEN"
 	CA_HASH="$JOIN_CA_HASH"
 	API_ENDPOINT="$JOIN_API_ENDPOINT"
-	log "joining ${NODENAME} as a control-plane node via ${API_ENDPOINT}"
+	log "joining ${NODE_NAME} as a control-plane node via ${API_ENDPOINT}"
 	import_k8s_images
 	write_kubeadm_join_conf control-plane
 	kubeadm join --config "$KUBEADM_JOIN_CONF" --ignore-preflight-errors=all || die "control-plane join failed"
@@ -495,7 +496,7 @@ run_worker() {
 		TOKEN="$JOIN_TOKEN"
 		CA_HASH="$JOIN_CA_HASH"
 		API_ENDPOINT="$JOIN_API_ENDPOINT"
-		log "joining ${NODENAME} to ${API_ENDPOINT}"
+		log "joining ${NODE_NAME} to ${API_ENDPOINT}"
 		import_k8s_images
 		write_kubeadm_join_conf worker
 		kubeadm join --config "$KUBEADM_JOIN_CONF" --ignore-preflight-errors=all || die "kubeadm join failed"
@@ -510,7 +511,7 @@ run_worker() {
 # taken out of rotation. The stats page on :8404 shows backend state.
 run_lb() {
 	[ -n "${LB_BACKENDS:-}" ] || die "LB_BACKENDS must list the control-plane IPs"
-	local out=/etc/haproxy/haproxy.cfg i=1 ip
+	local cfg=/etc/haproxy/haproxy.cfg i=1 ip
 	mkdir -p /etc/haproxy
 	{
 		cat <<'EOF'
@@ -546,9 +547,9 @@ frontend stats
 	stats enable
 	stats uri /
 EOF
-	} >"$out"
+	} >"$cfg"
 	log "load balancer for: $LB_BACKENDS"
-	exec haproxy -f "$out"
+	exec haproxy -f "$cfg"
 }
 
 run_kubectl() {

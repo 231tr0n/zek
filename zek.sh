@@ -77,7 +77,7 @@ IMAGE="${ZEK_IMAGE:-zek:latest}"
 NET_NAME="${CLUSTER}-net"
 MASTER_NAME="${CLUSTER}-master-1"
 LB_NAME="${CLUSTER}-lb"
-WORKER_COUNT="${ZEK_NODES:-1}"
+DEFAULT_WORKERS="${ZEK_NODES:-1}"
 
 NODE_ARGS=(
 	--privileged --cgroupns=host
@@ -189,22 +189,22 @@ wait_for_nodes() {
 # handed to joining nodes as env vars. The files appear a moment after the
 # API starts answering, so wait for them.
 read_join_credentials() {
-	local token="" ca="" ep="" key="" deadline=$((SECONDS + WAIT_TIMEOUT))
+	local token="" ca_hash="" endpoint="" cert_key="" deadline=$((SECONDS + WAIT_TIMEOUT))
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		token="$(docker exec "$MASTER_NAME" cat /etc/cluster/token 2>/dev/null)" &&
-			ca="$(docker exec "$MASTER_NAME" cat /etc/cluster/ca-hash 2>/dev/null)" &&
-			ep="$(docker exec "$MASTER_NAME" cat /etc/cluster/api-endpoint 2>/dev/null)" &&
-			key="$(docker exec "$MASTER_NAME" cat /etc/cluster/cert-key 2>/dev/null)" &&
+			ca_hash="$(docker exec "$MASTER_NAME" cat /etc/cluster/ca-hash 2>/dev/null)" &&
+			endpoint="$(docker exec "$MASTER_NAME" cat /etc/cluster/api-endpoint 2>/dev/null)" &&
+			cert_key="$(docker exec "$MASTER_NAME" cat /etc/cluster/cert-key 2>/dev/null)" &&
 			break
 		sleep 2
 	done
-	[ -n "$token" ] && [ -n "$ca" ] && [ -n "$ep" ] && [ -n "$key" ] ||
+	[ -n "$token" ] && [ -n "$ca_hash" ] && [ -n "$endpoint" ] && [ -n "$cert_key" ] ||
 		die "join credentials not published by $MASTER_NAME after ${WAIT_TIMEOUT}s"
 	CRED_ARGS=(
 		--env "JOIN_TOKEN=$token"
-		--env "JOIN_CA_HASH=$ca"
-		--env "JOIN_API_ENDPOINT=$ep"
-		--env "JOIN_CERT_KEY=$key"
+		--env "JOIN_CA_HASH=$ca_hash"
+		--env "JOIN_API_ENDPOINT=$endpoint"
+		--env "JOIN_CERT_KEY=$cert_key"
 	)
 }
 
@@ -219,9 +219,9 @@ create_cluster() {
 	local workers="$1" masters="$2"
 
 	NET_SUBNET="$(pick_subnet)"
-	local prefix="${NET_SUBNET%.*}"
-	MASTER_IP="${ZEK_MASTER_IP:-${prefix}.2}"
-	local lb_ip="${prefix}.10"
+	local subnet_prefix="${NET_SUBNET%.*}"
+	MASTER_IP="${ZEK_MASTER_IP:-${subnet_prefix}.2}"
+	local lb_ip="${subnet_prefix}.10"
 	ensure_net "$NET_SUBNET"
 
 	local endpoint="${MASTER_IP}:6443" i backends=""
@@ -260,12 +260,12 @@ create_cluster() {
 # when the requested sizes differ from what was created.
 restart_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
-	local have_m have_w
-	have_m="$(count_masters)"
-	have_w="$(count_workers)"
-	if { [ "$workers_set" = 1 ] && [ "$workers" != "$have_w" ]; } ||
-		{ [ "$masters_set" = 1 ] && [ "$masters" != "$have_m" ]; }; then
-		log "cluster $CLUSTER already exists with $have_m master(s) and $have_w worker(s); topology is fixed, ignoring --masters/--workers"
+	local have_masters have_workers
+	have_masters="$(count_masters)"
+	have_workers="$(count_workers)"
+	if { [ "$workers_set" = 1 ] && [ "$workers" != "$have_workers" ]; } ||
+		{ [ "$masters_set" = 1 ] && [ "$masters" != "$have_masters" ]; }; then
+		log "cluster $CLUSTER already exists with $have_masters master(s) and $have_workers worker(s); topology is fixed, ignoring --masters/--workers"
 	fi
 
 	log "restarting cluster $CLUSTER"
@@ -288,8 +288,8 @@ restart_cluster() {
 	done < <(worker_names)
 
 	wait_for_cluster_conf
-	wait_for_nodes "$((have_m + have_w))"
-	log "cluster $CLUSTER up: $have_m master(s) + $have_w worker(s). Nodes report NotReady until you install a CNI."
+	wait_for_nodes "$((have_masters + have_workers))"
+	log "cluster $CLUSTER up: $have_masters master(s) + $have_workers worker(s). Nodes report NotReady until you install a CNI."
 }
 
 cmd_up() {
@@ -329,7 +329,7 @@ cmd_up() {
 	[ -z "$workers" ] || [[ "$workers" =~ ^[0-9]+$ ]] || die "--workers must be a number"
 	[ -z "$masters" ] || { [[ "$masters" =~ ^[0-9]+$ ]] && [ "$masters" -ge 1 ]; } ||
 		die "--masters must be a number >= 1"
-	workers="${workers:-$WORKER_COUNT}"
+	workers="${workers:-$DEFAULT_WORKERS}"
 	masters="${masters:-1}"
 
 	if node_exists "$MASTER_NAME"; then
