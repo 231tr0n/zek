@@ -31,8 +31,9 @@ done
 # containerd (apk) starts fine unprivileged; content fetch + export are plain
 # file operations, so no unpacking/mounting happens inside this build step.
 mkdir -p /opt/zek/images
-# Minimal config for the build-time image preload only; entrypoint.sh regenerates
-# the full config at runtime, so we only need the native snapshotter here.
+# Minimal config for the build-time image preload only; at runtime
+# entrypoint.sh reuses this file and applies its own tweaks (CNI bin_dirs,
+# native unpack_config) on top, so only the snapshotter matters here.
 containerd config default >/etc/containerd/config.toml
 sed -i "s|^\([[:space:]]*snapshotter = \).*|\1'native'|" /etc/containerd/config.toml
 containerd >/dev/null 2>&1 &

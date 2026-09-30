@@ -17,8 +17,9 @@
 #   ./zek.sh [-c NAME] [-t SECONDS] up [--workers N] [--masters M]
 #                               first run: create the cluster with N workers
 #                               (default 1) and M masters (default 1; M>1
-#                               starts the HA load balancer). Later runs just
-#                               restart the existing nodes.
+#                               starts the HA load balancer). A bare number
+#                               (up 2) is a shorthand for --workers 2. Later
+#                               runs just restart the existing nodes.
 #   ./zek.sh [-c NAME] [-t SECONDS] down
 #                               stop every node container (state is kept)
 #   ./zek.sh [-c NAME] clean <name>
@@ -274,7 +275,7 @@ restart_cluster() {
 	fi
 	local i=1 name
 	while :; do
-		if [ "$i" -eq 1 ]; then name="$MASTER_NAME"; else name="${CLUSTER}-master-$i"; fi
+		name="${CLUSTER}-master-$i"
 		node_exists "$name" || break
 		log "starting $name"
 		docker start "$name" >/dev/null

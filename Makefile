@@ -15,21 +15,24 @@ TAG       := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-$(BUILD_ID)
 # scripts can pin the combo without tracking the git-based BUILD_ID.
 COMBO_TAG := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-latest
 
+# Shared build+tag recipe; $(1) is extra docker build flags (build-nocache
+# passes --no-cache to force the image preload step to re-run).
+
 .PHONY: build build-nocache help
 
-build: ## Build + tag $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
-	$(DOCKER) build -t $(IMAGE):$(TAG) \
+define build_image
+	$(DOCKER) build $(1) -t $(IMAGE):$(TAG) \
 	--build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
 	--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) .
 	$(DOCKER) tag $(IMAGE):$(TAG) $(IMAGE):latest
 	$(DOCKER) tag $(IMAGE):$(TAG) $(IMAGE):$(COMBO_TAG)
+endef
+
+build: ## Build + tag $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
+	$(call build_image,)
 
 build-nocache: ## Build, forcing the image preload step to re-run
-	$(DOCKER) build --no-cache -t $(IMAGE):$(TAG) \
-	--build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
-	--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) .
-	$(DOCKER) tag $(IMAGE):$(TAG) $(IMAGE):latest
-	$(DOCKER) tag $(IMAGE):$(TAG) $(IMAGE):$(COMBO_TAG)
+	$(call build_image,--no-cache)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'

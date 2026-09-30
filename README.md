@@ -35,6 +35,33 @@ docker build --build-arg ALPINE_VERSION=3.24.1 \
   --build-arg KUBERNETES_VERSION=v1.37.0 -t zek:latest .
 ```
 
+## Upgrading Kubernetes
+
+Versions are pinned in the Makefile (`KUBERNETES_VERSION`,
+`ALPINE_VERSION`); bump them and `make build` fetches the new binaries and
+preloads the matching kubeadm images. A few release-coupled spots cannot be
+updated by the build — check them when the bump fails or behaves oddly:
+
+- `KUBEADM_API_VERSION` in `entrypoint.sh` — the API version of the
+  generated kubeadm init/join configs (`kubeadm.k8s.io/v1beta4`, current
+  for kubeadm 1.31–1.37). kubeadm drops old config API versions after a
+  few releases; init/join then fail with an unsupported-apiVersion error.
+- `kubelet.config.k8s.io/v1beta1` in the same heredoc — the kubelet config
+  API, stable for years; just re-check on a major bump.
+- Two soft couplings break without failing the build: the kube-proxy
+  conntrack keys patched in `patch_kube_proxy`, and containerd's
+  `bin_dirs`/`unpack_config` tweaks in `start_containerd`. If a new release
+  renames those knobs the cluster still comes up, but the workaround stops
+  applying — verify your workload if you see the old symptoms again.
+- kubeadm/kubelet are glibc builds run through `gcompat` on Alpine; a
+  release needing newer glibc symbols fails loudly at startup in the node
+  logs (rebuild is the fix).
+
+Smoke-test the bump end-to-end with
+`./zek.sh up --masters 2 --workers 1`: it exercises `kubeadm init`, a
+control-plane join (certificate key), a worker join and the published
+credentials in one run.
+
 ## Quick start
 
 ```sh
@@ -47,9 +74,10 @@ docker build --build-arg ALPINE_VERSION=3.24.1 \
 ```
 
 `up [--workers N] [--masters M]` creates the cluster on the first run
-(defaults: 1 worker, 1 master). On later runs the size flags are ignored —
-the topology was fixed at creation — and a warning is printed if they differ
-from what exists.
+(defaults: 1 worker, 1 master; a bare number — `up 2` — is a shorthand for
+`--workers 2`). On later runs the size flags are ignored — the topology was
+fixed at creation — and a warning is printed if they differ from what
+exists.
 
 Every wait in zek.sh is bounded by `-t/--timeout SECONDS` (default 600,
 override with `ZEK_TIMEOUT`), so a broken cluster fails fast instead of
@@ -102,8 +130,9 @@ haproxy at `<subnet>.10`:
   control-plane static pods (leader-elected, so one active scheduler /
   controller-manager, N apiservers).
 - additional masters join with `kubeadm join --control-plane` using a
-  certificate key published by the first master (re-uploaded on every `up`,
-  valid for 2h — joiners are always started right after creation).
+  certificate key the first master generates and publishes when the
+  cluster is created — joiners start immediately after, while the
+  uploaded certificates are fresh.
 
 Use **odd** master counts: etcd needs a majority to stay writable. 1 master
 has no redundancy, 2 masters lose quorum if either fails, 3 masters survive
