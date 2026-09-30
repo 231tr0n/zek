@@ -273,6 +273,17 @@ patch_kube_proxy() {
 	kubectl -n kube-system rollout restart daemonset kube-proxy >/dev/null 2>&1 || true
 }
 
+# failSwapOn belongs in the kubelet config file: the --fail-swap-on CLI flag
+# is deprecated and will eventually disappear. kubeadm owns config.yaml, so
+# enforce the key here right before every kubelet start - that covers init,
+# resume and all join paths regardless of what kubeadm's defaults write.
+ensure_kubelet_config() {
+	[ -f "$KUBELET_CONFIG" ] || return 0
+	sed -i 's/^failSwapOn:[[:space:]]*.*/failSwapOn: false/' "$KUBELET_CONFIG"
+	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "$KUBELET_CONFIG" && return 0
+	printf '\nfailSwapOn: false\n' >>"$KUBELET_CONFIG"
+}
+
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config
 # and flags file, and without systemd we feed the kubeconfig args ourselves.
 # config.yaml appearing marks kubeadm init/join as done; init does not put
@@ -281,10 +292,20 @@ kubelet_supervisor() {
 	trap 'exit 0' TERM INT
 	while :; do
 		if [ -f "$KUBELET_CONFIG" ]; then
+			ensure_kubelet_config
 			local args=""
 			if [ -f "$KUBEADM_FLAGS" ]; then
 				source "$KUBEADM_FLAGS"
-				args="${KUBELET_KUBEADM_ARGS:-}"
+				# Drop any deprecated CLI copy kubeadm may still ship
+				# in KUBELET_KUBEADM_ARGS; the config file carries
+				# the setting now.
+				local a
+				for a in ${KUBELET_KUBEADM_ARGS:-}; do
+					case "$a" in
+					--fail-swap-on | --fail-swap-on=*) ;;
+					*) args="$args $a" ;;
+					esac
+				done
 			fi
 			if [ -f /etc/kubernetes/bootstrap-kubelet.conf ]; then
 				args="$args --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
@@ -292,7 +313,7 @@ kubelet_supervisor() {
 				args="$args --kubeconfig=/etc/kubernetes/kubelet.conf"
 			fi
 			kubelet --config "$KUBELET_CONFIG" --hostname-override "$NODENAME" \
-				--fail-swap-on=false --v=2 $args &
+				--v=2 $args &
 			local pid=$!
 			log "kubelet running (pid $pid)"
 			wait "$pid" 2>/dev/null || true
