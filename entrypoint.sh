@@ -345,23 +345,29 @@ node_setup() {
 # nodes. Everything is extracted first and written only once all of it is
 # known, so a failure cannot leave a half-published set behind; admin.conf
 # goes last and marks the set as complete (the resume path republishes when
-# it is missing). upload-certs needs a serving API, so both API-dependent
-# extractions are retried briefly.
+# it is missing). The token and upload-certs both need a serving API, so
+# they are retried briefly.
 publish_cluster_credentials() {
-	local token="" cert_key="" hash i
+	local token="" cert_key="" hash uploaded i
 	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
 	mkdir -p "$CLUSTER_DIR"
 	[ -n "${KUBECONFIG:-}" ] || export KUBECONFIG=/etc/kubernetes/admin.conf
 	hash="$(ca_hash)"
+	# Generate the certificate key ourselves and pass it to upload-certs
+	# instead of scraping it from kubeadm's human-readable output - that
+	# wording changed between releases before (v1.37 moved it to its own
+	# line) and would break extraction again. The key is a hex-encoded
+	# 32-byte AES key, so 64 hex characters.
+	cert_key="$(openssl rand -hex 32)"
 	for i in $(seq 1 60); do
 		token="$(kubeadm token create --ttl 0 2>/dev/null | tr -d '\n')" || token=""
-		# The key is printed on its own line ("Using certificate key:\n<key>").
-		cert_key="$(kubeadm init phase upload-certs --upload-certs 2>&1 |
-			grep -oE '[0-9a-f]{64}' | tail -n1)" || cert_key=""
-		[ -n "$token" ] && [ -n "$cert_key" ] && break
+		uploaded=""
+		kubeadm init phase upload-certs --upload-certs \
+			--certificate-key "$cert_key" >/dev/null 2>&1 && uploaded=1
+		[ -n "$token" ] && [ -n "$uploaded" ] && break
 		sleep 2
 	done
-	[ -n "$token" ] && [ -n "$cert_key" ] && [ -n "$hash" ] ||
+	[ -n "$token" ] && [ -n "$uploaded" ] && [ -n "$hash" ] ||
 		die "could not extract the join credentials (token/certificate key/CA hash)"
 	printf '%s' "$token" >"$CLUSTER_DIR/token"
 	printf '%s' "$cert_key" >"$CLUSTER_DIR/cert-key"
