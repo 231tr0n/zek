@@ -3,28 +3,23 @@ name: Lint
 on:
   workflow_dispatch:
   workflow_call:
-permissions:
-  contents: read
 jobs:
   lint:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
+    # so CI and local runs agree. dockerfmt/prettier fetch latest on demand.
+    container: fedora:latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
       - name: Install lint tools
-        # Latest versions of every linter/formatter (no pins); prettier needs
-        # no install: lint.sh fetches the latest version via npx on demand.
         run: |
           set -euo pipefail
-          go install mvdan.cc/sh/v3/cmd/shfmt@latest
+          dnf install -y git shellcheck shfmt nodejs npm golang
           go install github.com/reteps/dockerfmt@latest
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y shellcheck
-          fi
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - uses: actions/checkout@v7
       - name: Print tool versions
         run: |
           shellcheck --version | sed -n '2p'

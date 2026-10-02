@@ -429,9 +429,7 @@ init_control_plane() {
 	patch_kube_proxy
 
 	publish_cluster_credentials
-	local token
-	token=$(cat "${CLUSTER_DIR}/token")
-	log "control plane ready (endpoint: ${API_ENDPOINT}, token: ${token})"
+	log "control plane ready (endpoint: ${API_ENDPOINT})"
 	log "no CNI installed; nodes are NotReady until you install one (flannel, cilium, ...)"
 }
 
