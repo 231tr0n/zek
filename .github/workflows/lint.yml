@@ -13,14 +13,14 @@ jobs:
     container: fedora:latest
     timeout-minutes: 15
     steps:
-      - name: Allow git in container
-        run: git config --global --add safe.directory '*'
       - name: Install lint tools
         run: |
           set -euo pipefail
           dnf install -y git shellcheck shfmt nodejs npm golang
           go install github.com/reteps/dockerfmt@latest
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - name: Allow git in container
+        run: git config --global --add safe.directory '*'
       - uses: actions/checkout@v7
       - name: Print tool versions
         run: |
