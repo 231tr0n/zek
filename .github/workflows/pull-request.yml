@@ -1,0 +1,28 @@
+---
+name: Pull Request CI
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml
+  build_and_test:
+    needs: lint
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Print versions
+        run: |
+          git --version
+          docker --version
+      - name: Build image
+        run: make build
+      - name: Run e2e tests
+        run: ./e2e.sh

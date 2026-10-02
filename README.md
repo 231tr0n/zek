@@ -22,17 +22,17 @@ make build    # tags zek:<alpine>-<k8s>-<commit>, zek:<alpine>-<k8s>-latest and 
 ```
 
 Each build is tagged `<alpine>-<k8s>-<commit>` where the version pair is pinned
-in the Makefile (`ALPINE_VERSION` = `3.24.1`, `KUBERNETES_VERSION` = `v1.37.0`)
-and the last component is the short git commit SHA (suffixed `-dirty` when the
-working tree has uncommitted changes), so every machine building the same
-commit produces the same tag and no state needs to be shared. `:latest` is
-re-pointed at each new build so default usage keeps working.
-`make build-nocache` re-runs the image preload step. Neither version is
-hard-coded in the Dockerfile. To build with raw docker:
+in the Makefile (`ALPINE_VERSION`, `KUBERNETES_VERSION`) and the last component
+is the short git commit SHA (suffixed `-dirty` when the working tree has
+uncommitted changes), so every machine building the same commit produces the
+same tag and no state needs to be shared. `:latest` is re-pointed at each new
+build so default usage keeps working. `make build-nocache` re-runs the image
+preload step. Neither version is hard-coded in the Dockerfile. To build with
+raw docker, substitute the versions pinned in the Makefile:
 
 ```sh
-docker build --build-arg ALPINE_VERSION=3.24.1 \
-  --build-arg KUBERNETES_VERSION=v1.37.0 -t zek:latest .
+docker build --build-arg ALPINE_VERSION=<alpine-version> \
+  --build-arg KUBERNETES_VERSION=<k8s-version> -t zek:latest .
 ```
 
 ## Upgrading Kubernetes

@@ -49,18 +49,18 @@ die() {
 
 CLUSTER="${ZEK_CLUSTER:-zek}"
 WAIT_TIMEOUT="${ZEK_TIMEOUT:-600}"
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-c | --cluster)
 		shift
-		[ $# -gt 0 ] || die "-c needs a cluster name"
+		[[ $# -gt 0 ]] || die "-c needs a cluster name"
 		CLUSTER="$1"
 		shift
 		;;
 	-c=* | --cluster=*) CLUSTER="${1#*=}" && shift ;;
 	-t | --timeout)
 		shift
-		[ $# -gt 0 ] || die "-t needs a number of seconds"
+		[[ $# -gt 0 ]] || die "-t needs a number of seconds"
 		WAIT_TIMEOUT="$1"
 		shift
 		;;
@@ -68,10 +68,10 @@ while [ $# -gt 0 ]; do
 	*) break ;;
 	esac
 done
-[[ "$CLUSTER" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] ||
-	die "invalid cluster name '$CLUSTER' (letters, digits, '-' and '_' only)"
-[[ "$WAIT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
-	die "invalid timeout '$WAIT_TIMEOUT' (expected seconds >= 1)"
+[[ ${CLUSTER} =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] ||
+	die "invalid cluster name '${CLUSTER}' (letters, digits, '-' and '_' only)"
+[[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] ||
+	die "invalid timeout '${WAIT_TIMEOUT}' (expected seconds >= 1)"
 
 IMAGE="${ZEK_IMAGE:-zek:latest}"
 NET_NAME="${CLUSTER}-net"
@@ -81,23 +81,26 @@ DEFAULT_WORKERS="${ZEK_NODES:-1}"
 
 NODE_ARGS=(
 	--privileged --cgroupns=host
-	--network "$NET_NAME"
+	--network "${NET_NAME}"
 	--restart unless-stopped
 	-v /lib/modules:/lib/modules:ro
 	-v /sys/fs/cgroup:/sys/fs/cgroup:rw
 	--tmpfs /run --tmpfs /tmp
 )
-[ -n "${ZEK_DNS:-}" ] && NODE_ARGS+=(--dns "$ZEK_DNS")
-[ -n "${POD_CIDR:-}" ] && NODE_ARGS+=(--env "POD_CIDR=$POD_CIDR")
+[[ -n ${ZEK_DNS:-} ]] && NODE_ARGS+=(--dns "${ZEK_DNS}")
+[[ -n ${POD_CIDR:-} ]] && NODE_ARGS+=(--env "POD_CIDR=${POD_CIDR}")
 
-net_exists() { docker network inspect "$NET_NAME" >/dev/null 2>&1; }
-ensure_net() { net_exists || docker network create --driver bridge --subnet "$1" "$NET_NAME" >/dev/null; }
+net_exists() { docker network inspect "${NET_NAME}" >/dev/null 2>&1; }
+ensure_net() {
+	# shellcheck disable=SC2310
+	net_exists || docker network create --driver bridge --subnet "$1" "${NET_NAME}" >/dev/null
+}
 
 # First free 172.20.X.0/24 (or $ZEK_SUBNET when set) so parallel clusters
 # never share a subnet.
 pick_subnet() {
-	[ -n "${ZEK_SUBNET:-}" ] && {
-		echo "$ZEK_SUBNET"
+	[[ -n ${ZEK_SUBNET:-} ]] && {
+		echo "${ZEK_SUBNET}"
 		return
 	}
 	# Collect the occupied subnets word by word through plain assignments:
@@ -105,35 +108,44 @@ pick_subnet() {
 	# GitHub's syntax highlighter from derailing.
 	local i net nets subnets subnet candidate used_subnets=""
 	nets="$(docker network ls -q)"
-	for net in $nets; do
-		subnets="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net")"
-		for subnet in $subnets; do
-			used_subnets="$used_subnets $subnet"
+	for net in ${nets}; do
+		subnets="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "${net}")"
+		for subnet in ${subnets}; do
+			used_subnets="${used_subnets} ${subnet}"
 		done
 	done
 	for i in $(seq 0 254); do
-		candidate="172.20.$i.0/24"
-		case " $used_subnets " in
-		*" $candidate "*) ;;
+		candidate="172.20.${i}.0/24"
+		case " ${used_subnets} " in
+		*" ${candidate} "*) ;;
 		*)
-			echo "$candidate"
+			echo "${candidate}"
 			return
 			;;
 		esac
 	done
-	die "no free 172.20.X.0/24 subnet left for cluster $CLUSTER"
+	die "no free 172.20.X.0/24 subnet left for cluster ${CLUSTER}"
 }
 
 node_exists() { docker inspect --type container "$1" >/dev/null 2>&1; }
 
 # Containers of this cluster (running or stopped).
-cluster_names() { docker ps -a --format '{{.Names}}' -f network="$NET_NAME" 2>/dev/null || true; }
+cluster_names() { docker ps -a --format '{{.Names}}' -f network="${NET_NAME}" 2>/dev/null || true; }
 
 # Masters are named <cluster>-master-1, <cluster>-master-2, ...; workers are
 # <cluster>-worker-N.
-count_masters() { cluster_names | grep -cE "^${CLUSTER}-master-[0-9]+$" || true; }
-count_workers() { cluster_names | grep -cE "^${CLUSTER}-worker-[0-9]+$" || true; }
-worker_names() { cluster_names | grep -E "^${CLUSTER}-worker-[0-9]+$" || true; }
+count_masters() {
+	# shellcheck disable=SC2310
+	cluster_names | grep -cE "^${CLUSTER}-master-[0-9]+$" || true
+}
+count_workers() {
+	# shellcheck disable=SC2310
+	cluster_names | grep -cE "^${CLUSTER}-worker-[0-9]+$" || true
+}
+worker_names() {
+	# shellcheck disable=SC2310
+	cluster_names | grep -E "^${CLUSTER}-worker-[0-9]+$" || true
+}
 
 # Every node is a container on the cluster's network running an entrypoint
 # role. All state lives on the container's own writable layer: it survives
@@ -141,57 +153,75 @@ worker_names() { cluster_names | grep -E "^${CLUSTER}-worker-[0-9]+$" || true; }
 run_node() {
 	local name="$1" role="$2"
 	shift 2
-	docker run -d --name "$name" --hostname "$name" \
-		"${NODE_ARGS[@]}" "$@" "$IMAGE" "$role"
+	docker run -d --name "${name}" --hostname "${name}" \
+		"${NODE_ARGS[@]}" "$@" "${IMAGE}" "${role}"
+}
+
+# A static-IP start can race the previous endpoint's cleanup and fail
+# with "Address already in use"; retry before giving up.
+start_node() { # name
+	local out
+	for _ in {1..10}; do
+		if out=$(docker start "$1" 2>&1); then
+			return 0
+		fi
+		sleep 2
+	done
+	printf '%s\n' "${out}" >&2
+	return 1
 }
 
 # Run kubectl against the cluster via the first master's container.
 kube() {
 	local tty_flag=-i
-	[ -t 0 ] && tty_flag=""
-	docker exec "$tty_flag" "$MASTER_NAME" /entrypoint.sh kubectl "$@"
+	[[ -t 0 ]] && tty_flag=""
+	docker exec "${tty_flag}" "${MASTER_NAME}" /entrypoint.sh kubectl "$@"
 }
 
 # Every internal wait is bounded by WAIT_TIMEOUT (-t/--timeout, default
 # ZEK_TIMEOUT or 600s) so a broken cluster fails fast instead of hanging.
 wait_for_cluster_conf() {
 	local deadline=$((SECONDS + WAIT_TIMEOUT))
-	log "waiting for the control plane of $CLUSTER to come up (timeout ${WAIT_TIMEOUT}s)"
-	while [ "$SECONDS" -lt "$deadline" ]; do
+	log "waiting for the control plane of ${CLUSTER} to come up (timeout ${WAIT_TIMEOUT}s)"
+	while [[ ${SECONDS} -lt ${deadline} ]]; do
+		# shellcheck disable=SC2310
 		kube get nodes >/dev/null 2>&1 && {
 			log "control plane is up"
 			return 0
 		}
 		sleep 2
 	done
-	die "control plane API not reachable after ${WAIT_TIMEOUT}s (see: ./zek.sh -c $CLUSTER logs $MASTER_NAME)"
+	die "control plane API not reachable after ${WAIT_TIMEOUT}s (see: ./zek.sh -c ${CLUSTER} logs ${MASTER_NAME})"
 }
 
 # Wait until a control-plane node actually serves: its kube-apiserver and
 # etcd static pods are Running.
 wait_for_master_ready() {
 	local name="$1" phase deadline=$((SECONDS + WAIT_TIMEOUT))
-	log "waiting for the control plane on $name (timeout ${WAIT_TIMEOUT}s)"
-	while [ "$SECONDS" -lt "$deadline" ]; do
-		phase="$(kube -n kube-system get pod "kube-apiserver-$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-		if [ "$phase" = Running ]; then
-			phase="$(kube -n kube-system get pod "etcd-$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-			[ "$phase" = Running ] && return 0
+	log "waiting for the control plane on ${name} (timeout ${WAIT_TIMEOUT}s)"
+	while [[ ${SECONDS} -lt ${deadline} ]]; do
+		# shellcheck disable=SC2310
+		phase="$(kube -n kube-system get pod "kube-apiserver-${name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+		if [[ ${phase} == Running ]]; then
+			# shellcheck disable=SC2310
+			phase="$(kube -n kube-system get pod "etcd-${name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+			[[ ${phase} == Running ]] && return 0
 		fi
 		sleep 2
 	done
-	die "control plane on $name not ready after ${WAIT_TIMEOUT}s"
+	die "control plane on ${name} not ready after ${WAIT_TIMEOUT}s"
 }
 
 wait_for_nodes() {
 	local want="$1" have=0 deadline=$((SECONDS + WAIT_TIMEOUT))
-	log "waiting for $want node(s) to register (timeout ${WAIT_TIMEOUT}s)"
-	while [ "$SECONDS" -lt "$deadline" ]; do
+	log "waiting for ${want} node(s) to register (timeout ${WAIT_TIMEOUT}s)"
+	while [[ ${SECONDS} -lt ${deadline} ]]; do
+		# shellcheck disable=SC2310
 		have=$(kube get nodes --no-headers 2>/dev/null | wc -l || true)
-		[ "$have" -ge "$want" ] && return 0
+		[[ ${have} -ge ${want} ]] && return 0
 		sleep 2
 	done
-	die "expected $want nodes after ${WAIT_TIMEOUT}s, saw $have"
+	die "expected ${want} nodes after ${WAIT_TIMEOUT}s, saw ${have}"
 }
 
 # The first master publishes the join credentials (token, CA hash, API
@@ -200,21 +230,21 @@ wait_for_nodes() {
 # API starts answering, so wait for them.
 read_join_credentials() {
 	local token="" ca_hash="" endpoint="" cert_key="" deadline=$((SECONDS + WAIT_TIMEOUT))
-	while [ "$SECONDS" -lt "$deadline" ]; do
-		token="$(docker exec "$MASTER_NAME" cat /etc/cluster/token 2>/dev/null)" &&
-			ca_hash="$(docker exec "$MASTER_NAME" cat /etc/cluster/ca-hash 2>/dev/null)" &&
-			endpoint="$(docker exec "$MASTER_NAME" cat /etc/cluster/api-endpoint 2>/dev/null)" &&
-			cert_key="$(docker exec "$MASTER_NAME" cat /etc/cluster/cert-key 2>/dev/null)" &&
+	while [[ ${SECONDS} -lt ${deadline} ]]; do
+		token="$(docker exec "${MASTER_NAME}" cat /etc/cluster/token 2>/dev/null)" &&
+			ca_hash="$(docker exec "${MASTER_NAME}" cat /etc/cluster/ca-hash 2>/dev/null)" &&
+			endpoint="$(docker exec "${MASTER_NAME}" cat /etc/cluster/api-endpoint 2>/dev/null)" &&
+			cert_key="$(docker exec "${MASTER_NAME}" cat /etc/cluster/cert-key 2>/dev/null)" &&
 			break
 		sleep 2
 	done
-	[ -n "$token" ] && [ -n "$ca_hash" ] && [ -n "$endpoint" ] && [ -n "$cert_key" ] ||
-		die "join credentials not published by $MASTER_NAME after ${WAIT_TIMEOUT}s"
+	[[ -n ${token} ]] && [[ -n ${ca_hash} ]] && [[ -n ${endpoint} ]] && [[ -n ${cert_key} ]] ||
+		die "join credentials not published by ${MASTER_NAME} after ${WAIT_TIMEOUT}s"
 	CRED_ARGS=(
-		--env "JOIN_TOKEN=$token"
-		--env "JOIN_CA_HASH=$ca_hash"
-		--env "JOIN_API_ENDPOINT=$endpoint"
-		--env "JOIN_CERT_KEY=$cert_key"
+		--env "JOIN_TOKEN=${token}"
+		--env "JOIN_CA_HASH=${ca_hash}"
+		--env "JOIN_API_ENDPOINT=${endpoint}"
+		--env "JOIN_CERT_KEY=${cert_key}"
 	)
 }
 
@@ -222,7 +252,7 @@ read_join_credentials() {
 # (default <subnet>.2), following ones increment the last octet.
 master_node_ip() {
 	local base="${MASTER_IP%.*}" last_octet="${MASTER_IP##*.}"
-	echo "$base.$((last_octet + $1 - 1))"
+	echo "${base}.$((last_octet + $1 - 1))"
 }
 
 create_cluster() {
@@ -232,37 +262,39 @@ create_cluster() {
 	local subnet_prefix="${NET_SUBNET%.*}"
 	MASTER_IP="${ZEK_MASTER_IP:-${subnet_prefix}.2}"
 	local lb_ip="${subnet_prefix}.10"
-	ensure_net "$NET_SUBNET"
+	ensure_net "${NET_SUBNET}"
 
 	local endpoint="${MASTER_IP}:6443" i backends=""
-	if [ "$masters" -gt 1 ]; then
+	if [[ ${masters} -gt 1 ]]; then
 		endpoint="${lb_ip}:6443"
-		for i in $(seq 1 "$masters"); do
-			backends="${backends:+$backends }$(master_node_ip "$i")"
+		for i in $(seq 1 "${masters}"); do
+			backends="${backends:+${backends} }$(master_node_ip "${i}")"
 		done
-		log "creating $LB_NAME ($lb_ip) in front of: $backends"
-		run_node "$LB_NAME" lb --ip "$lb_ip" --env "LB_BACKENDS=$backends"
+		log "creating ${LB_NAME} (${lb_ip}) in front of: ${backends}"
+		run_node "${LB_NAME}" lb --ip "${lb_ip}" --env "LB_BACKENDS=${backends}"
 	fi
 
-	log "creating $MASTER_NAME ($MASTER_IP)"
-	run_node "$MASTER_NAME" master --ip "$MASTER_IP" --env "API_ENDPOINT=$endpoint"
+	log "creating ${MASTER_NAME} (${MASTER_IP})"
+	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" --env "API_ENDPOINT=${endpoint}"
 	wait_for_cluster_conf
 	read_join_credentials
 
-	for i in $(seq 2 "$masters"); do
-		log "creating ${CLUSTER}-master-$i ($(master_node_ip "$i")) as control-plane"
-		run_node "${CLUSTER}-master-$i" master --ip "$(master_node_ip "$i")" \
+	local mip
+	for i in $(seq 2 "${masters}"); do
+		mip=$(master_node_ip "${i}")
+		log "creating ${CLUSTER}-master-${i} (${mip}) as control-plane"
+		run_node "${CLUSTER}-master-${i}" master --ip "${mip}" \
 			--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
-		wait_for_master_ready "${CLUSTER}-master-$i"
-		wait_for_nodes "$i"
+		wait_for_master_ready "${CLUSTER}-master-${i}"
+		wait_for_nodes "${i}"
 	done
 
-	for i in $(seq 1 "$workers"); do
-		run_node "${CLUSTER}-worker-$i" worker "${CRED_ARGS[@]}"
+	for i in $(seq 1 "${workers}"); do
+		run_node "${CLUSTER}-worker-${i}" worker "${CRED_ARGS[@]}"
 	done
 	wait_for_nodes "$((masters + workers))"
 
-	log "cluster $CLUSTER up: $masters master(s) + $workers worker(s). Nodes report NotReady until you install a CNI."
+	log "cluster ${CLUSTER} up: ${masters} master(s) + ${workers} worker(s). Nodes report NotReady until you install a CNI."
 }
 
 # The topology is fixed at creation time: restart exactly the containers
@@ -273,47 +305,50 @@ restart_cluster() {
 	local have_masters have_workers
 	have_masters="$(count_masters)"
 	have_workers="$(count_workers)"
-	if { [ "$workers_set" = 1 ] && [ "$workers" != "$have_workers" ]; } ||
-		{ [ "$masters_set" = 1 ] && [ "$masters" != "$have_masters" ]; }; then
-		log "cluster $CLUSTER already exists with $have_masters master(s) and $have_workers worker(s); topology is fixed, ignoring --masters/--workers"
+	if { [[ ${workers_set} == 1 ]] && [[ ${workers} != "${have_workers}" ]]; } ||
+		{ [[ ${masters_set} == 1 ]] && [[ ${masters} != "${have_masters}" ]]; }; then
+		log "cluster ${CLUSTER} already exists with ${have_masters} master(s) and ${have_workers} worker(s); topology is fixed, ignoring --masters/--workers"
 	fi
 
-	log "restarting cluster $CLUSTER"
-	if node_exists "$LB_NAME"; then
-		log "starting $LB_NAME"
-		docker start "$LB_NAME" >/dev/null
+	log "restarting cluster ${CLUSTER}"
+	# shellcheck disable=SC2310
+	if node_exists "${LB_NAME}"; then
+		log "starting ${LB_NAME}"
+		start_node "${LB_NAME}"
 	fi
-	local i=1 name
+	local i=1 name wlist
 	while :; do
-		name="${CLUSTER}-master-$i"
-		node_exists "$name" || break
-		log "starting $name"
-		docker start "$name" >/dev/null
+		name="${CLUSTER}-master-${i}"
+		# shellcheck disable=SC2310
+		node_exists "${name}" || break
+		log "starting ${name}"
+		start_node "${name}"
 		i=$((i + 1))
 	done
+	wlist=$(worker_names)
 	while read -r name; do
-		[ -n "$name" ] || continue
-		log "starting $name"
-		docker start "$name" >/dev/null
-	done < <(worker_names)
+		[[ -n ${name} ]] || continue
+		log "starting ${name}"
+		start_node "${name}"
+	done <<<"${wlist}"
 
 	wait_for_cluster_conf
 	wait_for_nodes "$((have_masters + have_workers))"
-	log "cluster $CLUSTER up: $have_masters master(s) + $have_workers worker(s). Nodes report NotReady until you install a CNI."
+	log "cluster ${CLUSTER} up: ${have_masters} master(s) + ${have_workers} worker(s). Nodes report NotReady until you install a CNI."
 }
 
 cmd_up() {
 	local workers="" masters="" workers_set=0 masters_set=0
-	while [ $# -gt 0 ]; do
+	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--workers | -w)
-			[ $# -ge 2 ] || die "--workers needs a value"
+			[[ $# -ge 2 ]] || die "--workers needs a value"
 			workers="$2"
 			workers_set=1
 			shift 2
 			;;
 		--masters | -m)
-			[ $# -ge 2 ] || die "--masters needs a value"
+			[[ $# -ge 2 ]] || die "--masters needs a value"
 			masters="$2"
 			masters_set=1
 			shift 2
@@ -336,93 +371,106 @@ cmd_up() {
 		*) usage ;;
 		esac
 	done
-	[ -z "$workers" ] || [[ "$workers" =~ ^[0-9]+$ ]] || die "--workers must be a number"
-	[ -z "$masters" ] || { [[ "$masters" =~ ^[0-9]+$ ]] && [ "$masters" -ge 1 ]; } ||
+	[[ -z ${workers} ]] || [[ ${workers} =~ ^[0-9]+$ ]] || die "--workers must be a number"
+	[[ -z ${masters} ]] || { [[ ${masters} =~ ^[0-9]+$ ]] && [[ ${masters} -ge 1 ]]; } ||
 		die "--masters must be a number >= 1"
-	workers="${workers:-$DEFAULT_WORKERS}"
+	workers="${workers:-${DEFAULT_WORKERS}}"
 	masters="${masters:-1}"
 
-	if node_exists "$MASTER_NAME"; then
-		restart_cluster "$workers" "$masters" "$workers_set" "$masters_set"
+	# shellcheck disable=SC2310
+	if node_exists "${MASTER_NAME}"; then
+		restart_cluster "${workers}" "${masters}" "${workers_set}" "${masters_set}"
 	else
-		create_cluster "$workers" "$masters"
+		create_cluster "${workers}" "${masters}"
 	fi
 }
 
 cmd_down() {
-	local names name
-	mapfile -t names < <(docker ps --format '{{.Names}}' -f network="$NET_NAME")
-	[ "${#names[@]}" -gt 0 ] || {
-		log "cluster $CLUSTER is not running"
+	local -a names=()
+	local name list
+	list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}") || list=""
+	[[ -n ${list} ]] && mapfile -t names <<<"${list}"
+	[[ ${#names[@]} -gt 0 ]] || {
+		log "cluster ${CLUSTER} is not running"
 		return 0
 	}
 	for name in "${names[@]}"; do
-		log "stopping $name"
-		docker stop "$name" >/dev/null
+		log "stopping ${name}"
+		docker stop "${name}" >/dev/null
 	done
-	log "cluster $CLUSTER stopped (state preserved; restart with up)"
+	log "cluster ${CLUSTER} stopped (state preserved; restart with up)"
 }
 
 # Evict a worker: drain it and drop its Node object. Tolerates an unreachable
 # control plane (drain/delete may fail) - the container is removed regardless.
 evict_worker() {
 	local name="$1"
-	kube drain "$name" --ignore-daemonsets --delete-emptydir-data --force \
+	# shellcheck disable=SC2310
+	kube drain "${name}" --ignore-daemonsets --delete-emptydir-data --force \
 		>/dev/null 2>&1 || true
-	kube delete node "$name" >/dev/null 2>&1 ||
+	# shellcheck disable=SC2310
+	kube delete node "${name}" >/dev/null 2>&1 ||
 		log "node object not removed (control plane unreachable?); continuing"
 }
 
 cmd_clean() {
 	local name="$1"
-	[[ "$name" =~ ^${CLUSTER}-master-[0-9]+$ ]] &&
-		die "cannot clean $name (control-plane node); use destroy"
-	[[ "$name" =~ ^${CLUSTER}-worker-[0-9]+$ ]] ||
-		die "$name is not a worker of cluster $CLUSTER"
-	node_exists "$name" || die "no container named $name"
+	[[ ${name} =~ ^${CLUSTER}-master-[0-9]+$ ]] &&
+		die "cannot clean ${name} (control-plane node); use destroy"
+	[[ ${name} =~ ^${CLUSTER}-worker-[0-9]+$ ]] ||
+		die "${name} is not a worker of cluster ${CLUSTER}"
+	# shellcheck disable=SC2310
+	node_exists "${name}" || die "no container named ${name}"
 
 	# A node's netns lives on its container; a fresh container is the only
 	# guaranteed way to drop CNI residue (iptables chains, ipsets, bpf pins,
 	# interfaces) left behind by an in-place uninstall.
-	log "recreating $name with a pristine netns (drops CNI residue)"
-	evict_worker "$name"
-	docker rm -f "$name" >/dev/null
+	log "recreating ${name} with a pristine netns (drops CNI residue)"
+	evict_worker "${name}"
+	docker rm -f "${name}" >/dev/null
 	read_join_credentials
-	run_node "$name" worker "${CRED_ARGS[@]}"
-	log "$name recreated; it is rejoining the cluster"
+	run_node "${name}" worker "${CRED_ARGS[@]}"
+	log "${name} recreated; it is rejoining the cluster"
 }
 
 cmd_status() {
-	net_exists || die "no cluster named $CLUSTER (create it with: $0 -c $CLUSTER up)"
-	local running=0 name state
+	# shellcheck disable=SC2310
+	net_exists || die "no cluster named ${CLUSTER} (create it with: $0 -c ${CLUSTER} up)"
+	local running=0 name state rows
+	rows=$(docker ps -a --format '{{.Names}}\t{{.State}}' -f network="${NET_NAME}") || rows=""
 	while IFS=$'\t' read -r name state; do
-		printf '%-25s %s\n' "$name" "$state"
-		[ "$state" = running ] && running=$((running + 1))
-	done < <(docker ps -a --format '{{.Names}}\t{{.State}}' -f network="$NET_NAME")
-	[ "$running" = 0 ] && {
-		log "cluster $CLUSTER is stopped"
+		[[ -n ${name} ]] || continue
+		printf '%-25s %s\n' "${name}" "${state}"
+		[[ ${state} == running ]] && running=$((running + 1))
+	done <<<"${rows}"
+	[[ ${running} == 0 ]] && {
+		log "cluster ${CLUSTER} is stopped"
 		return 0
 	}
 	echo
+	# shellcheck disable=SC2310
 	kube get nodes -o wide || log "control plane not reachable"
 }
 
 cmd_destroy() {
-	local names removed=0
-	mapfile -t names < <(cluster_names)
-	if [ "${#names[@]}" -gt 0 ]; then
+	local -a names=()
+	local list removed=0
+	list=$(cluster_names)
+	[[ -n ${list} ]] && mapfile -t names <<<"${list}"
+	if [[ ${#names[@]} -gt 0 ]]; then
 		docker rm -f "${names[@]}" >/dev/null
 		removed=1
 	fi
+	# shellcheck disable=SC2310
 	if net_exists; then
-		docker network rm "$NET_NAME" >/dev/null
+		docker network rm "${NET_NAME}" >/dev/null
 		removed=1
 	fi
-	[ "$removed" = 1 ] || {
-		log "no cluster named $CLUSTER"
+	[[ ${removed} == 1 ]] || {
+		log "no cluster named ${CLUSTER}"
 		return 0
 	}
-	log "removed cluster $CLUSTER (containers + network $NET_NAME)"
+	log "removed cluster ${CLUSTER} (containers + network ${NET_NAME})"
 }
 
 usage() {
@@ -436,7 +484,7 @@ up)
 	;;
 down) cmd_down ;;
 clean)
-	[ $# -lt 2 ] && usage
+	[[ $# -lt 2 ]] && usage
 	cmd_clean "$2"
 	;;
 status) cmd_status ;;
@@ -445,7 +493,7 @@ kubectl)
 	kube "$@"
 	;;
 logs)
-	[ $# -lt 2 ] && usage
+	[[ $# -lt 2 ]] && usage
 	docker logs -f "$2"
 	;;
 destroy) cmd_destroy ;;

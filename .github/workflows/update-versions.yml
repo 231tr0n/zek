@@ -1,0 +1,85 @@
+---
+name: Update versions
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+concurrency:
+  group: update-versions
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml
+  update-versions:
+    needs: lint
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Print versions
+        run: |
+          git --version
+          docker --version
+      - name: Resolve latest versions
+        id: latest
+        run: |
+          set -euo pipefail
+          alpine=$(curl -fsSL --retry 5 --retry-all-errors \
+            https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml |
+            awk '/^  version: /{print $2; exit}')
+          k8s=$(curl -fsSL --retry 5 --retry-all-errors https://dl.k8s.io/release/stable.txt)
+          echo "$alpine" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected alpine version: $alpine"; exit 1; }
+          echo "$k8s" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected kubernetes version: $k8s"; exit 1; }
+          alpine_prev=$(sed -nE 's/^ALPINE_VERSION[[:space:]]*\?=[[:space:]]*//p' Makefile)
+          k8s_prev=$(sed -nE 's/^KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*//p' Makefile)
+          {
+            echo "alpine=$alpine"
+            echo "k8s=$k8s"
+            echo "alpine_prev=$alpine_prev"
+            echo "k8s_prev=$k8s_prev"
+          } >>"$GITHUB_OUTPUT"
+          echo "alpine: $alpine_prev -> $alpine"
+          echo "kubernetes: $k8s_prev -> $k8s"
+      - name: Update pins
+        if: >-
+          steps.latest.outputs.alpine != steps.latest.outputs.alpine_prev ||
+          steps.latest.outputs.k8s != steps.latest.outputs.k8s_prev
+        env:
+          ALPINE: ${{ steps.latest.outputs.alpine }}
+          K8S: ${{ steps.latest.outputs.k8s }}
+        run: |
+          set -euo pipefail
+          sed -i -E 's|^(ALPINE_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${ALPINE}"'|' Makefile
+          sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${K8S}"'|' Makefile
+      - name: Build image
+        run: make build
+      - name: Run e2e tests
+        run: ./e2e.sh
+      - name: Count git status
+        id: git-status
+        run: echo "files=$(git status --porcelain | wc -l)" >>"$GITHUB_OUTPUT"
+      - uses: peter-evans/create-pull-request@v8
+        if: steps.git-status.outputs.files != '0'
+        with:
+          commit-message: |
+            chore: update alpine/k8s versions
+          title: |
+            chore: update alpine/k8s versions
+          body: |
+            Daily version bump. `make build` passed with the new pins.
+
+            | Pin                | before                                  | after                              |
+            | ------------------ | --------------------------------------- | ---------------------------------- |
+            | ALPINE_VERSION     | ${{ steps.latest.outputs.alpine_prev }} | ${{ steps.latest.outputs.alpine }} |
+            | KUBERNETES_VERSION | ${{ steps.latest.outputs.k8s_prev }}    | ${{ steps.latest.outputs.k8s }}    |
+
+            Before merging, check the release-coupled spots listed in README.md
+            ("Upgrading Kubernetes"): `KUBEADM_API_VERSION` in `entrypoint.sh`,
+            the kubelet config API, and the soft couplings.
+          branch: update-versions

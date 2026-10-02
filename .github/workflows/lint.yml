@@ -1,0 +1,33 @@
+---
+name: Lint
+on:
+  workflow_dispatch:
+  workflow_call:
+jobs:
+  lint:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install lint tools
+        # Latest versions of every linter/formatter (no pins); prettier needs
+        # no install: lint.sh fetches the latest version via npx on demand.
+        run: |
+          set -euo pipefail
+          go install mvdan.cc/sh/v3/cmd/shfmt@latest
+          go install github.com/reteps/dockerfmt@latest
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - name: Print tool versions
+        run: |
+          shellcheck --version | sed -n '2p'
+          npx --yes prettier --version
+          dockerfmt version
+          command -v shfmt
+      - name: Lint
+        run: ./lint.sh
