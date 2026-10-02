@@ -13,6 +13,8 @@ jobs:
     container: fedora:latest
     timeout-minutes: 15
     steps:
+      - name: Allow git in container
+        run: git config --global --add safe.directory '*'
       - name: Install lint tools
         run: |
           set -euo pipefail
