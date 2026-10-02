@@ -6,13 +6,10 @@ on:
     - cron: "0 0 * * *"
 concurrency:
   group: update-versions
+permissions:
+  contents: read
 jobs:
-  lint:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint.yml
   update-versions:
-    needs: lint
     permissions:
       contents: write
       pull-requests: write
@@ -57,6 +54,18 @@ jobs:
           set -euo pipefail
           sed -i -E 's|^(ALPINE_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${ALPINE}"'|' Makefile
           sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${K8S}"'|' Makefile
+      - name: Install lint tools
+        run: |
+          set -euo pipefail
+          go install mvdan.cc/sh/v3/cmd/shfmt@latest
+          go install github.com/reteps/dockerfmt@latest
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - name: Lint
+        run: ./lint.sh
       - name: Build image
         run: make build
       - name: Run e2e tests
@@ -67,12 +76,13 @@ jobs:
       - uses: peter-evans/create-pull-request@v8
         if: steps.git-status.outputs.files != '0'
         with:
+          base: main
           commit-message: |
             chore: update alpine/k8s versions
           title: |
             chore: update alpine/k8s versions
           body: |
-            Daily version bump. `make build` passed with the new pins.
+            Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.
 
             | Pin                | before                                  | after                              |
             | ------------------ | --------------------------------------- | ---------------------------------- |
