@@ -43,6 +43,8 @@
 #                          image pulls on a slow day can eat 10+ minutes)
 #   ZEK_E2E_TESTS          comma separated test list (same as the args)
 #   ZEK_E2E_JOBS           tests to run in parallel (default 2; 1 = serial)
+#   ZEK_E2E_SHARD          "N/M": run only the Nth of M balanced slices of
+#                          the test list (CI matrix sharding; default: all)
 #   ZEK_E2E_KEEP_ON_FAIL   1 = leave the failed cluster running for debugging
 #   CILIUM_VERSION         cilium version to install (default: match the
 #                          cluster's k8s version against cilium's tested
@@ -58,6 +60,7 @@ export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
 export ZEK_TIMEOUT="${ZEK_TIMEOUT:-600}"
 ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-1200}"
 ZEK_E2E_JOBS="${ZEK_E2E_JOBS:-2}"
+ZEK_E2E_SHARD="${ZEK_E2E_SHARD:-}"
 # Optional override; when empty the cilium test resolves a release that
 # matches the cluster's k8s version (resolve_cilium_version below).
 CILIUM_VERSION="${CILIUM_VERSION:-}"
@@ -103,6 +106,38 @@ if [[ " ${requested[*]} " == *" istio "* ]]; then
 		[[ ${t} == flannel ]] || deduped+=("${t}")
 	done
 	requested=("${deduped[@]}")
+fi
+
+# ZEK_E2E_SHARD=N/M keeps ALL_TESTS as the single test inventory: CI's
+# matrix passes only "N/M" and this splits the list into M balanced
+# contiguous slices (extras to the leading slices: 7 tests -> 3/2/2 for
+# 3 shards), so adding a test never needs a workflow edit. Runs after the
+# flannel dedup above, so shards never re-create the flannel-only job,
+# and everything downstream (downloads, subnets, the job pool) only sees
+# this slice.
+if [[ -n ${ZEK_E2E_SHARD} ]]; then
+	[[ ${ZEK_E2E_SHARD} =~ ^([0-9]+)/([0-9]+)$ ]] ||
+		die "ZEK_E2E_SHARD must look like N/M (got '${ZEK_E2E_SHARD}')"
+	shard_idx=$((10#${BASH_REMATCH[1]}))
+	shard_cnt=$((10#${BASH_REMATCH[2]}))
+	[[ ${shard_cnt} -ge 1 && ${shard_idx} -ge 1 && ${shard_idx} -le ${shard_cnt} ]] ||
+		die "ZEK_E2E_SHARD needs 1 <= N <= M (got '${ZEK_E2E_SHARD}')"
+	shard_k=${#requested[@]}
+	shard_base=$((shard_k / shard_cnt))
+	shard_rem=$((shard_k % shard_cnt))
+	# Items before this slice: (N-1) full slices + min(N-1, remainder).
+	shard_pre=$(((shard_idx - 1) * shard_base))
+	if ((shard_idx - 1 < shard_rem)); then
+		shard_pre=$((shard_pre + shard_idx - 1))
+	else
+		shard_pre=$((shard_pre + shard_rem))
+	fi
+	shard_size=${shard_base}
+	((shard_idx <= shard_rem)) && shard_size=$((shard_size + 1))
+	requested=("${requested[@]:shard_pre:shard_size}")
+	[[ ${#requested[@]} -gt 0 ]] ||
+		die "ZEK_E2E_SHARD=${ZEK_E2E_SHARD} selects nothing (${shard_k} test(s) for ${shard_cnt} shards)"
+	log "shard ${ZEK_E2E_SHARD}: ${#requested[@]} test(s): ${requested[*]}"
 fi
 
 docker image inspect "${ZEK_IMAGE}" >/dev/null 2>&1 ||

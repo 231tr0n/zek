@@ -7,16 +7,27 @@ on:
 concurrency:
   group: update-versions
 jobs:
-  update-versions:
+  lint:
+    # Same linter as CI, run before spending any e2e compute on a change
+    # that would not pass lint anyway (e2e needs this job below).
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+    uses: ./.github/workflows/lint.yml
+  prepare:
+    # Resolve the new pins once, apply them, and share the updated
+    # Makefile with everything downstream: the e2e shards test exactly
+    # these pins and the PR publishes exactly what was tested.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
+    outputs:
+      alpine: ${{ steps.latest.outputs.alpine }}
+      alpine_prev: ${{ steps.latest.outputs.alpine_prev }}
+      k8s: ${{ steps.latest.outputs.k8s }}
+      k8s_prev: ${{ steps.latest.outputs.k8s_prev }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: Print versions
         run: |
           git --version
@@ -52,25 +63,62 @@ jobs:
           set -euo pipefail
           sed -i -E 's|^(ALPINE_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${ALPINE}"'|' Makefile
           sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${K8S}"'|' Makefile
-      - name: Lint
-        # Same Fedora toolchain as lint.yml; the job itself stays on the
-        # ubuntu runner because build/e2e need the host docker daemon.
+      - name: Share updated Makefile
+        uses: actions/upload-artifact@v7
+        with:
+          name: updated-makefile
+          path: Makefile
+  e2e:
+    needs:
+      - lint
+      - prepare
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # e2e.sh splits ALL_TESTS into balanced slices from the shard
+        # number, so the test list lives only there: 3 runners cover the
+        # whole suite (7 tests -> 3/2/2) and cutting wall time ~3x.
+        shard: ["1/3", "2/3", "3/3"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Print versions
         run: |
-          set -euo pipefail
-          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo fedora:latest bash -c '
-            set -euo pipefail
-            dnf install -y git shellcheck shfmt nodejs npm golang
-            go install github.com/reteps/dockerfmt@latest
-            export PATH="$PATH:$(go env GOPATH)/bin"
-            git config --global --add safe.directory /repo
-            ./lint.sh'
+          git --version
+          docker --version
+      - name: Fetch updated Makefile
+        uses: actions/download-artifact@v8
+        with:
+          name: updated-makefile
       - name: Build image
         run: make build
       - name: Run e2e tests
-        # No arguments: every test in e2e.sh's ALL_TESTS runs, two at a
-        # time (ZEK_E2E_JOBS default): the runner has 4 vCPU/16GB - more
+        # This runner's slice of the suite, two tests at a time
+        # (ZEK_E2E_JOBS default): the runner has 4 vCPU/16GB - more
         # parallel clusters risk OOM and kubeadm's hard 4m deadline.
+        env:
+          ZEK_E2E_SHARD: ${{ matrix.shard }}
         run: ./e2e.sh
+  create-pr:
+    needs:
+      - prepare
+      - e2e
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Fetch updated Makefile
+        uses: actions/download-artifact@v8
+        with:
+          name: updated-makefile
       - name: Count git status
         id: git-status
         run: echo "files=$(git status --porcelain | wc -l)" >>"$GITHUB_OUTPUT"
@@ -85,10 +133,10 @@ jobs:
           body: |
             Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.
 
-            | Pin                | before                                  | after                              |
-            | ------------------ | --------------------------------------- | ---------------------------------- |
-            | ALPINE_VERSION     | ${{ steps.latest.outputs.alpine_prev }} | ${{ steps.latest.outputs.alpine }} |
-            | KUBERNETES_VERSION | ${{ steps.latest.outputs.k8s_prev }}    | ${{ steps.latest.outputs.k8s }}    |
+            | Pin                | before                                   | after                               |
+            | ------------------ | ---------------------------------------- | ----------------------------------- |
+            | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |
+            | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |
 
             Before merging, check the release-coupled spots listed in README.md
             ("Upgrading Kubernetes"): `KUBEADM_API_VERSION` in `entrypoint.sh`,
