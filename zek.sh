@@ -97,7 +97,9 @@ ensure_net() {
 }
 
 # First free 172.20.X.0/24 (or $ZEK_SUBNET when set) so parallel clusters
-# never share a subnet.
+# never share a subnet. The scan is not atomic: two concurrent `up` calls
+# can pick the same candidate, so when creating clusters in parallel pass
+# a distinct ZEK_SUBNET per cluster (e2e.sh pre-allocates them).
 pick_subnet() {
 	[[ -n ${ZEK_SUBNET:-} ]] && {
 		echo "${ZEK_SUBNET}"
@@ -153,8 +155,10 @@ worker_names() {
 run_node() {
 	local name="$1" role="$2"
 	shift 2
+	# docker run -d prints the container id on stdout; nobody consumes it
+	# and it just pollutes the logs.
 	docker run -d --name "${name}" --hostname "${name}" \
-		"${NODE_ARGS[@]}" "$@" "${IMAGE}" "${role}"
+		"${NODE_ARGS[@]}" "$@" "${IMAGE}" "${role}" >/dev/null
 }
 
 # A static-IP start can race the previous endpoint's cleanup and fail

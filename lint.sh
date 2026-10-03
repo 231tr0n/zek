@@ -77,6 +77,6 @@ for f in "${dockerfiles[@]:-}"; do
 done
 
 if [[ ${status} -ne 0 ]]; then
-	printf '\n[lint] FAILED - see the tool output above for the offending files\n'
+	printf '\n[lint] FAILED - see the tool output above for the offending files\n' >&2
 fi
 exit "${status}"

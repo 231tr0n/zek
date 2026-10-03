@@ -84,7 +84,7 @@ preflight_host() {
 	done
 	for key in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
 		SYSCTL_BEFORE[${key}]="$(sysctl -n "${key}" 2>/dev/null || true)"
-		sysctl -w "${key}=1" 2>/dev/null || true
+		sysctl -w "${key}=1" >/dev/null 2>&1 || true
 	done
 	# Every node container runs as uid 0 in the init namespace, so they all
 	# share the host's per-uid inotify instance quota (default 128). A
@@ -95,7 +95,7 @@ preflight_host() {
 	if [[ -w /proc/sys/fs/inotify/max_user_instances ]]; then
 		local limit
 		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"
-		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024; } 2>/dev/null || true
+		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 >/dev/null; } 2>/dev/null || true
 	fi
 }
 
@@ -327,10 +327,33 @@ kubelet_supervisor() {
 			elif [[ -f /etc/kubernetes/kubelet.conf ]]; then
 				args+=(--kubeconfig=/etc/kubernetes/kubelet.conf)
 			fi
+			# Full kubelet log goes to /var/log/kubelet.log; docker logs
+			# only gets warnings/errors/fatals and non-klog lines
+			# (panics). At --v=2 klog's I-lines are per-pod sync spam
+			# that used to flood `docker logs` of every node, and klog
+			# renders big values (kubelet config, /proc/swaps) as a
+			# multi-line `...=<` block with a tab-indented body and a
+			# lone `>` closer that carry no I-prefix - awk drops those
+			# with the header. fflush() keeps the sparse output
+			# realtime through the pipe; wait returns the awk pid, so if
+			# awk ever died while kubelet was still alive, the pkill
+			# keeps the start below from ever running two kubelets.
+			pkill -x kubelet >/dev/null 2>&1 || true
 			kubelet --config "${KUBELET_CONFIG}" --hostname-override "${NODE_NAME}" \
-				--v=2 "${args[@]}" &
+				--v=2 "${args[@]}" 2>&1 |
+				tee -a /var/log/kubelet.log |
+				awk '
+					inval {
+						if (substr($0, 1, 1) == "\t" ||
+							$0 ~ /^[[:space:]]*>[[:space:]]*$/) next
+						inval = 0
+					}
+					/<$/ { inval = 1 }
+					/^I[0-9]{4} / { next }
+					{ print; fflush() }
+				' &
 			local pid=$!
-			log "kubelet running (pid ${pid})"
+			log "kubelet running (full log: /var/log/kubelet.log)"
 			wait "${pid}" 2>/dev/null || true
 			log "kubelet exited, restarting"
 		fi
@@ -423,7 +446,17 @@ init_control_plane() {
 	mkdir -p "${CLUSTER_DIR}"
 	import_k8s_images
 	write_kubeadm_init_conf
-	kubeadm init --config "${KUBEADM_INIT_CONF}" --ignore-preflight-errors=all || die "kubeadm init failed"
+	# kubeadm's preflight/cert chatter is one-shot and verbose; keep it
+	# out of docker logs and surface it only when init fails.
+	if ! kubeadm init --config "${KUBEADM_INIT_CONF}" --ignore-preflight-errors=all \
+		>/var/log/kubeadm-init.log 2>&1; then
+		cat /var/log/kubeadm-init.log >&2
+		die "kubeadm init failed"
+	fi
+	# Every phase ran, including the bootstrap-token RBAC that lets joining
+	# nodes fetch cluster-info; run_master uses this to tell a completed
+	# init from one that died in wait-control-plane.
+	touch "${CLUSTER_DIR}/init-complete"
 
 	export KUBECONFIG=/etc/kubernetes/admin.conf
 	patch_kube_proxy
@@ -446,7 +479,13 @@ join_control_plane() {
 	log "joining ${NODE_NAME} as a control-plane node via ${API_ENDPOINT}"
 	import_k8s_images
 	write_kubeadm_join_conf control-plane
-	kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all || die "control-plane join failed"
+	if ! kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all \
+		>/var/log/kubeadm-join.log 2>&1; then
+		cat /var/log/kubeadm-join.log >&2
+		die "control-plane join failed"
+	fi
+	mkdir -p "${CLUSTER_DIR}"
+	touch "${CLUSTER_DIR}/init-complete"
 }
 
 run_master() {
@@ -454,10 +493,28 @@ run_master() {
 
 	# Recovery for a creation interrupted before kubeadm finished (crash,
 	# power loss, host reboot during `up`): the partial certs/state cannot
-	# be resumed by kubeadm, so wipe it and start over. A complete node has
-	# kubelet.conf and is never reset.
+	# be resumed by kubeadm, so wipe it and start over. Two interruption
+	# points need handling:
+	# - certs written but no kubelet.conf yet (interrupted very early);
+	# - kubelet.conf present but the init never finished. kubelet.conf is
+	#   written in the kubeconfig phase, long before wait-control-plane,
+	#   the bootstrap-token RBAC that lets nodes fetch cluster-info, and
+	#   the addons - so an init that dies in wait-control-plane (hard 4m
+	#   budget; parallel clusters can exceed it) would otherwise resume
+	#   as a half-initialized cluster whose joins all 403 on
+	#   cluster-info. Without completion evidence (the init-complete
+	#   marker, or published credentials which only exist after a
+	#   completed init) wipe and start over. Control-plane joins are
+	#   exempt: their nodes never publish credentials and never get the
+	#   marker checked here (they touch it themselves after joining).
 	if [[ ! -f /etc/kubernetes/kubelet.conf ]] && [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 		log "interrupted control-plane setup detected; resetting partial state"
+		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
+	elif [[ -f /etc/kubernetes/kubelet.conf ]] && [[ ${MASTER_JOIN:-0} != 1 ]] &&
+		[[ ! -f "${CLUSTER_DIR}/init-complete" ]] &&
+		[[ ! -f "${CLUSTER_DIR}/admin.conf" ]] &&
+		[[ ! -f "${CLUSTER_DIR}/token" ]]; then
+		log "interrupted control-plane init detected; resetting partial state"
 		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
 	fi
 
@@ -502,7 +559,11 @@ run_worker() {
 		log "joining ${NODE_NAME} to ${API_ENDPOINT}"
 		import_k8s_images
 		write_kubeadm_join_conf worker
-		kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all || die "kubeadm join failed"
+		if ! kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all \
+			>/var/log/kubeadm-join.log 2>&1; then
+			cat /var/log/kubeadm-join.log >&2
+			die "kubeadm join failed"
+		fi
 	fi
 
 	wait "${SUPERVISOR_PID}"
@@ -556,11 +617,16 @@ EOF
 }
 
 run_kubectl() {
-	log "waiting for cluster config on master (${CLUSTER_DIR})"
-	for _ in $(seq 1 300); do
-		[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
-		sleep 2
-	done
+	# This runs on every `zek kubectl` call and every 2s poll during
+	# cluster bring-up, so only log when there is something to wait for:
+	# the common case is "config already there".
+	if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+		log "waiting for cluster config on master (${CLUSTER_DIR})"
+		for _ in $(seq 1 300); do
+			[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
+			sleep 2
+		done
+	fi
 	[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found; is the master running?"
 	export KUBECONFIG="${CLUSTER_DIR}/admin.conf"
 	[[ $# -eq 0 ]] && exec bash

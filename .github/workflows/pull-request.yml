@@ -28,4 +28,7 @@ jobs:
       - name: Build image
         run: make build
       - name: Run e2e tests
+        # No arguments: every test in e2e.sh's ALL_TESTS runs, two at a
+        # time (ZEK_E2E_JOBS default): the runner has 4 vCPU/16GB - more
+        # parallel clusters risk OOM and kubeadm's hard 4m deadline.
         run: ./e2e.sh

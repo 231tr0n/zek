@@ -33,6 +33,9 @@ jobs:
           image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           IMAGE="$image" make build
       - name: Run e2e tests
+        # No arguments: every test in e2e.sh's ALL_TESTS runs, two at a
+        # time (ZEK_E2E_JOBS default): the runner has 4 vCPU/16GB - more
+        # parallel clusters risk OOM and kubeadm's hard 4m deadline.
         run: |
           set -euo pipefail
           image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
