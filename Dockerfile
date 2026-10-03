@@ -11,7 +11,7 @@ RUN apk add --no-cache \
     coreutils findutils grep gawk sed diffutils \
     procps-ng \
     curl inetutils-telnet netcat-openbsd traceroute bind-tools openssh-client mtr \
-    iproute2 iputils ethtool socat conntrack-tools ebtables \
+    iproute2 iputils ethtool nfs-utils socat conntrack-tools ebtables \
     openssl kmod ipset tar \
     lsof strace tcpdump jq yq less vim tree file
 

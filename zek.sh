@@ -5,7 +5,7 @@
 # A cluster is created in one shot with a fixed topology: `up` creates it
 # on the first run and only restarts the same containers afterwards (nodes
 # are never added or removed while the cluster exists), `down` stops it,
-# `destroy` removes it. Several clusters can coexist - the -c flag (or
+# `destroy` removes it. Several clusters can coexist - the --cluster flag (or
 # ZEK_CLUSTER) selects one, and every container and network is prefixed
 # with the cluster name.
 #
@@ -14,31 +14,47 @@
 # once the containers are removed (destroy, docker rm, ...).
 #
 # Usage:
-#   ./zek.sh [-c NAME] [-t SECONDS] up [--workers N] [--masters M]
+#   ./zek.sh [flags] up [--workers N] [--masters M]
 #                               first run: create the cluster with N workers
 #                               (default 1) and M masters (default 1; M>1
 #                               starts the HA load balancer). A bare number
 #                               (up 2) is a shorthand for --workers 2. Later
 #                               runs just restart the existing nodes.
-#   ./zek.sh [-c NAME] [-t SECONDS] down
-#                               stop every node container (state is kept)
-#   ./zek.sh [-c NAME] clean <name>
+#   ./zek.sh [flags] down       stop every node container (state is kept)
+#   ./zek.sh [flags] clean <name>
 #                               evict a worker and recreate it with a fresh
 #                               netns (drops any CNI iptables/ipsets/bpf residue)
-#   ./zek.sh [-c NAME] status    show node containers and cluster nodes
-#   ./zek.sh [-c NAME] kubectl <args...>
+#   ./zek.sh [flags] status     show node containers and cluster nodes
+#   ./zek.sh [flags] kubectl <args...>
 #                               run kubectl against the cluster (may be
 #                               piped manifests)
-#   ./zek.sh [-c NAME] logs <name>
+#   ./zek.sh [flags] logs <name>
 #                               tail a node container's logs
-#   ./zek.sh [-c NAME] destroy   remove the cluster's containers and network
+#   ./zek.sh [flags] destroy    remove the cluster's containers and network
 #
-#   -t, --timeout SECONDS  bound for every internal wait (control plane up,
-#                          nodes registered, credentials published); default
-#                          600, override with ZEK_TIMEOUT.
+#   Global flags go before the command. Every one has an env twin and can
+#   be written as --flag value or --flag=value; when both are set the flag
+#   wins:
+#   --cluster NAME          cluster to operate on (ZEK_CLUSTER, default zek)
+#   --timeout SECONDS       bound for every internal wait (control plane up,
+#                           nodes registered, credentials published);
+#                           default 600 (ZEK_TIMEOUT)
+#   --image IMAGE           node image (ZEK_IMAGE, default zek:latest)
+#   --subnet CIDR           cluster subnet (ZEK_SUBNET, default: first free
+#                           172.20.X.0/24)
+#   --master-ip IP          first master's IP (ZEK_MASTER_IP, default
+#                           <subnet>.2)
+#   --dns IP                upstream DNS for the node containers (ZEK_DNS)
+#   --pod-cidr CIDR         pod subnet passed to kubeadm (POD_CIDR, default
+#                           10.244.0.0/16)
+#   --mounts SPEC           extra host bind mounts for the nodes: a
+#                           space-separated list of
+#                           host-path:container-path[:options] (ZEK_MOUNTS)
+#   up-only flags: --workers N (ZEK_NODES), --masters M (ZEK_MASTERS).
 #
-# Env overrides: ZEK_CLUSTER, ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET,
-#                ZEK_MASTER_IP, ZEK_DNS, POD_CIDR, ZEK_NODES (default --workers)
+# Env overrides: the env twin of every flag above - ZEK_CLUSTER,
+#                ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET, ZEK_MASTER_IP, ZEK_DNS,
+#                POD_CIDR, ZEK_MOUNTS, ZEK_NODES, ZEK_MASTERS.
 set -euo pipefail
 
 log() { echo "[zek] $*" >&2; }
@@ -47,24 +63,76 @@ die() {
 	exit 1
 }
 
+# Settings: environment first (each flag's env twin), then the flags parsed
+# below override them (flag > env > default), then everything is validated.
 CLUSTER="${ZEK_CLUSTER:-zek}"
 WAIT_TIMEOUT="${ZEK_TIMEOUT:-600}"
+IMAGE="${ZEK_IMAGE:-zek:latest}"
+SUBNET="${ZEK_SUBNET:-}"
+MASTER_IP="${ZEK_MASTER_IP:-}"
+DNS="${ZEK_DNS:-}"
+POD_CIDR="${POD_CIDR:-}"
+MOUNTS="${ZEK_MOUNTS:-}"
+DEFAULT_WORKERS="${ZEK_NODES:-1}"
+DEFAULT_MASTERS="${ZEK_MASTERS:-1}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	-c | --cluster)
+	--cluster)
 		shift
-		[[ $# -gt 0 ]] || die "-c needs a cluster name"
+		[[ $# -gt 0 ]] || die "--cluster needs a cluster name"
 		CLUSTER="$1"
 		shift
 		;;
-	-c=* | --cluster=*) CLUSTER="${1#*=}" && shift ;;
-	-t | --timeout)
+	--cluster=*) CLUSTER="${1#*=}" && shift ;;
+	--timeout)
 		shift
-		[[ $# -gt 0 ]] || die "-t needs a number of seconds"
+		[[ $# -gt 0 ]] || die "--timeout needs a number of seconds"
 		WAIT_TIMEOUT="$1"
 		shift
 		;;
-	-t=* | --timeout=*) WAIT_TIMEOUT="${1#*=}" && shift ;;
+	--timeout=*) WAIT_TIMEOUT="${1#*=}" && shift ;;
+	--image)
+		shift
+		[[ $# -gt 0 ]] || die "--image needs a value"
+		IMAGE="$1"
+		shift
+		;;
+	--image=*) IMAGE="${1#*=}" && shift ;;
+	--subnet)
+		shift
+		[[ $# -gt 0 ]] || die "--subnet needs a value"
+		SUBNET="$1"
+		shift
+		;;
+	--subnet=*) SUBNET="${1#*=}" && shift ;;
+	--master-ip)
+		shift
+		[[ $# -gt 0 ]] || die "--master-ip needs a value"
+		MASTER_IP="$1"
+		shift
+		;;
+	--master-ip=*) MASTER_IP="${1#*=}" && shift ;;
+	--dns)
+		shift
+		[[ $# -gt 0 ]] || die "--dns needs a value"
+		DNS="$1"
+		shift
+		;;
+	--dns=*) DNS="${1#*=}" && shift ;;
+	--pod-cidr)
+		shift
+		[[ $# -gt 0 ]] || die "--pod-cidr needs a value"
+		POD_CIDR="$1"
+		shift
+		;;
+	--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
+	--mounts)
+		shift
+		[[ $# -gt 0 ]] || die "--mounts needs a value"
+		MOUNTS="$1"
+		shift
+		;;
+	--mounts=*) MOUNTS="${1#*=}" && shift ;;
 	*) break ;;
 	esac
 done
@@ -72,12 +140,15 @@ done
 	die "invalid cluster name '${CLUSTER}' (letters, digits, '-' and '_' only)"
 [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] ||
 	die "invalid timeout '${WAIT_TIMEOUT}' (expected seconds >= 1)"
+[[ -n ${IMAGE} ]] || die "--image needs a value"
+[[ ${DEFAULT_WORKERS} =~ ^[0-9]+$ ]] ||
+	die "invalid ZEK_NODES '${DEFAULT_WORKERS}' (expected a number of workers)"
+[[ ${DEFAULT_MASTERS} =~ ^[1-9][0-9]*$ ]] ||
+	die "invalid ZEK_MASTERS '${DEFAULT_MASTERS}' (expected a number of masters >= 1)"
 
-IMAGE="${ZEK_IMAGE:-zek:latest}"
 NET_NAME="${CLUSTER}-net"
 MASTER_NAME="${CLUSTER}-master-1"
 LB_NAME="${CLUSTER}-lb"
-DEFAULT_WORKERS="${ZEK_NODES:-1}"
 
 NODE_ARGS=(
 	--privileged --cgroupns=host
@@ -87,8 +158,18 @@ NODE_ARGS=(
 	-v /sys/fs/cgroup:/sys/fs/cgroup:rw
 	--tmpfs /run --tmpfs /tmp
 )
-[[ -n ${ZEK_DNS:-} ]] && NODE_ARGS+=(--dns "${ZEK_DNS}")
-[[ -n ${POD_CIDR:-} ]] && NODE_ARGS+=(--env "POD_CIDR=${POD_CIDR}")
+[[ -n ${DNS} ]] && NODE_ARGS+=(--dns "${DNS}")
+[[ -n ${POD_CIDR} ]] && NODE_ARGS+=(--env "POD_CIDR=${POD_CIDR}")
+# Extra host bind mounts (ZEK_MOUNTS/--mounts): a space-separated list of
+# host-path:container-path[:options] entries, each validated here so a typo
+# dies before any container is created.
+mount_entries=()
+[[ -n ${MOUNTS} ]] && read -r -a mount_entries <<<"${MOUNTS}"
+for m in "${mount_entries[@]}"; do
+	[[ ${m} =~ ^[^:]+:/[^:]+(:[^:]*)?$ ]] ||
+		die "invalid mount '${m}' (expected host-path:container-path[:options])"
+	NODE_ARGS+=(-v "${m}")
+done
 
 net_exists() { docker network inspect "${NET_NAME}" >/dev/null 2>&1; }
 ensure_net() {
@@ -96,13 +177,13 @@ ensure_net() {
 	net_exists || docker network create --driver bridge --subnet "$1" "${NET_NAME}" >/dev/null
 }
 
-# First free 172.20.X.0/24 (or $ZEK_SUBNET when set) so parallel clusters
-# never share a subnet. The scan is not atomic: two concurrent `up` calls
-# can pick the same candidate, so when creating clusters in parallel pass
-# a distinct ZEK_SUBNET per cluster (e2e.sh pre-allocates them).
+# First free 172.20.X.0/24 (or --subnet/ZEK_SUBNET when set) so parallel
+# clusters never share a subnet. The scan is not atomic: two concurrent
+# `up` calls can pick the same candidate, so when creating clusters in
+# parallel pass a distinct subnet per cluster (e2e.sh pre-allocates them).
 pick_subnet() {
-	[[ -n ${ZEK_SUBNET:-} ]] && {
-		echo "${ZEK_SUBNET}"
+	[[ -n ${SUBNET} ]] && {
+		echo "${SUBNET}"
 		return
 	}
 	# Collect the occupied subnets word by word through plain assignments:
@@ -177,12 +258,17 @@ start_node() { # name
 
 # Run kubectl against the cluster via the first master's container.
 kube() {
-	local tty_flag=-i
-	[[ -t 0 ]] && tty_flag=""
-	docker exec "${tty_flag}" "${MASTER_NAME}" /entrypoint.sh kubectl "$@"
+	# -i always: stdin must be forwarded for piped manifests (even when a
+	# terminal sits on the other end). A pty is added only when both ends
+	# are one, so interactive `kubectl exec ... bash` gets a real terminal
+	# while captured or piped output stays free of CR line endings (the
+	# e2e assertions compare such output).
+	local -a exec_flags=(-i)
+	[[ -t 0 && -t 1 ]] && exec_flags+=(-t)
+	docker exec "${exec_flags[@]}" "${MASTER_NAME}" /entrypoint.sh kubectl "$@"
 }
 
-# Every internal wait is bounded by WAIT_TIMEOUT (-t/--timeout, default
+# Every internal wait is bounded by WAIT_TIMEOUT (--timeout, default
 # ZEK_TIMEOUT or 600s) so a broken cluster fails fast instead of hanging.
 wait_for_cluster_conf() {
 	local deadline=$((SECONDS + WAIT_TIMEOUT))
@@ -195,7 +281,7 @@ wait_for_cluster_conf() {
 		}
 		sleep 2
 	done
-	die "control plane API not reachable after ${WAIT_TIMEOUT}s (see: ./zek.sh -c ${CLUSTER} logs ${MASTER_NAME})"
+	die "control plane API not reachable after ${WAIT_TIMEOUT}s (see: ./zek.sh --cluster ${CLUSTER} logs ${MASTER_NAME})"
 }
 
 # Wait until a control-plane node actually serves: its kube-apiserver and
@@ -252,8 +338,9 @@ read_join_credentials() {
 	)
 }
 
-# Static IP of master $1 (1-based): the first sits at ZEK_MASTER_IP
-# (default <subnet>.2), following ones increment the last octet.
+# Static IP of master $1 (1-based): the first sits at --master-ip
+# (ZEK_MASTER_IP, default <subnet>.2), following ones increment the last
+# octet.
 master_node_ip() {
 	local base="${MASTER_IP%.*}" last_octet="${MASTER_IP##*.}"
 	echo "${base}.$((last_octet + $1 - 1))"
@@ -264,7 +351,7 @@ create_cluster() {
 
 	NET_SUBNET="$(pick_subnet)"
 	local subnet_prefix="${NET_SUBNET%.*}"
-	MASTER_IP="${ZEK_MASTER_IP:-${subnet_prefix}.2}"
+	MASTER_IP="${MASTER_IP:-${subnet_prefix}.2}"
 	local lb_ip="${subnet_prefix}.10"
 	ensure_net "${NET_SUBNET}"
 
@@ -345,13 +432,13 @@ cmd_up() {
 	local workers="" masters="" workers_set=0 masters_set=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--workers | -w)
+		--workers)
 			[[ $# -ge 2 ]] || die "--workers needs a value"
 			workers="$2"
 			workers_set=1
 			shift 2
 			;;
-		--masters | -m)
+		--masters)
 			[[ $# -ge 2 ]] || die "--masters needs a value"
 			masters="$2"
 			masters_set=1
@@ -379,7 +466,7 @@ cmd_up() {
 	[[ -z ${masters} ]] || { [[ ${masters} =~ ^[0-9]+$ ]] && [[ ${masters} -ge 1 ]]; } ||
 		die "--masters must be a number >= 1"
 	workers="${workers:-${DEFAULT_WORKERS}}"
-	masters="${masters:-1}"
+	masters="${masters:-${DEFAULT_MASTERS}}"
 
 	# shellcheck disable=SC2310
 	if node_exists "${MASTER_NAME}"; then
@@ -439,7 +526,7 @@ cmd_clean() {
 
 cmd_status() {
 	# shellcheck disable=SC2310
-	net_exists || die "no cluster named ${CLUSTER} (create it with: $0 -c ${CLUSTER} up)"
+	net_exists || die "no cluster named ${CLUSTER} (create it with: $0 --cluster ${CLUSTER} up)"
 	local running=0 name state rows
 	rows=$(docker ps -a --format '{{.Names}}\t{{.State}}' -f network="${NET_NAME}") || rows=""
 	while IFS=$'\t' read -r name state; do
@@ -478,7 +565,7 @@ cmd_destroy() {
 }
 
 usage() {
-	die "usage: $0 [-c cluster] [-t seconds] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
+	die "usage: $0 [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
 }
 
 case "${1:-}" in

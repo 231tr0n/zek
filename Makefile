@@ -18,7 +18,7 @@ COMBO_TAG := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-latest
 # Shared build+tag recipe; $(1) is extra docker build flags (build-nocache
 # passes --no-cache to force the image preload step to re-run).
 
-.PHONY: build build-nocache help
+.PHONY: build build-nocache lint help
 
 define build_image
 	$(DOCKER) build $(1) -t $(IMAGE):$(TAG) \
@@ -33,6 +33,24 @@ build: ## Build + tag $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
 
 build-nocache: ## Build, forcing the image preload step to re-run
 	$(call build_image,--no-cache)
+
+lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
+	$(DOCKER) run --rm \
+		-v "$(PWD):/repo:z" -w /repo \
+		fedora:latest bash -c ' \
+			set -euo pipefail; \
+			dnf install -y git shellcheck shfmt nodejs npm golang haproxy; \
+			go install github.com/reteps/dockerfmt@latest; \
+			go install sigs.k8s.io/yaml/yamlfmt@latest; \
+			export PATH="$$(go env GOPATH)/bin:$$PATH"; \
+			git config --global --add safe.directory "*"; \
+			shellcheck --version | sed -n "2p"; \
+			npx --yes prettier --version; \
+			dockerfmt version; \
+			command -v shfmt; \
+			yamlfmt -h | sed -n "1p"; \
+			haproxy -v | sed -n "1p"; \
+			./lint.sh'
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
