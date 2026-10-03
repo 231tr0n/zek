@@ -338,6 +338,30 @@ creds_published() { # cluster
 	docker exec "${1}-master-1" test -f /etc/cluster/admin.conf
 }
 
+# Fill CLONE_ARGS with docker run args reproducing container $1's host
+# config, for cloning a node with small overrides. Derived from the live
+# container via docker inspect, so it tracks zek.sh's NODE_ARGS
+# automatically instead of duplicating them in the test.
+node_clone_args() { # container
+	CLONE_ARGS=()
+	local c=$1 priv cgroupns net bind tmp dns
+	priv=$(docker inspect -f '{{.HostConfig.Privileged}}' "${c}")
+	[[ ${priv} == true ]] && CLONE_ARGS+=(--privileged)
+	cgroupns=$(docker inspect -f '{{.HostConfig.CgroupnsMode}}' "${c}")
+	[[ -n ${cgroupns} ]] && CLONE_ARGS+=(--cgroupns "${cgroupns}")
+	net=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "${c}")
+	CLONE_ARGS+=(--network "${net}")
+	for bind in $(docker inspect -f '{{range .HostConfig.Binds}}{{.}} {{end}}' "${c}"); do
+		CLONE_ARGS+=(-v "${bind}")
+	done
+	for tmp in $(docker inspect -f '{{range $k, $v := .HostConfig.Tmpfs}}{{$k}} {{end}}' "${c}"); do
+		CLONE_ARGS+=(--tmpfs "${tmp}")
+	done
+	for dns in $(docker inspect -f '{{range .HostConfig.DNS}}{{.}} {{end}}' "${c}"); do
+		CLONE_ARGS+=(--dns "${dns}")
+	done
+}
+
 web_info() {
 	zk "$1" kubectl -n default get pod -l app=web \
 		-o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}@{.spec.nodeName}{"\n"}{end}'
@@ -1187,12 +1211,12 @@ test_recovery() {
 	token=$(docker exec "${c}-master-1" cat /etc/cluster/token)
 	ca_hash=$(docker exec "${c}-master-1" cat /etc/cluster/ca-hash)
 	endpoint=$(docker exec "${c}-master-1" cat /etc/cluster/api-endpoint)
+	# Clone the existing worker's host config (network, volumes, tmpfs,
+	# privileged, cgroupns, ...) so the test tracks zek.sh's NODE_ARGS
+	# instead of duplicating them; only env and restart are overridden.
+	node_clone_args "${c}-worker-1"
 	docker run -d --name "${c}-worker-nhm" --hostname "${c}-worker-nhm" \
-		--network "${c}-net" --restart=no \
-		--privileged --cgroupns=host \
-		-v /lib/modules:/lib/modules:ro \
-		-v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-		--tmpfs /run --tmpfs /tmp \
+		--restart=no "${CLONE_ARGS[@]}" \
 		-e NO_HOST_MODULES=1 \
 		-e "JOIN_TOKEN=${token}" -e "JOIN_CA_HASH=${ca_hash}" \
 		-e "JOIN_API_ENDPOINT=${endpoint}" \
@@ -1227,7 +1251,10 @@ test_recovery() {
 	wait_for "${c}: credentials republished" 120 creds_published "${c}"
 	wait_for "${c}: control plane readyz after republish" 120 readyz_ok "${c}"
 
-	# run_kubectl waits for a missing admin.conf instead of dying.
+	# run_kubectl waits for a missing admin.conf instead of dying. The
+	# timeout bounds the worst case: the restore lands after 3s, so a
+	# successful wait finishes in seconds and a failed restore fails
+	# here instead of hanging for run_kubectl's full 600s.
 	log "${c}: kubectl waits for the cluster config to appear"
 	docker exec "${c}-master-1" rm -f /etc/cluster/admin.conf
 	(
@@ -1235,7 +1262,7 @@ test_recovery() {
 		docker exec "${c}-master-1" cp /etc/kubernetes/admin.conf /etc/cluster/admin.conf
 	) &
 	bg=$!
-	out=$(docker exec "${c}-master-1" /entrypoint.sh kubectl get nodes 2>&1) ||
+	out=$(timeout 30 docker exec "${c}-master-1" /entrypoint.sh kubectl get nodes 2>&1) ||
 		fail "${c}: kubectl did not wait for the config: ${out}"
 	wait "${bg}" 2>/dev/null || true
 	assert_cmd "${c}: nodes listed after the wait" 2 node_count "${c}"
