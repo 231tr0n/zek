@@ -22,8 +22,10 @@
 #     /etc/cluster and passes them to joining nodes as the JOIN_* env
 #     vars; there is no shared volume between nodes.
 #   - Host effects are limited to in-memory kernel setup (loading modules the
-#     host lacks and enabling a few sysctls); both are undone on shutdown and
-#     nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
+#     host lacks, enabling a few sysctls, and raising the host-wide inotify
+#     quota); sysctls and any modules we loaded are undone on shutdown, the
+#     inotify quota stays raised on purpose (other zek containers need it),
+#     and nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
 set -euo pipefail
 
 readonly CLUSTER_DIR="${CLUSTER_DIR:-/etc/cluster}"
@@ -50,22 +52,38 @@ die() {
 	exit 1
 }
 
+# Run a command with its output captured to a log file; on failure surface
+# the log on stderr and die. kubeadm's preflight/cert chatter is one-shot
+# and verbose, so it stays out of docker logs unless it fails.
+run_logged() { # logfile desc cmd...
+	local logfile=$1 desc=$2
+	shift 2
+	if ! "$@" >"${logfile}" 2>&1; then
+		cat "${logfile}" >&2
+		die "${desc}"
+	fi
+}
+
 cleanup() {
 	# Undo the host-level kernel setup: restore sysctls and unload any modules
-	# we loaded (only ones the host did not already have). Unloading may fail
-	# while other processes still use them, which is fine.
+	# we loaded (only ones the host did not already have; with
+	# NO_HOST_MODULES=1 nothing was loaded, so the unload is skipped too -
+	# otherwise an idle host module could be pulled out from under the host).
+	# Unloading may fail while other processes still use them, which is fine.
 	log "shutting down"
-	[ -n "$CONTAINERD_PID" ] && kill "$CONTAINERD_PID" 2>/dev/null || true
-	[ -n "$SUPERVISOR_PID" ] && kill "$SUPERVISOR_PID" 2>/dev/null || true
+	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2>/dev/null || true
+	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2>/dev/null || true
 	for key in "${!SYSCTL_BEFORE[@]}"; do
-		[ -n "${SYSCTL_BEFORE[$key]}" ] && sysctl -w "$key=${SYSCTL_BEFORE[$key]}" >/dev/null 2>&1 || true
+		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" >/dev/null 2>&1 || true
 	done
-	for module in br_netfilter vxlan; do
-		case " $HOST_MODULES_PRESENT " in
-		*" $module "*) ;;
-		*) rmmod "$module" 2>/dev/null || true ;;
-		esac
-	done
+	if [[ ${NO_HOST_MODULES:-0} != 1 ]]; then
+		for module in br_netfilter vxlan; do
+			case " ${HOST_MODULES_PRESENT} " in
+			*" ${module} "*) ;;
+			*) rmmod "${module}" 2>/dev/null || true ;;
+			esac
+		done
+	fi
 	exit 0
 }
 trap cleanup TERM INT
@@ -74,17 +92,17 @@ preflight_host() {
 	# In-memory kernel setup only: it does not survive a reboot and touches no
 	# disk. Skip entirely with NO_HOST_MODULES=1 if the host manages its own
 	# modules (e.g. they were already loaded at boot).
-	[ "${NO_HOST_MODULES:-0}" = 1 ] && return 0
+	[[ ${NO_HOST_MODULES:-0} == 1 ]] && return 0
 	for module in br_netfilter vxlan; do
-		if [ -d "/sys/module/$module" ]; then
-			HOST_MODULES_PRESENT="$HOST_MODULES_PRESENT $module"
+		if [[ -d "/sys/module/${module}" ]]; then
+			HOST_MODULES_PRESENT="${HOST_MODULES_PRESENT} ${module}"
 		else
-			modprobe "$module" 2>/dev/null || true
+			modprobe "${module}" 2>/dev/null || true
 		fi
 	done
 	for key in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
-		SYSCTL_BEFORE[$key]="$(sysctl -n "$key" 2>/dev/null || true)"
-		sysctl -w "$key=1" 2>/dev/null || true
+		SYSCTL_BEFORE[${key}]="$(sysctl -n "${key}" 2>/dev/null || true)"
+		sysctl -w "${key}=1" >/dev/null 2>&1 || true
 	done
 	# Every node container runs as uid 0 in the init namespace, so they all
 	# share the host's per-uid inotify instance quota (default 128). A
@@ -92,10 +110,10 @@ preflight_host() {
 	# "inotify_init: too many open files" in cAdvisor, so raise the quota
 	# for the whole host (best effort, kept on purpose after exit: the
 	# other zek containers still need it).
-	if [ -w /proc/sys/fs/inotify/max_user_instances ]; then
+	if [[ -w /proc/sys/fs/inotify/max_user_instances ]]; then
 		local limit
 		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"
-		{ [ "$limit" -ge 1024 ] || sysctl -w fs.inotify.max_user_instances=1024; } 2>/dev/null || true
+		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 >/dev/null; } 2>/dev/null || true
 	fi
 }
 
@@ -106,27 +124,32 @@ ensure_resolv_conf() {
 	# systemd-resolved 127.0.0.53 is not routable from our netns), and fall
 	# back to public resolvers when nothing usable remains.
 	local upstreams
+	# NODE_DNS is an optional override for manual `docker run -e
+	# NODE_DNS="..."` usage; normally the docker --dns resolv.conf parsed
+	# below provides the upstreams.
 	upstreams="${NODE_DNS:-}"
-	if [ -z "$upstreams" ]; then
+	if [[ -z ${upstreams} ]]; then
 		upstreams="$(grep -oE '([0-9]+\.){3}[0-9]+' /etc/resolv.conf |
 			grep -vE '^127\.|^169\.254\.' | sort -u | tr '\n' ' ')" || true
 	fi
-	[ -n "$upstreams" ] || upstreams="1.1.1.1 8.8.8.8"
+	[[ -n ${upstreams} ]] || upstreams="1.1.1.1 8.8.8.8"
 	{
 		echo "search ."
-		for nameserver in $upstreams; do echo "nameserver $nameserver"; done
+		for nameserver in ${upstreams}; do echo "nameserver ${nameserver}"; done
 	} >/etc/resolv.conf
 }
 
 ensure_etc_kubernetes() {
-	# kubeadm insists on /etc/kubernetes; keep it on the persistent /var/lib
-	# volume so node state survives container removal.
+	# kubeadm insists on /etc/kubernetes; keep its state under
+	# /var/lib/kubernetes on the container's writable layer so it survives
+	# stop/start and restarts (and dies with the container on docker rm,
+	# like the rest of the node state).
 	mkdir -p /var/lib/kubernetes
 	ln -sfn /var/lib/kubernetes /etc/kubernetes
 }
 
 start_containerd() {
-	[ -f /etc/containerd/config.toml ] || containerd config default >/etc/containerd/config.toml
+	[[ -f /etc/containerd/config.toml ]] || containerd config default >/etc/containerd/config.toml
 	# Search both the Alpine-provided and user-installed CNI binaries.
 	sed -i "s|bin_dirs = \[.*\]|bin_dirs = ['/opt/cni/bin', '/usr/libexec/cni']|" /etc/containerd/config.toml
 	# /var/lib lives on the container's overlay rootfs (no volume), and overlay
@@ -150,7 +173,7 @@ start_containerd() {
 	containerd >/var/log/containerd.log 2>&1 &
 	CONTAINERD_PID=$!
 	for _ in $(seq 1 60); do
-		[ -S /run/containerd/containerd.sock ] && return 0
+		[[ -S /run/containerd/containerd.sock ]] && return 0
 		sleep 1
 	done
 	die "containerd did not start (see /var/log/containerd.log)"
@@ -177,9 +200,9 @@ import_k8s_images() {
 	log "importing preloaded kubeadm images"
 	local tarball
 	for tarball in /opt/zek/images/*.tar; do
-		[ -e "$tarball" ] || continue
-		ctr --namespace k8s.io images import --no-unpack "$tarball" >/dev/null 2>&1 ||
-			log "WARNING: failed to import $tarball"
+		[[ -e ${tarball} ]] || continue
+		ctr --namespace k8s.io images import --no-unpack "${tarball}" >/dev/null 2>&1 ||
+			log "WARNING: failed to import ${tarball}"
 	done
 }
 
@@ -190,7 +213,7 @@ master_ip() {
 
 # sha256 of the CA public key - the exact format kubeadm expects for the
 # caCertHashes join-discovery field ("sha256:<hash>").
-ca_hash() {
+get_ca_hash() {
 	openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt |
 		openssl pkey -pubin -outform der 2>/dev/null |
 		openssl dgst -sha256 -hex | sed 's/^.*= //'
@@ -198,16 +221,18 @@ ca_hash() {
 
 # The API endpoint every kubeconfig points at: the load balancer's IP for
 # multi-master clusters, the first master's own address otherwise. zek.sh
-# passes it as API_ENDPOINT; the fallback keeps plain `docker run ... master`
-# working for a single node.
+# passes it as API_ENDPOINT and init_control_plane defaults it too; this
+# :- fallback is a safety net so the writer never sees it unset.
 write_kubeadm_init_conf() {
-	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
+	local api_ip
+	api_ip=$(master_ip)
+	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
 	mkdir -p /etc/zek
-	cat >"$KUBEADM_INIT_CONF" <<EOF
+	cat >"${KUBEADM_INIT_CONF}" <<EOF
 apiVersion: ${KUBEADM_API_VERSION}
 kind: InitConfiguration
 localAPIEndpoint:
-  advertiseAddress: $(master_ip)
+  advertiseAddress: ${api_ip}
   bindPort: 6443
 nodeRegistration:
   name: ${NODE_NAME}
@@ -234,8 +259,8 @@ EOF
 # master so kubeadm stores the control-plane certs and joins stacked etcd.
 write_kubeadm_join_conf() {
 	mkdir -p /etc/zek
-	if [ "${1:-worker}" = control-plane ]; then
-		cat >"$KUBEADM_JOIN_CONF" <<EOF
+	if [[ ${1:-worker} == control-plane ]]; then
+		cat >"${KUBEADM_JOIN_CONF}" <<EOF
 apiVersion: ${KUBEADM_API_VERSION}
 kind: JoinConfiguration
 discovery:
@@ -251,7 +276,7 @@ nodeRegistration:
   criSocket: unix:///run/containerd/containerd.sock
 EOF
 	else
-		cat >"$KUBEADM_JOIN_CONF" <<EOF
+		cat >"${KUBEADM_JOIN_CONF}" <<EOF
 apiVersion: ${KUBEADM_API_VERSION}
 kind: JoinConfiguration
 discovery:
@@ -272,15 +297,15 @@ patch_kube_proxy() {
 	# (EACCES); disable its auto-tuning via the ConfigMap.
 	log "disabling kube-proxy conntrack tuning"
 	local dir=/etc/zek/kube-proxy
-	mkdir -p "$dir"
+	mkdir -p "${dir}"
 	export KUBECONFIG=/etc/kubernetes/admin.conf
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' >"$dir/config.conf"
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' >"$dir/kubeconfig.conf"
-	[ -s "$dir/config.conf" ] || return 0
-	sed -i -e 's/^\(  maxPerCore: \)null/\10/' -e 's/^\(  min: \)null/\10/' "$dir/config.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' >"${dir}/config.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' >"${dir}/kubeconfig.conf"
+	[[ -s "${dir}/config.conf" ]] || return 0
+	sed -i -e 's/^\(  maxPerCore: \)null/\10/' -e 's/^\(  min: \)null/\10/' "${dir}/config.conf"
 	kubectl -n kube-system create configmap kube-proxy \
-		--from-file=config.conf="$dir/config.conf" \
-		--from-file=kubeconfig.conf="$dir/kubeconfig.conf" \
+		--from-file=config.conf="${dir}/config.conf" \
+		--from-file=kubeconfig.conf="${dir}/kubeconfig.conf" \
 		--dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
 	kubectl -n kube-system rollout restart daemonset kube-proxy >/dev/null 2>&1 || true
 }
@@ -290,10 +315,10 @@ patch_kube_proxy() {
 # enforce the key here right before every kubelet start - that covers init,
 # resume and all join paths regardless of what kubeadm's defaults write.
 ensure_kubelet_config() {
-	[ -f "$KUBELET_CONFIG" ] || return 0
-	sed -i 's/^failSwapOn:[[:space:]]*.*/failSwapOn: false/' "$KUBELET_CONFIG"
-	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "$KUBELET_CONFIG" && return 0
-	printf '\nfailSwapOn: false\n' >>"$KUBELET_CONFIG"
+	[[ -f ${KUBELET_CONFIG} ]] || return 0
+	sed -i 's/^failSwapOn:[[:space:]]*.*/failSwapOn: false/' "${KUBELET_CONFIG}"
+	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "${KUBELET_CONFIG}" && return 0
+	printf '\nfailSwapOn: false\n' >>"${KUBELET_CONFIG}"
 }
 
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config
@@ -303,32 +328,56 @@ ensure_kubelet_config() {
 kubelet_supervisor() {
 	trap 'exit 0' TERM INT
 	while :; do
-		if [ -f "$KUBELET_CONFIG" ]; then
+		if [[ -f ${KUBELET_CONFIG} ]]; then
 			ensure_kubelet_config
-			local args=""
-			if [ -f "$KUBEADM_FLAGS" ]; then
-				source "$KUBEADM_FLAGS"
+			local -a args=()
+			if [[ -f ${KUBEADM_FLAGS} ]]; then
+				# shellcheck source=/dev/null
+				source "${KUBEADM_FLAGS}"
 				# Drop any deprecated CLI copy kubeadm may still ship
 				# in KUBELET_KUBEADM_ARGS; the config file carries
 				# the setting now.
 				local flag
 				for flag in ${KUBELET_KUBEADM_ARGS:-}; do
-					case "$flag" in
+					case "${flag}" in
 					--fail-swap-on | --fail-swap-on=*) ;;
-					*) args="$args $flag" ;;
+					*) args+=("${flag}") ;;
 					esac
 				done
 			fi
-			if [ -f /etc/kubernetes/bootstrap-kubelet.conf ]; then
-				args="$args --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
-			elif [ -f /etc/kubernetes/kubelet.conf ]; then
-				args="$args --kubeconfig=/etc/kubernetes/kubelet.conf"
+			if [[ -f /etc/kubernetes/bootstrap-kubelet.conf ]]; then
+				args+=(--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf)
+			elif [[ -f /etc/kubernetes/kubelet.conf ]]; then
+				args+=(--kubeconfig=/etc/kubernetes/kubelet.conf)
 			fi
-			kubelet --config "$KUBELET_CONFIG" --hostname-override "$NODE_NAME" \
-				--v=2 $args &
+			# Full kubelet log goes to /var/log/kubelet.log; docker logs
+			# only gets warnings/errors/fatals and non-klog lines
+			# (panics). At --v=2 klog's I-lines are per-pod sync spam
+			# that used to flood `docker logs` of every node, and klog
+			# renders big values (kubelet config, /proc/swaps) as a
+			# multi-line `...=<` block with a tab-indented body and a
+			# lone `>` closer that carry no I-prefix - awk drops those
+			# with the header. fflush() keeps the sparse output
+			# realtime through the pipe; wait returns the awk pid, so if
+			# awk ever died while kubelet was still alive, the pkill
+			# keeps the start below from ever running two kubelets.
+			pkill -x kubelet >/dev/null 2>&1 || true
+			kubelet --config "${KUBELET_CONFIG}" --hostname-override "${NODE_NAME}" \
+				--v=2 "${args[@]}" 2>&1 |
+				tee -a /var/log/kubelet.log |
+				awk '
+					inval {
+						if (substr($0, 1, 1) == "\t" ||
+							$0 ~ /^[[:space:]]*>[[:space:]]*$/) next
+						inval = 0
+					}
+					/<$/ { inval = 1 }
+					/^I[0-9]{4} / { next }
+					{ print; fflush() }
+				' &
 			local pid=$!
-			log "kubelet running (pid $pid)"
-			wait "$pid" 2>/dev/null || true
+			log "kubelet running (full log: /var/log/kubelet.log)"
+			wait "${pid}" 2>/dev/null || true
 			log "kubelet exited, restarting"
 		fi
 		sleep 2
@@ -339,7 +388,7 @@ ensure_cni_dirs() {
 	# Nodes start with no CNI; the user installs one whose installer runs as a
 	# non-root pod user (e.g. calico uses uid 10001) and drops binaries/config
 	# onto the node. Pre-create those paths world-writable so it works.
-	for dir in /etc/cni/net.d /opt/cni/bin; do mkdir -p "$dir" && chmod 0777 "$dir"; done
+	for dir in /etc/cni/net.d /opt/cni/bin; do mkdir -p "${dir}" && chmod 0777 "${dir}"; done
 }
 
 ensure_shared_mounts() {
@@ -383,9 +432,9 @@ node_setup() {
 publish_cluster_credentials() {
 	local token="" cert_key="" ca_hash uploaded i
 	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
-	mkdir -p "$CLUSTER_DIR"
-	[ -n "${KUBECONFIG:-}" ] || export KUBECONFIG=/etc/kubernetes/admin.conf
-	ca_hash="$(ca_hash)"
+	mkdir -p "${CLUSTER_DIR}"
+	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
+	ca_hash="$(get_ca_hash)"
 	# Generate the certificate key ourselves and pass it to upload-certs
 	# instead of scraping it from kubeadm's human-readable output - that
 	# wording changed between releases before (v1.37 moved it to its own
@@ -396,37 +445,42 @@ publish_cluster_credentials() {
 		token="$(kubeadm token create --ttl 0 2>/dev/null | tr -d '\n')" || token=""
 		uploaded=""
 		kubeadm init phase upload-certs --upload-certs \
-			--certificate-key "$cert_key" >/dev/null 2>&1 && uploaded=1
-		[ -n "$token" ] && [ -n "$uploaded" ] && break
+			--certificate-key "${cert_key}" >/dev/null 2>&1 && uploaded=1
+		[[ -n ${token} ]] && [[ -n ${uploaded} ]] && break
 		sleep 2
 	done
-	[ -n "$token" ] && [ -n "$uploaded" ] && [ -n "$ca_hash" ] ||
+	[[ -n ${token} ]] && [[ -n ${uploaded} ]] && [[ -n ${ca_hash} ]] ||
 		die "could not extract the join credentials (token/certificate key/CA hash)"
-	printf '%s' "$token" >"$CLUSTER_DIR/token"
-	printf '%s' "$cert_key" >"$CLUSTER_DIR/cert-key"
-	echo "$API_ENDPOINT" >"$CLUSTER_DIR/api-endpoint"
-	printf '%s' "$ca_hash" >"$CLUSTER_DIR/ca-hash"
-	cp /etc/kubernetes/admin.conf "$CLUSTER_DIR/admin.conf"
-	log "published join credentials to $CLUSTER_DIR (endpoint: ${API_ENDPOINT})"
+	printf '%s' "${token}" >"${CLUSTER_DIR}/token"
+	printf '%s' "${cert_key}" >"${CLUSTER_DIR}/cert-key"
+	echo "${API_ENDPOINT}" >"${CLUSTER_DIR}/api-endpoint"
+	printf '%s' "${ca_hash}" >"${CLUSTER_DIR}/ca-hash"
+	cp /etc/kubernetes/admin.conf "${CLUSTER_DIR}/admin.conf"
+	log "published join credentials to ${CLUSTER_DIR} (endpoint: ${API_ENDPOINT})"
 }
 
 # First control-plane node: kubeadm init against the API endpoint, then
 # publish the credentials the manager hands to every joining node.
 init_control_plane() {
-	local ip_addr
-	ip_addr="$(master_ip)"
-	API_ENDPOINT="${API_ENDPOINT:-${ip_addr}:6443}"
-	log "initializing control plane on ${NODE_NAME} (${ip_addr})"
-	mkdir -p "$CLUSTER_DIR"
+	local api_ip
+	api_ip="$(master_ip)"
+	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
+	log "initializing control plane on ${NODE_NAME} (${api_ip})"
+	mkdir -p "${CLUSTER_DIR}"
 	import_k8s_images
 	write_kubeadm_init_conf
-	kubeadm init --config "$KUBEADM_INIT_CONF" --ignore-preflight-errors=all || die "kubeadm init failed"
+	run_logged /var/log/kubeadm-init.log "kubeadm init failed" \
+		kubeadm init --config "${KUBEADM_INIT_CONF}" --ignore-preflight-errors=all
+	# Every phase ran, including the bootstrap-token RBAC that lets joining
+	# nodes fetch cluster-info; run_master uses this to tell a completed
+	# init from one that died in wait-control-plane.
+	touch "${CLUSTER_DIR}/init-complete"
 
 	export KUBECONFIG=/etc/kubernetes/admin.conf
 	patch_kube_proxy
 
 	publish_cluster_credentials
-	log "control plane ready (endpoint: ${API_ENDPOINT}, token: $(cat "$CLUSTER_DIR/token"))"
+	log "control plane ready (endpoint: ${API_ENDPOINT})"
 	log "no CNI installed; nodes are NotReady until you install one (flannel, cilium, ...)"
 }
 
@@ -434,16 +488,19 @@ init_control_plane() {
 # through the API endpoint with the certificate key published by the first
 # master, becoming a member of the stacked etcd cluster.
 join_control_plane() {
-	[ -n "${JOIN_TOKEN:-}" ] && [ -n "${JOIN_CA_HASH:-}" ] && [ -n "${JOIN_API_ENDPOINT:-}" ] &&
-		[ -n "${JOIN_CERT_KEY:-}" ] ||
+	[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] &&
+		[[ -n ${JOIN_CERT_KEY:-} ]] ||
 		die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY"
-	TOKEN="$JOIN_TOKEN"
-	CA_HASH="$JOIN_CA_HASH"
-	API_ENDPOINT="$JOIN_API_ENDPOINT"
+	TOKEN="${JOIN_TOKEN}"
+	CA_HASH="${JOIN_CA_HASH}"
+	API_ENDPOINT="${JOIN_API_ENDPOINT}"
 	log "joining ${NODE_NAME} as a control-plane node via ${API_ENDPOINT}"
 	import_k8s_images
 	write_kubeadm_join_conf control-plane
-	kubeadm join --config "$KUBEADM_JOIN_CONF" --ignore-preflight-errors=all || die "control-plane join failed"
+	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
+		kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all
+	mkdir -p "${CLUSTER_DIR}"
+	touch "${CLUSTER_DIR}/init-complete"
 }
 
 run_master() {
@@ -451,58 +508,77 @@ run_master() {
 
 	# Recovery for a creation interrupted before kubeadm finished (crash,
 	# power loss, host reboot during `up`): the partial certs/state cannot
-	# be resumed by kubeadm, so wipe it and start over. A complete node has
-	# kubelet.conf and is never reset.
-	if [ ! -f /etc/kubernetes/kubelet.conf ] && [ -f /etc/kubernetes/pki/ca.crt ]; then
+	# be resumed by kubeadm, so wipe it and start over. Two interruption
+	# points need handling:
+	# - certs written but no kubelet.conf yet (interrupted very early);
+	# - kubelet.conf present but the init never finished. kubelet.conf is
+	#   written in the kubeconfig phase, long before wait-control-plane,
+	#   the bootstrap-token RBAC that lets nodes fetch cluster-info, and
+	#   the addons - so an init that dies in wait-control-plane (hard 4m
+	#   budget; parallel clusters can exceed it) would otherwise resume
+	#   as a half-initialized cluster whose joins all 403 on
+	#   cluster-info. Without completion evidence (the init-complete
+	#   marker, or published credentials which only exist after a
+	#   completed init) wipe and start over. Control-plane joins are
+	#   exempt: their nodes never publish credentials and never get the
+	#   marker checked here (they touch it themselves after joining).
+	if [[ ! -f /etc/kubernetes/kubelet.conf ]] && [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 		log "interrupted control-plane setup detected; resetting partial state"
+		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
+	elif [[ -f /etc/kubernetes/kubelet.conf ]] && [[ ${MASTER_JOIN:-0} != 1 ]] &&
+		[[ ! -f "${CLUSTER_DIR}/init-complete" ]] &&
+		[[ ! -f "${CLUSTER_DIR}/admin.conf" ]] &&
+		[[ ! -f "${CLUSTER_DIR}/token" ]]; then
+		log "interrupted control-plane init detected; resetting partial state"
 		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
 	fi
 
 	# kubelet.conf exists after either kubeadm init or a control-plane join,
 	# so it marks this node as already configured: only the supervisor needs
 	# to come back up.
-	if [ -f /etc/kubernetes/kubelet.conf ]; then
+	if [[ -f /etc/kubernetes/kubelet.conf ]]; then
 		log "control plane already set up, resuming"
 		# Complete a publish that was interrupted by a crash/restart -
 		# admin.conf is written last and marks the set as complete.
-		[ -f "$CLUSTER_DIR/admin.conf" ] || {
+		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || {
 			log "published credentials incomplete; republishing"
 			publish_cluster_credentials
 		}
-	elif [ "${MASTER_JOIN:-0}" = 1 ]; then
+	elif [[ ${MASTER_JOIN:-0} == 1 ]]; then
 		join_control_plane
 	else
 		init_control_plane
 	fi
 
-	wait "$SUPERVISOR_PID"
+	wait "${SUPERVISOR_PID}"
 }
 
 run_worker() {
 	node_setup
 
-	if [ -f /etc/kubernetes/kubelet.conf ]; then
+	if [[ -f /etc/kubernetes/kubelet.conf ]]; then
 		log "node already joined, resuming"
 	else
 		# A join interrupted before it finished (crash/power loss) leaves
 		# the downloaded cluster certs behind; wipe them so kubeadm join
 		# starts clean. kubelet.conf marks a complete join.
-		if [ -f /etc/kubernetes/pki/ca.crt ]; then
+		if [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 			log "interrupted join detected; resetting partial state"
 			kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
 		fi
-		[ -n "${JOIN_TOKEN:-}" ] && [ -n "${JOIN_CA_HASH:-}" ] && [ -n "${JOIN_API_ENDPOINT:-}" ] ||
+		[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] ||
 			die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT"
-		TOKEN="$JOIN_TOKEN"
-		CA_HASH="$JOIN_CA_HASH"
-		API_ENDPOINT="$JOIN_API_ENDPOINT"
+		TOKEN="${JOIN_TOKEN}"
+		CA_HASH="${JOIN_CA_HASH}"
+		API_ENDPOINT="${JOIN_API_ENDPOINT}"
 		log "joining ${NODE_NAME} to ${API_ENDPOINT}"
 		import_k8s_images
 		write_kubeadm_join_conf worker
-		kubeadm join --config "$KUBEADM_JOIN_CONF" --ignore-preflight-errors=all || die "kubeadm join failed"
+		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
+			kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all
 	fi
 
-	wait "$SUPERVISOR_PID"
+	wait "${SUPERVISOR_PID}"
 }
 
 # TCP load balancer in front of the control-plane nodes (multi-master
@@ -510,7 +586,7 @@ run_worker() {
 # (space-separated IPs); haproxy health-checks them so a dead master is
 # taken out of rotation. The stats page on :8404 shows backend state.
 run_lb() {
-	[ -n "${LB_BACKENDS:-}" ] || die "LB_BACKENDS must list the control-plane IPs"
+	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs"
 	local cfg=/etc/haproxy/haproxy.cfg i=1 ip
 	mkdir -p /etc/haproxy
 	{
@@ -534,8 +610,8 @@ backend apiservers
 	balance roundrobin
 	option tcp-check
 EOF
-		for ip in $LB_BACKENDS; do
-			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "$i" "$ip"
+		for ip in ${LB_BACKENDS}; do
+			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${ip}"
 			i=$((i + 1))
 		done
 		cat <<'EOF'
@@ -547,20 +623,25 @@ frontend stats
 	stats enable
 	stats uri /
 EOF
-	} >"$cfg"
-	log "load balancer for: $LB_BACKENDS"
-	exec haproxy -f "$cfg"
+	} >"${cfg}"
+	log "load balancer for: ${LB_BACKENDS}"
+	exec haproxy -f "${cfg}"
 }
 
 run_kubectl() {
-	log "waiting for cluster config on master ($CLUSTER_DIR)"
-	for _ in $(seq 1 300); do
-		[ -f "$CLUSTER_DIR/admin.conf" ] && break
-		sleep 2
-	done
-	[ -f "$CLUSTER_DIR/admin.conf" ] || die "no admin.conf found; is the master running?"
-	export KUBECONFIG="$CLUSTER_DIR/admin.conf"
-	[ $# -eq 0 ] && exec bash
+	# This runs on every `zek kubectl` call and every 2s poll during
+	# cluster bring-up, so only log when there is something to wait for:
+	# the common case is "config already there".
+	if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+		log "waiting for cluster config on master (${CLUSTER_DIR})"
+		for _ in $(seq 1 300); do
+			[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
+			sleep 2
+		done
+	fi
+	[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found; is the master running?"
+	export KUBECONFIG="${CLUSTER_DIR}/admin.conf"
+	[[ $# -eq 0 ]] && exec bash
 	exec kubectl "$@"
 }
 

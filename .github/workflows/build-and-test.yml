@@ -1,0 +1,53 @@
+---
+name: Build and test
+on:
+  workflow_call:
+    inputs:
+      makefile-artifact:
+        description: Name of an artifact holding the updated Makefile to
+          test instead of the checked-out one
+        type: string
+        default: ""
+jobs:
+  build_and_test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same list as ALL_TESTS in e2e.sh, spelled out so each job is
+        # named after its test. One test per runner: two clusters sharing
+        # the 4 vCPU/16GB runner starve kubelet, so no job ever runs two.
+        test:
+          [
+            single-node,
+            multi-master,
+            multi-worker,
+            flannel,
+            cilium,
+            smoke,
+            persistence,
+          ]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Print versions
+        run: |
+          git --version
+          docker --version
+      - name: Fetch updated Makefile
+        if: ${{ inputs['makefile-artifact'] != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs['makefile-artifact'] }}
+      - name: Build image
+        run: |
+          set -euo pipefail
+          export IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=${IMAGE}" >>"$GITHUB_ENV"
+          make build
+      - name: Run e2e tests
+        run: |
+          set -euo pipefail
+          ZEK_IMAGE="${IMAGE}:latest" ./e2e.sh "${{ matrix.test }}"
