@@ -283,11 +283,11 @@ create_cluster() {
 	wait_for_cluster_conf
 	read_join_credentials
 
-	local mip
+	local master_ip
 	for i in $(seq 2 "${masters}"); do
-		mip=$(master_node_ip "${i}")
-		log "creating ${CLUSTER}-master-${i} (${mip}) as control-plane"
-		run_node "${CLUSTER}-master-${i}" master --ip "${mip}" \
+		master_ip=$(master_node_ip "${i}")
+		log "creating ${CLUSTER}-master-${i} (${master_ip}) as control-plane"
+		run_node "${CLUSTER}-master-${i}" master --ip "${master_ip}" \
 			--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
 		wait_for_master_ready "${CLUSTER}-master-${i}"
 		wait_for_nodes "${i}"
@@ -320,7 +320,7 @@ restart_cluster() {
 		log "starting ${LB_NAME}"
 		start_node "${LB_NAME}"
 	fi
-	local i=1 name wlist
+	local i=1 name worker_list
 	while :; do
 		name="${CLUSTER}-master-${i}"
 		# shellcheck disable=SC2310
@@ -329,12 +329,12 @@ restart_cluster() {
 		start_node "${name}"
 		i=$((i + 1))
 	done
-	wlist=$(worker_names)
+	worker_list=$(worker_names)
 	while read -r name; do
 		[[ -n ${name} ]] || continue
 		log "starting ${name}"
 		start_node "${name}"
-	done <<<"${wlist}"
+	done <<<"${worker_list}"
 
 	wait_for_cluster_conf
 	wait_for_nodes "$((have_masters + have_workers))"

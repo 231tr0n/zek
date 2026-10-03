@@ -212,6 +212,7 @@ reset.
 - **`--privileged`** is required for containerd's mounts and the CNI networking.
 - The nodes are prepared so CNI daemonsets "just work": `/etc/cni/net.d` and the CNI bin dir are pre-created world-writable (some installers run as non-root), `/`, `/sys`, `/run` are made shared mounts so eBPF setups can mount fs types into pods, and `bpffs` is pre-mounted at `/sys/fs/bpf`.
 - The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on shutdown. Nothing is written to disk. Set `NO_HOST_MODULES=1` on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); life is fully host-neutral then.
+- The node also raises the host-wide `fs.inotify.max_user_instances` quota to 1024 (all node containers share the per-uid quota) and leaves it raised on exit, since running containers still need it. With `NO_HOST_MODULES=1` this is skipped too.
 - `kube-proxy`'s automatic conntrack table tuning is disabled via its ConfigMap because the global `nf_conntrack_max` sysctl is not writable from a container netns.
 - Containerd's CNI plugin search path is set to `['/opt/cni/bin', '/usr/libexec/cni']` since CNI providers install their plugin binary into `/opt/cni/bin`.
 - `--dns` is a convenience for the node's own resolution; the entrypoint rewrites `/etc/resolv.conf` to the same upstream so coredns (which uses `dnsPolicy: Default`) does not forward to itself and loop.

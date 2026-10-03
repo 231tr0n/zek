@@ -118,12 +118,15 @@ export PATH
 # --- helpers ----------------------------------------------------------------
 zk() { ./zek.sh -c "$1" "${@:2}"; }
 
-up() { zk "$1" up --workers "$2" --masters "$3"; }
+up() { # cluster workers masters
+	zk "$1" up --workers "$2" --masters "$3"
+}
 
 destroy() { ./zek.sh -c "$1" destroy >/dev/null 2>&1 || true; }
 
 # A static-IP start can race the previous endpoint's cleanup and fail
-# with "Address already in use"; retry before giving up.
+# with "Address already in use"; retry before giving up - same race and
+# retry as start_node in zek.sh.
 start_containers() { # name...
 	local out
 	for _ in {1..10}; do
@@ -152,13 +155,13 @@ assert_cmd() { # desc want cmd args... (runs cmd, fails hard if it errors)
 }
 
 wait_for() { # desc timeout-secs func args...
-	local desc=$1 t=$2 deadline
+	local desc=$1 timeout=$2 deadline
 	shift 2
-	deadline=$((SECONDS + t))
+	deadline=$((SECONDS + timeout))
 	until "$@" >/dev/null 2>&1; do
-		[[ ${SECONDS} -lt ${deadline} ]] || fail "timed out after ${t}s waiting for: ${desc}"
-		# Readiness flips land within seconds; a 5s gap only added
-		# dead time to every wait in the suite.
+		[[ ${SECONDS} -lt ${deadline} ]] || fail "timed out after ${timeout}s waiting for: ${desc}"
+		# Readiness flips land within seconds, so 2s is enough (a 5s gap
+		# used to add dead time to every wait in the suite).
 		sleep 2
 	done
 	log "ok: ${desc}"
@@ -304,12 +307,11 @@ apply_flannel() {
 	zk "$1" kubectl apply -f - >/dev/null <<<"${manifest}"
 }
 
-ARCH=""
-arch=$(uname -m)
-case "${arch}" in
+machine=$(uname -m)
+case "${machine}" in
 x86_64) ARCH=amd64 ;;
 aarch64 | arm64) ARCH=arm64 ;;
-*) die "unsupported architecture: ${arch}" ;;
+*) die "unsupported architecture: ${machine}" ;;
 esac
 
 ensure_cilium() {
@@ -376,7 +378,7 @@ k8s_minor() { # cluster -> e.g. 37, empty when unknown
 }
 
 resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
-	local minor="${1:-}" releases tag tag_minor tested fallback newest prev_minor=""
+	local minor="${1:-}" releases tag tag_minor tested_minors fallback newest_tested prev_minor=""
 	local -a tested_list=()
 	# One page of 100 reaches back for years (patch releases outnumber
 	# minors by far); strict x.y.z keeps rc tags out; API order is
@@ -402,11 +404,11 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 		prev_minor=${tag_minor}
 		# The tested-minor bullets of that release's requirements.rst
 		# (tags with a different doc layout parse empty and are skipped).
-		tested=$(curl -fsSL --max-time 30 \
+		tested_minors=$(curl -fsSL --max-time 30 \
 			"https://raw.githubusercontent.com/cilium/cilium/${tag}/Documentation/network/kubernetes/requirements.rst" 2>/dev/null |
-			sed -nE 's/^\* (1\.[0-9]+)$/\1/p') || tested=""
-		[[ -n ${tested} ]] || continue
-		mapfile -t tested_list <<<"${tested}"
+			sed -nE 's/^\* (1\.[0-9]+)$/\1/p') || tested_minors=""
+		[[ -n ${tested_minors} ]] || continue
+		mapfile -t tested_list <<<"${tested_minors}"
 		case " ${tested_list[*]} " in
 		*" 1.${minor} "*)
 			printf '%s\n' "${tag}"
@@ -416,8 +418,8 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 		esac
 		# Cluster k8s newer than this release's newest tested version ->
 		# no older release lists it either (the lists only move forward).
-		newest=$(printf '%s\n' "${tested_list[@]}" | sort -V | tail -1)
-		if [[ -n ${newest} ]] && ((10#${minor} > 10#${newest#*.})); then
+		newest_tested=$(printf '%s\n' "${tested_list[@]}" | sort -V | tail -1)
+		if [[ -n ${newest_tested} ]] && ((10#${minor} > 10#${newest_tested#*.})); then
 			break
 		fi
 	done <<<"${releases}"
@@ -542,16 +544,11 @@ test_cilium() {
 	# Capture the CLI output: install prints progress and `status --wait`
 	# redraws an ASCII logo via ANSI escapes - only failures are worth
 	# putting in the log.
-	if [[ -n ${ver} ]]; then
-		if ! out=$(KUBECONFIG="${kc}" cilium install --version "${ver}" 2>&1); then
-			printf '%s\n' "${out}" >&2
-			fail "${c}: cilium install failed"
-		fi
-	else
-		if ! out=$(KUBECONFIG="${kc}" cilium install 2>&1); then
-			printf '%s\n' "${out}" >&2
-			fail "${c}: cilium install failed"
-		fi
+	local -a install_args=()
+	[[ -n ${ver} ]] && install_args=(--version "${ver}")
+	if ! out=$(KUBECONFIG="${kc}" cilium install "${install_args[@]}" 2>&1); then
+		printf '%s\n' "${out}" >&2
+		fail "${c}: cilium install failed"
 	fi
 	# Image pulls of the ~260MB cilium images can eat most of the CLI's
 	# default 5m wait; use the same budget as every other kubectl wait.
@@ -568,7 +565,7 @@ test_cilium() {
 }
 
 test_istio() {
-	local c=$1 kc containers inits out
+	local c=$1 kc containers out
 	# The flannel test brings the cluster up, installs the base CNI and
 	# proves cross-node pod networking; istio-cni is a chained plugin
 	# and the test app needs working pod networking like any other
@@ -622,11 +619,9 @@ EOF
 	esac
 	# istio-cni replaces the istio-init network-setup container; it must
 	# be absent (istio-validation and the native sidecar may remain).
-	inits=$(zk "${c}" kubectl -n zek-e2e get pod app \
-		-o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{end}' 2>&1)
-	case " ${inits} " in
+	case " ${containers} " in
 	*" istio-init "*)
-		fail "${c}: istio-init present, istio-cni should avoid it (inits: '${inits}')"
+		fail "${c}: istio-init present, istio-cni should avoid it (containers: '${containers}')"
 		;;
 	*) ;;
 	esac
@@ -812,7 +807,7 @@ run_test() { # test [subnet]
 # pick_subnet (zek.sh) sees the same free candidates from every parallel
 # `up`, so without this the second docker network create fails with an
 # address-space overlap error.
-alloc_subnets() { # want -> fills SUBNETS
+alloc_subnets() { # want -> fills subnets
 	local want=$1 used="" net subnet i candidate
 	for net in $(docker network ls -q); do
 		for subnet in $(docker network inspect \
@@ -820,14 +815,14 @@ alloc_subnets() { # want -> fills SUBNETS
 			used="${used} ${subnet}"
 		done
 	done
-	SUBNETS=()
+	subnets=()
 	for i in $(seq 0 254); do
 		candidate="172.20.${i}.0/24"
 		case " ${used} " in
 		*" ${candidate} "*) ;;
 		*)
-			SUBNETS+=("${candidate}")
-			if [[ ${#SUBNETS[@]} -ge ${want} ]]; then
+			subnets+=("${candidate}")
+			if [[ ${#subnets[@]} -ge ${want} ]]; then
 				return 0
 			fi
 			;;
@@ -854,8 +849,7 @@ fi
 	die "ZEK_E2E_JOBS must be an integer >= 1 (got '${ZEK_E2E_JOBS}')"
 
 # Resolve tool downloads once up front: parallel jobs must not race the
-# extraction into the shared BIN_DIR (the tests' own ensure_* calls are
-# then no-ops via `command -v`). A failed download must not abort the
+# extraction into the shared BIN_DIR. A failed download must not abort the
 # suite before it starts - the affected test fails on the missing binary
 # and every other test still runs.
 case " ${requested[*]} " in
@@ -882,7 +876,6 @@ esac
 subnets=()
 if [[ ${ZEK_E2E_JOBS} -gt 1 ]]; then
 	alloc_subnets "${#requested[@]}"
-	subnets=("${SUBNETS[@]:0:${#requested[@]}}")
 fi
 
 # Job pool: launch, then reap one job whenever the pool is full.

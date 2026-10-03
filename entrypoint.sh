@@ -22,8 +22,10 @@
 #     /etc/cluster and passes them to joining nodes as the JOIN_* env
 #     vars; there is no shared volume between nodes.
 #   - Host effects are limited to in-memory kernel setup (loading modules the
-#     host lacks and enabling a few sysctls); both are undone on shutdown and
-#     nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
+#     host lacks, enabling a few sysctls, and raising the host-wide inotify
+#     quota); sysctls and any modules we loaded are undone on shutdown, the
+#     inotify quota stays raised on purpose (other zek containers need it),
+#     and nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
 set -euo pipefail
 
 readonly CLUSTER_DIR="${CLUSTER_DIR:-/etc/cluster}"
@@ -50,22 +52,38 @@ die() {
 	exit 1
 }
 
+# Run a command with its output captured to a log file; on failure surface
+# the log on stderr and die. kubeadm's preflight/cert chatter is one-shot
+# and verbose, so it stays out of docker logs unless it fails.
+run_logged() { # logfile desc cmd...
+	local logfile=$1 desc=$2
+	shift 2
+	if ! "$@" >"${logfile}" 2>&1; then
+		cat "${logfile}" >&2
+		die "${desc}"
+	fi
+}
+
 cleanup() {
 	# Undo the host-level kernel setup: restore sysctls and unload any modules
-	# we loaded (only ones the host did not already have). Unloading may fail
-	# while other processes still use them, which is fine.
+	# we loaded (only ones the host did not already have; with
+	# NO_HOST_MODULES=1 nothing was loaded, so the unload is skipped too -
+	# otherwise an idle host module could be pulled out from under the host).
+	# Unloading may fail while other processes still use them, which is fine.
 	log "shutting down"
 	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2>/dev/null || true
 	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2>/dev/null || true
 	for key in "${!SYSCTL_BEFORE[@]}"; do
 		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" >/dev/null 2>&1 || true
 	done
-	for module in br_netfilter vxlan; do
-		case " ${HOST_MODULES_PRESENT} " in
-		*" ${module} "*) ;;
-		*) rmmod "${module}" 2>/dev/null || true ;;
-		esac
-	done
+	if [[ ${NO_HOST_MODULES:-0} != 1 ]]; then
+		for module in br_netfilter vxlan; do
+			case " ${HOST_MODULES_PRESENT} " in
+			*" ${module} "*) ;;
+			*) rmmod "${module}" 2>/dev/null || true ;;
+			esac
+		done
+	fi
 	exit 0
 }
 trap cleanup TERM INT
@@ -106,6 +124,9 @@ ensure_resolv_conf() {
 	# systemd-resolved 127.0.0.53 is not routable from our netns), and fall
 	# back to public resolvers when nothing usable remains.
 	local upstreams
+	# NODE_DNS is an optional override for manual `docker run -e
+	# NODE_DNS="..."` usage; normally the docker --dns resolv.conf parsed
+	# below provides the upstreams.
 	upstreams="${NODE_DNS:-}"
 	if [[ -z ${upstreams} ]]; then
 		upstreams="$(grep -oE '([0-9]+\.){3}[0-9]+' /etc/resolv.conf |
@@ -119,8 +140,10 @@ ensure_resolv_conf() {
 }
 
 ensure_etc_kubernetes() {
-	# kubeadm insists on /etc/kubernetes; keep it on the persistent /var/lib
-	# volume so node state survives container removal.
+	# kubeadm insists on /etc/kubernetes; keep its state under
+	# /var/lib/kubernetes on the container's writable layer so it survives
+	# stop/start and restarts (and dies with the container on docker rm,
+	# like the rest of the node state).
 	mkdir -p /var/lib/kubernetes
 	ln -sfn /var/lib/kubernetes /etc/kubernetes
 }
@@ -190,7 +213,7 @@ master_ip() {
 
 # sha256 of the CA public key - the exact format kubeadm expects for the
 # caCertHashes join-discovery field ("sha256:<hash>").
-ca_hash() {
+get_ca_hash() {
 	openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt |
 		openssl pkey -pubin -outform der 2>/dev/null |
 		openssl dgst -sha256 -hex | sed 's/^.*= //'
@@ -198,8 +221,8 @@ ca_hash() {
 
 # The API endpoint every kubeconfig points at: the load balancer's IP for
 # multi-master clusters, the first master's own address otherwise. zek.sh
-# passes it as API_ENDPOINT; the fallback keeps plain `docker run ... master`
-# working for a single node.
+# passes it as API_ENDPOINT and init_control_plane defaults it too; this
+# :- fallback is a safety net so the writer never sees it unset.
 write_kubeadm_init_conf() {
 	local api_ip
 	api_ip=$(master_ip)
@@ -411,7 +434,7 @@ publish_cluster_credentials() {
 	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
-	ca_hash="$(ca_hash)"
+	ca_hash="$(get_ca_hash)"
 	# Generate the certificate key ourselves and pass it to upload-certs
 	# instead of scraping it from kubeadm's human-readable output - that
 	# wording changed between releases before (v1.37 moved it to its own
@@ -439,20 +462,15 @@ publish_cluster_credentials() {
 # First control-plane node: kubeadm init against the API endpoint, then
 # publish the credentials the manager hands to every joining node.
 init_control_plane() {
-	local ip_addr
-	ip_addr="$(master_ip)"
-	API_ENDPOINT="${API_ENDPOINT:-${ip_addr}:6443}"
-	log "initializing control plane on ${NODE_NAME} (${ip_addr})"
+	local api_ip
+	api_ip="$(master_ip)"
+	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
+	log "initializing control plane on ${NODE_NAME} (${api_ip})"
 	mkdir -p "${CLUSTER_DIR}"
 	import_k8s_images
 	write_kubeadm_init_conf
-	# kubeadm's preflight/cert chatter is one-shot and verbose; keep it
-	# out of docker logs and surface it only when init fails.
-	if ! kubeadm init --config "${KUBEADM_INIT_CONF}" --ignore-preflight-errors=all \
-		>/var/log/kubeadm-init.log 2>&1; then
-		cat /var/log/kubeadm-init.log >&2
-		die "kubeadm init failed"
-	fi
+	run_logged /var/log/kubeadm-init.log "kubeadm init failed" \
+		kubeadm init --config "${KUBEADM_INIT_CONF}" --ignore-preflight-errors=all
 	# Every phase ran, including the bootstrap-token RBAC that lets joining
 	# nodes fetch cluster-info; run_master uses this to tell a completed
 	# init from one that died in wait-control-plane.
@@ -479,11 +497,8 @@ join_control_plane() {
 	log "joining ${NODE_NAME} as a control-plane node via ${API_ENDPOINT}"
 	import_k8s_images
 	write_kubeadm_join_conf control-plane
-	if ! kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all \
-		>/var/log/kubeadm-join.log 2>&1; then
-		cat /var/log/kubeadm-join.log >&2
-		die "control-plane join failed"
-	fi
+	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
+		kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all
 	mkdir -p "${CLUSTER_DIR}"
 	touch "${CLUSTER_DIR}/init-complete"
 }
@@ -559,11 +574,8 @@ run_worker() {
 		log "joining ${NODE_NAME} to ${API_ENDPOINT}"
 		import_k8s_images
 		write_kubeadm_join_conf worker
-		if ! kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all \
-			>/var/log/kubeadm-join.log 2>&1; then
-			cat /var/log/kubeadm-join.log >&2
-			die "kubeadm join failed"
-		fi
+		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
+			kubeadm join --config "${KUBEADM_JOIN_CONF}" --ignore-preflight-errors=all
 	fi
 
 	wait "${SUPERVISOR_PID}"

@@ -59,10 +59,10 @@ git_list() { # pathspec...
 sh_list=$(git_list '*.sh')
 fmt_list=$(git_list '*.md' '*.yml' '*.yaml')
 docker_list=$(git_list 'Dockerfile*' '*Dockerfile*')
-sh_files=() fmt_files=() dockerfiles=()
+sh_files=() fmt_files=() docker_files=()
 [[ -n ${sh_list} ]] && mapfile -t sh_files <<<"${sh_list}"
 [[ -n ${fmt_list} ]] && mapfile -t fmt_files <<<"${fmt_list}"
-[[ -n ${docker_list} ]] && mapfile -t dockerfiles <<<"${docker_list}"
+[[ -n ${docker_list} ]] && mapfile -t docker_files <<<"${docker_list}"
 
 if [[ ${#sh_files[@]} -gt 0 ]]; then
 	check "shfmt -l -s (${#sh_files[@]} sh)" shfmt -l -s -d "${sh_files[@]}"
@@ -71,10 +71,11 @@ fi
 if [[ ${#fmt_files[@]} -gt 0 ]]; then
 	check "prettier (${#fmt_files[@]} md/yaml)" "${prettier_cmd[@]}" --check --end-of-line lf "${fmt_files[@]}"
 fi
-for f in "${dockerfiles[@]:-}"; do
-	[[ -n ${f} ]] || continue
-	check "dockerfmt -s -n (${f})" dockerfmt -s -n --check "${f}"
-done
+if [[ ${#docker_files[@]} -gt 0 ]]; then
+	for f in "${docker_files[@]}"; do
+		check "dockerfmt -s -n (${f})" dockerfmt -s -n --check "${f}"
+	done
+fi
 
 if [[ ${status} -ne 0 ]]; then
 	printf '\n[lint] FAILED - see the tool output above for the offending files\n' >&2
