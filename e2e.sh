@@ -467,6 +467,12 @@ diag() {
 	./zek.sh -c "${c}" status || true
 	./zek.sh -c "${c}" kubectl get nodes -o wide || true
 	./zek.sh -c "${c}" kubectl get pods -A -o wide || true
+	# Scheduler inputs: together with a FailedScheduling event these settle
+	# "Insufficient cpu" questions offline (allocatable vs requests).
+	./zek.sh -c "${c}" kubectl get nodes -o \
+		custom-columns='NODE:.metadata.name,CAP-CPU:.status.capacity.cpu,ALLOC-CPU:.status.allocatable.cpu' || true
+	./zek.sh -c "${c}" kubectl get pods -A -o \
+		custom-columns='NS:.metadata.namespace,POD:.metadata.name,CPU-REQ:.spec.containers[*].resources.requests.cpu,CPU-LIM:.spec.containers[*].resources.limits.cpu' || true
 	./zek.sh -c "${c}" kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null |
 		tail -50 || true
 	# shellcheck disable=SC2310

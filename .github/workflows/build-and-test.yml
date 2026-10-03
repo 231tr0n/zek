@@ -1,0 +1,50 @@
+---
+name: Build and test
+on:
+  workflow_call:
+    inputs:
+      makefile-artifact:
+        description: Name of an artifact holding the updated Makefile to
+          test instead of the checked-out one
+        type: string
+        required: false
+        default: ""
+jobs:
+  build_and_test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # e2e.sh splits ALL_TESTS into balanced slices from the shard
+        # number, so the test list lives only there: 7 tests (flannel
+        # dedupes into istio) -> 7 shards, one test per runner. Two
+        # clusters sharing the 4 vCPU/16GB runner starved kubelet in
+        # shard 2/3 (cilium + istio), so no shard ever runs two.
+        shard: ["1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Print versions
+        run: |
+          git --version
+          docker --version
+      - name: Fetch updated Makefile
+        if: ${{ inputs['makefile-artifact'] != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs['makefile-artifact'] }}
+      - name: Build image
+        run: |
+          set -euo pipefail
+          export IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=${IMAGE}" >>"$GITHUB_ENV"
+          make build
+      - name: Run e2e tests
+        # One test per shard: this runner hosts exactly one cluster.
+        env:
+          ZEK_E2E_SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          ZEK_IMAGE="${IMAGE}:latest" ./e2e.sh
