@@ -15,8 +15,9 @@
 # (the name in lower case with '_' as '-', e.g. POD_CIDR -> --pod-cidr); the
 # flag wins when both are set (value flags take --flag value or
 # --flag=value; --master-join and --no-host-modules are bare booleans).
-# `--` ends flag parsing and everything unrecognized is left for the role -
-# kubectl arguments pass through:
+# `--` ends flag parsing; it and everything after it is left for the role -
+# kubectl arguments pass through (kubectl needs the `--` itself, e.g. for
+# `exec POD -- CMD`):
 #   --cluster-dir PATH        (CLUSTER_DIR, default /etc/cluster)
 #   --node-name NAME          (NODE_NAME, default the container hostname)
 #   --pod-cidr CIDR           (POD_CIDR, default 10.244.0.0/16)
@@ -674,16 +675,19 @@ run_kubectl() {
 }
 
 # Consume the configuration flags for the current role; every input env var
-# has a flag twin of the same name (see the header). What is left - after
-# `--`, plus anything unrecognized - stays in ROLE_ARGS: kubectl arguments
-# pass through, the node roles ignore them as they always did.
+# has a flag twin of the same name (see the header). What is left -
+# everything unrecognized, plus `--` and everything after it - stays in
+# ROLE_ARGS: kubectl arguments (and the `--` delimiter itself, which kubectl
+# needs for exec/attach) pass through, the node roles ignore them as they
+# always did.
 parse_role_flags() {
 	ROLE_ARGS=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--)
+			# forward the delimiter: `kubectl exec POD -- CMD` needs it
 			shift
-			ROLE_ARGS+=("$@")
+			ROLE_ARGS+=("--" "$@")
 			break
 			;;
 		--cluster-dir)
