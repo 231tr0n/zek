@@ -11,6 +11,27 @@
 #   lb       haproxy in front of the control-plane nodes (only started by
 #            the manager for multi-master clusters)
 #
+# Flags: every input env var can also be passed as a flag after the role
+# (the name in lower case with '_' as '-', e.g. POD_CIDR -> --pod-cidr); the
+# flag wins when both are set (value flags take --flag value or
+# --flag=value; --master-join and --no-host-modules are bare booleans).
+# `--` ends flag parsing and everything unrecognized is left for the role -
+# kubectl arguments pass through:
+#   --cluster-dir PATH        (CLUSTER_DIR, default /etc/cluster)
+#   --node-name NAME          (NODE_NAME, default the container hostname)
+#   --pod-cidr CIDR           (POD_CIDR, default 10.244.0.0/16)
+#   --node-dns IP             (NODE_DNS; normally docker --dns owns this)
+#   --api-endpoint ADDR       (API_ENDPOINT, default <master-ip>:6443)
+#   --master-join             (MASTER_JOIN=1: join as a control plane)
+#   --join-token TOKEN        (JOIN_TOKEN)
+#   --join-ca-hash HASH       (JOIN_CA_HASH)
+#   --join-api-endpoint ADDR  (JOIN_API_ENDPOINT)
+#   --join-cert-key KEY       (JOIN_CERT_KEY)
+#   --lb-backends "IP ..."    (LB_BACKENDS, space separated)
+#   --kubeconfig PATH         (KUBECONFIG; kubectl defaults to the published
+#                              admin.conf)
+#   --no-host-modules         (NO_HOST_MODULES=1: skip host module setup)
+#
 # Persistence and host isolation:
 #   - Everything lives on the container's own writable layer: node state
 #     (kubelet, containerd, etcd) under /var/lib, /etc/kubernetes symlinked
@@ -28,9 +49,11 @@
 #     and nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
 set -euo pipefail
 
-readonly CLUSTER_DIR="${CLUSTER_DIR:-/etc/cluster}"
-readonly NODE_NAME="${NODE_NAME:-$(hostname)}"
-readonly POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+# Reassigned by the flags after parsing, so not readonly (the full flag/env
+# list is in the header).
+CLUSTER_DIR="${CLUSTER_DIR:-/etc/cluster}"
+NODE_NAME="${NODE_NAME:-$(hostname)}"
+POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 readonly KUBELET_CONFIG=/var/lib/kubelet/config.yaml
 readonly KUBEADM_FLAGS=/var/lib/kubelet/kubeadm-flags.env
 readonly KUBEADM_INIT_CONF=/etc/zek/kubeadm-init.yaml
@@ -629,26 +652,132 @@ EOF
 }
 
 run_kubectl() {
-	# This runs on every `zek kubectl` call and every 2s poll during
-	# cluster bring-up, so only log when there is something to wait for:
-	# the common case is "config already there".
-	if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
-		log "waiting for cluster config on master (${CLUSTER_DIR})"
-		for _ in $(seq 1 300); do
-			[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
-			sleep 2
-		done
+	# KUBECONFIG (env or --kubeconfig) selects an explicit kubeconfig;
+	# otherwise fall back to the cluster's published admin.conf, which every
+	# `zek kubectl` call and every 2s poll during cluster bring-up waits for
+	# - so only log when there is something to wait for: the common case is
+	# "config already there".
+	if [[ -z ${KUBECONFIG:-} ]]; then
+		if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+			log "waiting for cluster config on master (${CLUSTER_DIR})"
+			for _ in $(seq 1 300); do
+				[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
+				sleep 2
+			done
+		fi
+		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found; is the master running?"
+		KUBECONFIG="${CLUSTER_DIR}/admin.conf"
 	fi
-	[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found; is the master running?"
-	export KUBECONFIG="${CLUSTER_DIR}/admin.conf"
+	export KUBECONFIG
 	[[ $# -eq 0 ]] && exec bash
 	exec kubectl "$@"
 }
 
+# Consume the configuration flags for the current role; every input env var
+# has a flag twin of the same name (see the header). What is left - after
+# `--`, plus anything unrecognized - stays in ROLE_ARGS: kubectl arguments
+# pass through, the node roles ignore them as they always did.
+parse_role_flags() {
+	ROLE_ARGS=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--)
+			shift
+			ROLE_ARGS+=("$@")
+			break
+			;;
+		--cluster-dir)
+			[[ $# -ge 2 ]] || die "--cluster-dir needs a value"
+			CLUSTER_DIR="$2"
+			shift 2
+			;;
+		--cluster-dir=*) CLUSTER_DIR="${1#*=}" && shift ;;
+		--node-name)
+			[[ $# -ge 2 ]] || die "--node-name needs a value"
+			NODE_NAME="$2"
+			shift 2
+			;;
+		--node-name=*) NODE_NAME="${1#*=}" && shift ;;
+		--pod-cidr)
+			[[ $# -ge 2 ]] || die "--pod-cidr needs a value"
+			POD_CIDR="$2"
+			shift 2
+			;;
+		--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
+		--node-dns)
+			[[ $# -ge 2 ]] || die "--node-dns needs a value"
+			NODE_DNS="$2"
+			shift 2
+			;;
+		--node-dns=*) NODE_DNS="${1#*=}" && shift ;;
+		--api-endpoint)
+			[[ $# -ge 2 ]] || die "--api-endpoint needs a value"
+			API_ENDPOINT="$2"
+			shift 2
+			;;
+		--api-endpoint=*) API_ENDPOINT="${1#*=}" && shift ;;
+		--master-join)
+			MASTER_JOIN=1
+			shift
+			;;
+		--join-token)
+			[[ $# -ge 2 ]] || die "--join-token needs a value"
+			JOIN_TOKEN="$2"
+			shift 2
+			;;
+		--join-token=*) JOIN_TOKEN="${1#*=}" && shift ;;
+		--join-ca-hash)
+			[[ $# -ge 2 ]] || die "--join-ca-hash needs a value"
+			JOIN_CA_HASH="$2"
+			shift 2
+			;;
+		--join-ca-hash=*) JOIN_CA_HASH="${1#*=}" && shift ;;
+		--join-api-endpoint)
+			[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value"
+			JOIN_API_ENDPOINT="$2"
+			shift 2
+			;;
+		--join-api-endpoint=*) JOIN_API_ENDPOINT="${1#*=}" && shift ;;
+		--join-cert-key)
+			[[ $# -ge 2 ]] || die "--join-cert-key needs a value"
+			JOIN_CERT_KEY="$2"
+			shift 2
+			;;
+		--join-cert-key=*) JOIN_CERT_KEY="${1#*=}" && shift ;;
+		--lb-backends)
+			[[ $# -ge 2 ]] || die "--lb-backends needs a value"
+			LB_BACKENDS="$2"
+			shift 2
+			;;
+		--lb-backends=*) LB_BACKENDS="${1#*=}" && shift ;;
+		--kubeconfig)
+			[[ $# -ge 2 ]] || die "--kubeconfig needs a value"
+			KUBECONFIG="$2"
+			shift 2
+			;;
+		--kubeconfig=*) KUBECONFIG="${1#*=}" && shift ;;
+		--no-host-modules)
+			NO_HOST_MODULES=1
+			shift
+			;;
+		*)
+			ROLE_ARGS+=("$1")
+			shift
+			;;
+		esac
+	done
+}
+
+# Validate the role, drop it from the args, then parse the flags: what
+# remains is what the role receives.
 case "${1:-}" in
-master) shift && run_master "$@" ;;
-worker) shift && run_worker "$@" ;;
-lb) shift && run_lb "$@" ;;
-kubectl) shift && run_kubectl "$@" ;;
-*) die "usage: $0 {master|worker|lb|kubectl [kubectl-args...]}" ;;
+master | worker | lb | kubectl)
+	ROLE="$1"
+	shift
+	;;
+*)
+	die "usage: $0 {master|worker|lb|kubectl} [flags] [kubectl-args...]"
+	;;
 esac
+parse_role_flags "$@"
+"run_${ROLE}" "${ROLE_ARGS[@]}"

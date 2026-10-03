@@ -6,7 +6,7 @@
 # Every test creates its own cluster (e2e-<test>), asserts, then destroys it.
 #
 # Usage:
-#   ./e2e.sh [test ...]      run the given tests, or all of them
+#   ./e2e.sh [flags] [test ...]   run the given tests, or all of them
 #
 # Tests:
 #   single-node    1 master, 0 workers: the smallest cluster still works
@@ -30,17 +30,27 @@
 # cluster, subnet and scratch files). Failures never abort the pool - all
 # requested tests run, then diagnostics and the verdict are printed.
 #
-# Env:
-#   ZEK_IMAGE              image under test (default zek:latest)
-#   ZEK_TIMEOUT            per-wait budget inside zek.sh (default 600)
-#   ZEK_E2E_TIMEOUT        budget for kubectl waits (default 1200; large
-#                          image pulls on a slow day can eat 10+ minutes)
-#   ZEK_E2E_TESTS          comma separated test list (same as the args)
-#   ZEK_E2E_JOBS           tests to run in parallel (default 2; 1 = serial)
-#   ZEK_E2E_KEEP_ON_FAIL   1 = leave the failed cluster running for debugging
-#   CILIUM_VERSION         cilium version to install (default: match the
-#                          cluster's k8s version against cilium's tested
-#                          list, else newest stable release)
+# Flags (anywhere among the test names; each has an env twin and the flag
+# wins when both are set; value flags take --flag value or --flag=value):
+#   --image IMAGE            image under test (ZEK_IMAGE, default zek:latest)
+#   --timeout SECONDS        per-wait budget inside zek.sh (ZEK_TIMEOUT,
+#                            default 600)
+#   --e2e-timeout SECONDS    budget for kubectl waits (ZEK_E2E_TIMEOUT,
+#                            default 1200; large image pulls on a slow day
+#                            can eat 10+ minutes)
+#   --e2e-tests LIST         comma separated test list (ZEK_E2E_TESTS; same
+#                            as the args)
+#   --e2e-jobs N             tests to run in parallel (ZEK_E2E_JOBS,
+#                            default 2; 1 = serial)
+#   --e2e-keep-on-fail       leave the failed cluster running for debugging
+#                            (ZEK_E2E_KEEP_ON_FAIL=1)
+#   --cilium-version VER     cilium version to install (CILIUM_VERSION;
+#                            default: match the cluster's k8s version against
+#                            cilium's tested list, else newest stable release)
+#
+# Env: the env twin of every flag above - ZEK_IMAGE, ZEK_TIMEOUT,
+#      ZEK_E2E_TIMEOUT, ZEK_E2E_TESTS, ZEK_E2E_JOBS, ZEK_E2E_KEEP_ON_FAIL,
+#      CILIUM_VERSION.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -67,17 +77,68 @@ fail() {
 }
 
 usage() {
-	die "usage: $0 [single-node|multi-master|multi-worker|flannel|cilium|smoke|persistence]..."
+	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master|multi-worker|flannel|cilium|smoke|persistence]..."
 }
 
-# --- test selection ---------------------------------------------------------
+# --- flag parsing and test selection ----------------------------------------
+# Everything that is not a flag is a test name (validated below against
+# ALL_TESTS).
 requested=()
-if [[ $# -gt 0 ]]; then
-	requested=("$@")
-elif [[ -n ${ZEK_E2E_TESTS:-} ]]; then
-	IFS=',' read -ra requested <<<"${ZEK_E2E_TESTS}"
-else
-	requested=("${ALL_TESTS[@]}")
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--image)
+		[[ $# -ge 2 ]] || die "--image needs a value"
+		ZEK_IMAGE="$2"
+		shift 2
+		;;
+	--image=*) ZEK_IMAGE="${1#*=}" && shift ;;
+	--timeout)
+		[[ $# -ge 2 ]] || die "--timeout needs a value"
+		ZEK_TIMEOUT="$2"
+		shift 2
+		;;
+	--timeout=*) ZEK_TIMEOUT="${1#*=}" && shift ;;
+	--e2e-timeout)
+		[[ $# -ge 2 ]] || die "--e2e-timeout needs a value"
+		ZEK_E2E_TIMEOUT="$2"
+		shift 2
+		;;
+	--e2e-timeout=*) ZEK_E2E_TIMEOUT="${1#*=}" && shift ;;
+	--e2e-tests)
+		[[ $# -ge 2 ]] || die "--e2e-tests needs a value"
+		ZEK_E2E_TESTS="$2"
+		shift 2
+		;;
+	--e2e-tests=*) ZEK_E2E_TESTS="${1#*=}" && shift ;;
+	--e2e-jobs)
+		[[ $# -ge 2 ]] || die "--e2e-jobs needs a value"
+		ZEK_E2E_JOBS="$2"
+		shift 2
+		;;
+	--e2e-jobs=*) ZEK_E2E_JOBS="${1#*=}" && shift ;;
+	--cilium-version)
+		[[ $# -ge 2 ]] || die "--cilium-version needs a value"
+		CILIUM_VERSION="$2"
+		shift 2
+		;;
+	--cilium-version=*) CILIUM_VERSION="${1#*=}" && shift ;;
+	--e2e-keep-on-fail)
+		ZEK_E2E_KEEP_ON_FAIL=1
+		shift
+		;;
+	*)
+		requested+=("$1")
+		shift
+		;;
+	esac
+done
+[[ -n ${ZEK_IMAGE} ]] || die "--image needs a value"
+if [[ ${#requested[@]} -eq 0 ]]; then
+	if [[ -n ${ZEK_E2E_TESTS:-} ]]; then
+		IFS=',' read -ra requested <<<"${ZEK_E2E_TESTS}"
+	else
+		requested=("${ALL_TESTS[@]}")
+	fi
 fi
 for t in "${requested[@]}"; do
 	case " ${ALL_TESTS[*]} " in
@@ -97,13 +158,13 @@ PATH="${BIN_DIR}:${PATH}"
 export PATH
 
 # --- helpers ----------------------------------------------------------------
-zk() { ./zek.sh -c "$1" "${@:2}"; }
+zk() { ./zek.sh --cluster "$1" "${@:2}"; }
 
 up() { # cluster workers masters
 	zk "$1" up --workers "$2" --masters "$3"
 }
 
-destroy() { ./zek.sh -c "$1" destroy >/dev/null 2>&1 || true; }
+destroy() { ./zek.sh --cluster "$1" destroy >/dev/null 2>&1 || true; }
 
 # A static-IP start can race the previous endpoint's cleanup and fail
 # with "Address already in use"; retry before giving up - same race and
@@ -390,15 +451,15 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 diag() {
 	local c=$1 n list
 	log "================ diagnostics for ${c} ================"
-	./zek.sh -c "${c}" status || true
-	./zek.sh -c "${c}" kubectl get pods -A -o wide || true
+	./zek.sh --cluster "${c}" status || true
+	./zek.sh --cluster "${c}" kubectl get pods -A -o wide || true
 	# Scheduler inputs: together with a FailedScheduling event these settle
 	# "Insufficient cpu" questions offline (allocatable vs requests).
-	./zek.sh -c "${c}" kubectl get nodes -o \
+	./zek.sh --cluster "${c}" kubectl get nodes -o \
 		custom-columns='NODE:.metadata.name,CAP-CPU:.status.capacity.cpu,ALLOC-CPU:.status.allocatable.cpu' || true
-	./zek.sh -c "${c}" kubectl get pods -A -o \
+	./zek.sh --cluster "${c}" kubectl get pods -A -o \
 		custom-columns='NS:.metadata.namespace,POD:.metadata.name,CPU-REQ:.spec.containers[*].resources.requests.cpu,CPU-LIM:.spec.containers[*].resources.limits.cpu' || true
-	./zek.sh -c "${c}" kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null |
+	./zek.sh --cluster "${c}" kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null |
 		tail -50 || true
 	# shellcheck disable=SC2310
 	list=$(cluster_containers "${c}") || list=""
@@ -645,7 +706,7 @@ test_smoke() {
 	# shell function) and its group kill is what actually stops
 	# docker logs -f. The entrypoint logs to stderr, so merge both
 	# streams into the capture.
-	out=$(timeout 5 ./zek.sh -c "${c}" logs "${c}-master-1" 2>&1 || true)
+	out=$(timeout 5 ./zek.sh --cluster "${c}" logs "${c}-master-1" 2>&1 || true)
 	[[ ${out} == *"[zek]"* ]] || fail "${c}: logs gave no [zek] output"
 	# clean: evict + recreate the worker with a pristine netns; it rejoins
 	# with a fresh kubelet identity (new Node UID). No CNI is installed,

@@ -79,42 +79,59 @@ credentials in one run.
 fixed at creation — and a warning is printed if they differ from what
 exists.
 
-Every wait in zek.sh is bounded by `-t/--timeout SECONDS` (default 600,
+Every wait in zek.sh is bounded by `--timeout SECONDS` (default 600,
 override with `ZEK_TIMEOUT`), so a broken cluster fails fast instead of
 hanging:
 
 ```sh
-./zek.sh -t 120 up          # give up after 2 minutes
+./zek.sh --timeout 120 up   # give up after 2 minutes
 ZEK_TIMEOUT=120 ./zek.sh up # same, via environment
 ```
 
 ### Multiple clusters
 
 ```sh
-./zek.sh -c prod up --workers 2 --masters 3
-./zek.sh -c dev  up --workers 1
-./zek.sh -c prod kubectl get nodes     # or: ZEK_CLUSTER=prod ./zek.sh kubectl get nodes
-./zek.sh -c dev  destroy               # only this cluster; prod keeps running
+./zek.sh --cluster prod up --workers 2 --masters 3
+./zek.sh --cluster dev  up --workers 1
+./zek.sh --cluster prod kubectl get nodes     # or: ZEK_CLUSTER=prod ./zek.sh kubectl get nodes
+./zek.sh --cluster dev  destroy               # only this cluster; prod keeps running
 ```
 
-The `-c` flag (or `ZEK_CLUSTER`, default `zek`) selects the cluster for every
-command. All containers and the Docker network carry the cluster name as
+The `--cluster` flag (or `ZEK_CLUSTER`, default `zek`) selects the cluster for
+every command. All containers and the Docker network carry the cluster name as
 prefix (`prod-master-1`, `prod-worker-1`, `prod-lb`, `prod-net`). Each cluster
 gets its own subnet — the first free `172.20.X.0/24`, so parallel clusters
-never overlap (override with `ZEK_SUBNET`).
+never overlap (override with `--subnet` or `ZEK_SUBNET`).
 
-### Environment overrides
+### Flags and environment
 
-| Variable        | Effect                                                    |
-| --------------- | --------------------------------------------------------- |
-| `ZEK_CLUSTER`   | Cluster name (same as `-c`, default `zek`)                |
-| `ZEK_TIMEOUT`   | Wait budget in seconds (same as `-t`, default `600`)      |
-| `ZEK_IMAGE`     | Node image (default `zek:latest`)                         |
-| `ZEK_NODES`     | Default `--workers` for the first `up`                    |
-| `ZEK_SUBNET`    | Explicit subnet instead of the first free `172.20.X.0/24` |
-| `ZEK_MASTER_IP` | First master's IP (default `<subnet>.2`)                  |
-| `ZEK_DNS`       | Upstream DNS for the node containers                      |
-| `POD_CIDR`      | Pod subnet passed to kubeadm (default `10.244.0.0/16`)    |
+Every setting exists twice: as a flag and as an environment variable. The
+flag wins when both are set. Global flags go before the command
+(`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
+
+| Variable        | Flag          | Effect                                                    |
+| --------------- | ------------- | --------------------------------------------------------- |
+| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                              |
+| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                    |
+| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                         |
+| `ZEK_NODES`     | `--workers`   | Workers for the first `up` (default `1`)                  |
+| `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                  |
+| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24` |
+| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                  |
+| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                      |
+| `POD_CIDR`      | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`)    |
+| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers            |
+
+```sh
+./zek.sh --mounts "/srv/data:/mnt/data" up   # host dir inside every node container
+ZEK_MOUNTS="/srv/data:/mnt/data" ./zek.sh up # same, via environment
+```
+
+`--mounts` takes a space-separated list of
+`host-path:container-path[:options]` bindings (`--mounts "/a:/x /b:/y:ro"`).
+Like `--image` and `--dns`, it only affects containers created afterwards
+(the first `up`, `clean`) — existing node containers are never
+reconfigured.
 
 ## High availability (`--masters 3`)
 
