@@ -258,9 +258,14 @@ start_node() { # name
 
 # Run kubectl against the cluster via the first master's container.
 kube() {
-	local tty_flag=-i
-	[[ -t 0 ]] && tty_flag=""
-	docker exec "${tty_flag}" "${MASTER_NAME}" /entrypoint.sh kubectl "$@"
+	# -i always: stdin must be forwarded for piped manifests (even when a
+	# terminal sits on the other end). A pty is added only when both ends
+	# are one, so interactive `kubectl exec ... bash` gets a real terminal
+	# while captured or piped output stays free of CR line endings (the
+	# e2e assertions compare such output).
+	local -a exec_flags=(-i)
+	[[ -t 0 && -t 1 ]] && exec_flags+=(-t)
+	docker exec "${exec_flags[@]}" "${MASTER_NAME}" /entrypoint.sh kubectl "$@"
 }
 
 # Every internal wait is bounded by WAIT_TIMEOUT (--timeout, default
