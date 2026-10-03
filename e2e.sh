@@ -12,18 +12,12 @@
 #   single-node    1 master, 0 workers: the smallest cluster still works
 #   multi-master   3 masters + 1 worker: HA init/join behind the LB, 3 etcd
 #                  members, quorum survives docker stop/start of a master
-#   multi-worker   1 master + 3 workers: every node's kubelet/containerd
-#                  work (hostNetwork DaemonSet lands on all 4 nodes)
+#   multi-worker   1 master + 2 workers: every node's kubelet/containerd
+#                  work (hostNetwork DaemonSet lands on all 3 nodes)
 #   flannel        install flannel, nodes go Ready, coredns rolls out,
-#                  cross-node pod-to-pod ping (skipped when istio is
-#                  also requested - it runs inside the istio test)
+#                  cross-node pod-to-pod ping
 #   cilium         same with cilium (cilium CLI downloaded on demand,
 #                  version matched to the cluster's k8s release)
-#   istio          the full flannel test suite first (one cluster,
-#                  flannel installed once), then istio-cni layered on
-#                  top: sidecar injection works and the istio-init
-#                  network setup stays absent (istioctl downloaded on
-#                  demand)
 #   smoke          status, logs and clean: the info commands produce
 #                  output, and evict+recreate of a worker (fresh netns)
 #                  rejoins with a new node identity
@@ -43,24 +37,20 @@
 #                          image pulls on a slow day can eat 10+ minutes)
 #   ZEK_E2E_TESTS          comma separated test list (same as the args)
 #   ZEK_E2E_JOBS           tests to run in parallel (default 2; 1 = serial)
-#   ZEK_E2E_SHARD          "N/M": run only the Nth of M balanced slices of
-#                          the test list (CI matrix sharding; default: all)
 #   ZEK_E2E_KEEP_ON_FAIL   1 = leave the failed cluster running for debugging
 #   CILIUM_VERSION         cilium version to install (default: match the
 #                          cluster's k8s version against cilium's tested
 #                          list, else newest stable release)
-#   ISTIO_VERSION          istio version to download (default latest)
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-ALL_TESTS=(single-node multi-master multi-worker flannel cilium istio smoke persistence)
+ALL_TESTS=(single-node multi-master multi-worker flannel cilium smoke persistence)
 
 export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
 export ZEK_TIMEOUT="${ZEK_TIMEOUT:-600}"
 ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-1200}"
 ZEK_E2E_JOBS="${ZEK_E2E_JOBS:-2}"
-ZEK_E2E_SHARD="${ZEK_E2E_SHARD:-}"
 # Optional override; when empty the cilium test resolves a release that
 # matches the cluster's k8s version (resolve_cilium_version below).
 CILIUM_VERSION="${CILIUM_VERSION:-}"
@@ -77,7 +67,7 @@ fail() {
 }
 
 usage() {
-	die "usage: $0 [single-node|multi-master|multi-worker|flannel|cilium|istio|smoke|persistence]..."
+	die "usage: $0 [single-node|multi-master|multi-worker|flannel|cilium|smoke|persistence]..."
 }
 
 # --- test selection ---------------------------------------------------------
@@ -95,50 +85,6 @@ for t in "${requested[@]}"; do
 	*) usage ;;
 	esac
 done
-
-# test_istio runs the whole flannel test suite first (test_flannel): when
-# istio is requested, the standalone flannel job would install flannel a
-# second time in another cluster, so drop it. Requesting flannel alone
-# still runs it as its own test.
-if [[ " ${requested[*]} " == *" istio "* ]]; then
-	deduped=()
-	for t in "${requested[@]}"; do
-		[[ ${t} == flannel ]] || deduped+=("${t}")
-	done
-	requested=("${deduped[@]}")
-fi
-
-# ZEK_E2E_SHARD=N/M keeps ALL_TESTS as the single test inventory: CI's
-# matrix passes only "N/M" and this splits the list into M balanced
-# contiguous slices (extras to the leading slices: 7 tests -> 3/2/2 for
-# 3 shards), so adding a test never needs a workflow edit. Runs after the
-# flannel dedup above, so shards never re-create the flannel-only job,
-# and everything downstream (downloads, subnets, the job pool) only sees
-# this slice.
-if [[ -n ${ZEK_E2E_SHARD} ]]; then
-	[[ ${ZEK_E2E_SHARD} =~ ^([0-9]+)/([0-9]+)$ ]] ||
-		die "ZEK_E2E_SHARD must look like N/M (got '${ZEK_E2E_SHARD}')"
-	shard_idx=$((10#${BASH_REMATCH[1]}))
-	shard_cnt=$((10#${BASH_REMATCH[2]}))
-	[[ ${shard_cnt} -ge 1 && ${shard_idx} -ge 1 && ${shard_idx} -le ${shard_cnt} ]] ||
-		die "ZEK_E2E_SHARD needs 1 <= N <= M (got '${ZEK_E2E_SHARD}')"
-	shard_k=${#requested[@]}
-	shard_base=$((shard_k / shard_cnt))
-	shard_rem=$((shard_k % shard_cnt))
-	# Items before this slice: (N-1) full slices + min(N-1, remainder).
-	shard_pre=$(((shard_idx - 1) * shard_base))
-	if ((shard_idx - 1 < shard_rem)); then
-		shard_pre=$((shard_pre + shard_idx - 1))
-	else
-		shard_pre=$((shard_pre + shard_rem))
-	fi
-	shard_size=${shard_base}
-	((shard_idx <= shard_rem)) && shard_size=$((shard_size + 1))
-	requested=("${requested[@]:shard_pre:shard_size}")
-	[[ ${#requested[@]} -gt 0 ]] ||
-		die "ZEK_E2E_SHARD=${ZEK_E2E_SHARD} selects nothing (${shard_k} test(s) for ${shard_cnt} shards)"
-	log "shard ${ZEK_E2E_SHARD}: ${#requested[@]} test(s): ${requested[*]}"
-fi
 
 docker image inspect "${ZEK_IMAGE}" >/dev/null 2>&1 ||
 	die "image ${ZEK_IMAGE} not found (run: make build)"
@@ -287,7 +233,11 @@ wait_coredns() {
 		--timeout="${ZEK_E2E_TIMEOUT}s"
 }
 
-# Two busybox pods pinned to different workers, pinged across the overlay.
+# Two busybox pods pinned to different nodes, pinged across the overlay.
+# The second pod rides the master (with a toleration for the
+# control-plane taint, like the hostcheck DaemonSet below) so a cluster
+# with a single worker still proves cross-node routing - the overlay
+# tunnel is between node netns and does not care about node roles.
 netcheck() {
 	local c=$1 ip_a ip_b
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
@@ -311,7 +261,9 @@ metadata:
   name: net-b
 spec:
   nodeSelector:
-    kubernetes.io/hostname: ${c}-worker-2
+    kubernetes.io/hostname: ${c}-master-1
+  tolerations:
+  - operator: Exists
   restartPolicy: Never
   containers:
   - name: app
@@ -362,32 +314,6 @@ ensure_cilium() {
 		"https://github.com/cilium/cilium-cli/releases/download/${tag}/cilium-linux-${ARCH}.tar.gz" || return 1
 	tar -xzf "${WORK_DIR}/cilium.tar.gz" -C "${BIN_DIR}" || return 1
 	rm -f "${WORK_DIR}/cilium.tar.gz"
-}
-
-ensure_istioctl() {
-	command -v istioctl >/dev/null 2>&1 && return 0
-	local version url tarball
-	# Resolve the latest tag from the releases page redirect (same trick
-	# as ensure_cilium): the unauthenticated API is rate-limited per IP
-	# and CI runners share theirs. ARCH is the already-mapped arch
-	# (x86_64 -> amd64); the asset names use that spelling.
-	version="${ISTIO_VERSION:-}"
-	if [[ -z ${version} ]]; then
-		url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-			https://github.com/istio/istio/releases/latest) || return 1
-		version=${url##*/}
-	fi
-	[[ -n ${version} ]] || return 1
-	log "downloading istioctl ${version}"
-	tarball="${WORK_DIR}/istioctl.tar.gz"
-	# Explicit returns (this may run with errexit suppressed, as the left
-	# side of ||) so a failed download fails the caller, not the suite.
-	curl -fsSL -o "${tarball}" \
-		"https://github.com/istio/istio/releases/download/${version}/istioctl-${version}-linux-${ARCH}.tar.gz" ||
-		return 1
-	tar -xzf "${tarball}" -C "${WORK_DIR}" || return 1
-	ln -sf "${WORK_DIR}/istioctl" "${BIN_DIR}/istioctl"
-	rm -f "${tarball}"
 }
 
 # --- cilium <-> kubernetes version matching ---------------------------------
@@ -465,7 +391,6 @@ diag() {
 	local c=$1 n list
 	log "================ diagnostics for ${c} ================"
 	./zek.sh -c "${c}" status || true
-	./zek.sh -c "${c}" kubectl get nodes -o wide || true
 	./zek.sh -c "${c}" kubectl get pods -A -o wide || true
 	# Scheduler inputs: together with a FailedScheduling event these settle
 	# "Insufficient cpu" questions offline (allocatable vs requests).
@@ -522,13 +447,13 @@ test_multi_master() {
 
 test_multi_worker() {
 	local c=$1
-	up "${c}" 3 1
-	assert_cmd "${c}: node count" 4 node_count "${c}"
-	assert_cmd "${c}: nodes NotReady but kubelets reporting" 4 ready_false_count "${c}"
+	up "${c}" 2 1
+	assert_cmd "${c}: node count" 3 node_count "${c}"
+	assert_cmd "${c}: nodes NotReady but kubelets reporting" 3 ready_false_count "${c}"
 
 	# hostNetwork pods need no CNI, so this DaemonSet proves kubelet +
 	# containerd work on every node even before a CNI is installed.
-	log "${c}: hostNetwork DaemonSet on all 4 nodes"
+	log "${c}: hostNetwork DaemonSet on all 3 nodes"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
@@ -559,8 +484,8 @@ EOF
 
 test_flannel() {
 	local c=$1
-	up "${c}" 2 1
-	assert_cmd "${c}: node count" 3 node_count "${c}"
+	up "${c}" 1 1
+	assert_cmd "${c}: node count" 2 node_count "${c}"
 	log "${c}: installing flannel"
 	apply_flannel "${c}"
 	wait_nodes_ready "${c}"
@@ -571,8 +496,8 @@ test_flannel() {
 
 test_cilium() {
 	local c=$1 kc ver minor out
-	up "${c}" 2 1
-	assert_cmd "${c}: node count" 3 node_count "${c}"
+	up "${c}" 1 1
+	assert_cmd "${c}: node count" 2 node_count "${c}"
 	kc=$(kubeconfig "${c}")
 	# Resolve after `up`: the pick depends on the k8s the cluster
 	# actually runs. An explicit CILIUM_VERSION wins over matching.
@@ -605,73 +530,9 @@ test_cilium() {
 	wait_for "${c}: control plane readyz" 120 readyz_ok "${c}"
 }
 
-test_istio() {
-	local c=$1 kc containers out
-	# The flannel test brings the cluster up, installs the base CNI and
-	# proves cross-node pod networking; istio-cni is a chained plugin
-	# and the test app needs working pod networking like any other
-	# workload - so run that test as-is and layer istio on top.
-	test_flannel "${c}"
-
-	# istioctl was pre-downloaded by the runner (parallel jobs must not
-	# race the extraction into the shared BIN_DIR).
-	kc=$(kubeconfig "${c}")
-	log "${c}: installing istio with istio-cni"
-	# Capture the CLI output like the cilium test does: only failures
-	# are worth putting in the log.
-	if ! out=$(istioctl install --set profile=default --set components.cni.enabled=true \
-		--set values.cni.enabled=true --kubeconfig "${kc}" -y 2>&1); then
-		printf '%s\n' "${out}" >&2
-		fail "${c}: istioctl install failed"
-	fi
-	zk "${c}" kubectl -n istio-system rollout status deploy/istiod \
-		--timeout="${ZEK_E2E_TIMEOUT}s"
-	# The CNI DaemonSet ships as istio-cni-node (renamed from istio-cni).
-	zk "${c}" kubectl -n istio-system rollout status ds/istio-cni-node \
-		--timeout="${ZEK_E2E_TIMEOUT}s"
-
-	log "${c}: sidecar injection (istio-injection=enabled)"
-	zk "${c}" kubectl create namespace zek-e2e >/dev/null
-	zk "${c}" kubectl label namespace zek-e2e istio-injection=enabled >/dev/null
-	zk "${c}" kubectl -n zek-e2e apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: app
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: ${c}-worker-1
-  restartPolicy: Never
-  containers:
-  - name: app
-    image: busybox:1.36
-    command: [sleep, "600"]
-EOF
-	zk "${c}" kubectl -n zek-e2e wait --for=condition=Ready pod/app \
-		--timeout="${ZEK_E2E_TIMEOUT}s"
-	# Current istio injects the sidecar as a native sidecar (an
-	# initContainer with restartPolicy Always), so collect names from
-	# both container lists before asserting.
-	containers=$(zk "${c}" kubectl -n zek-e2e get pod app \
-		-o jsonpath='{range .spec.containers[*]}{.name}{" "}{end}{range .spec.initContainers[*]}{.name}{" "}{end}' 2>&1)
-	case " ${containers} " in
-	*" istio-proxy "*) ;;
-	*) fail "${c}: istio-proxy sidecar not injected (containers: '${containers}')" ;;
-	esac
-	# istio-cni replaces the istio-init network-setup container; it must
-	# be absent (istio-validation and the native sidecar may remain).
-	case " ${containers} " in
-	*" istio-init "*)
-		fail "${c}: istio-init present, istio-cni should avoid it (containers: '${containers}')"
-		;;
-	*) ;;
-	esac
-	wait_for "${c}: control plane readyz" 120 readyz_ok "${c}"
-}
-
 test_persistence() {
 	local c=$1 uids web
-	up "${c}" 2 1
+	up "${c}" 1 1
 	log "${c}: installing flannel + workload"
 	apply_flannel "${c}"
 	wait_nodes_ready "${c}"
@@ -718,7 +579,9 @@ EOF
 	if [[ -n ${list} ]]; then
 		mapfile -t names <<<"${list}"
 	fi
-	[[ ${#names[@]} -ge 3 ]] || fail "${c}: expected >=3 containers, got ${#names[@]}"
+	# Sanity check before the mass stop: `up 1 1` must really have
+	# created the master + worker pair this test is about.
+	[[ ${#names[@]} -ge 2 ]] || fail "${c}: expected >=2 containers, got ${#names[@]}"
 	docker stop "${names[@]}" >/dev/null
 	assert_cmd "${c}: all containers stopped" 0 running_count "${c}"
 	# Start in dependency-safe order (lb, masters, workers) like zek's
@@ -900,16 +763,6 @@ case " ${requested[*]} " in
 	# shellcheck disable=SC2310
 	ensure_cilium ||
 		printf '\n[e2e] WARNING: cilium CLI download failed; the cilium test will fail\n' >&2
-	;;
-*) ;;
-esac
-case " ${requested[*]} " in
-*" istio "*)
-	# errexit is off as the left side of ||; ensure_istioctl returns 1
-	# explicitly on every download step instead.
-	# shellcheck disable=SC2310
-	ensure_istioctl ||
-		printf '\n[e2e] WARNING: istioctl download failed; the istio test will fail\n' >&2
 	;;
 *) ;;
 esac

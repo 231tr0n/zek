@@ -15,7 +15,7 @@ jobs:
     uses: ./.github/workflows/lint.yml
   prepare:
     # Resolve the new pins once, apply them, and share the updated
-    # Makefile with everything downstream: the e2e shards test exactly
+    # Makefile with everything downstream: the e2e jobs test exactly
     # these pins and the PR publishes exactly what was tested.
     permissions:
       contents: read
@@ -88,8 +88,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: Fetch updated Makefile
         uses: actions/download-artifact@v8
         with:
@@ -97,23 +95,43 @@ jobs:
       - name: Count git status
         id: git-status
         run: echo "files=$(git status --porcelain | wc -l)" >>"$GITHUB_OUTPUT"
-      - uses: peter-evans/create-pull-request@v8
+      - name: Create pull request
         if: steps.git-status.outputs.files != '0'
-        with:
-          base: main
-          commit-message: |
-            chore: update alpine/k8s versions
-          title: |
-            chore: update alpine/k8s versions
-          body: |
-            Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Commit the artifact Makefile on the bot branch and push it;
+          # an open PR for the branch is then already refreshed by the
+          # push, so only create one when no open PR exists yet.
+          # 41898282 is github-actions[bot]'s GitHub user id, which keeps
+          # the noreply address stable if the bot name is ever reused.
+          branch=update-versions
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "${branch}"
+          git add Makefile
+          git commit -m "chore: update alpine/k8s versions"
+          git push --force -u origin "${branch}"
+          if [[ -n $(gh pr list --base main --head "${branch}" --state open \
+            --json number --jq '.[0].number // empty') ]]; then
+            echo "open pull request already exists for ${branch}"
+            exit 0
+          fi
+          # Quoted heredoc: the body is literal text (backticks and all);
+          # the pin placeholders are substituted by the runner before this
+          # script runs and are version strings validated in prepare.
+          cat >pr-body.md <<'EOF'
+          Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.
 
-            | Pin                | before                                   | after                               |
-            | ------------------ | ---------------------------------------- | ----------------------------------- |
-            | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |
-            | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |
+          | Pin                | before                                   | after                               |
+          | ------------------ | ---------------------------------------- | ----------------------------------- |
+          | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |
+          | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |
 
-            Before merging, check the release-coupled spots listed in README.md
-            ("Upgrading Kubernetes"): `KUBEADM_API_VERSION` in `entrypoint.sh`,
-            the kubelet config API, and the soft couplings.
-          branch: update-versions
+          Before merging, check the release-coupled spots listed in README.md
+          ("Upgrading Kubernetes"): `KUBEADM_API_VERSION` in `entrypoint.sh`,
+          the kubelet config API, and the soft couplings.
+          EOF
+          gh pr create --base main --head "${branch}" \
+            --title "chore: update alpine/k8s versions" --body-file pr-body.md
