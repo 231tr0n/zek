@@ -1,137 +1,170 @@
 ---
-name: Update versions
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"
-concurrency:
-  group: update-versions
-jobs:
-  lint:
-    # Same linter as CI, run before spending any e2e compute on a change
-    # that would not pass lint anyway (e2e needs this job below).
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint.yml
-  prepare:
-    # Resolve the new pins once, apply them, and share the updated
-    # Makefile with everything downstream: the e2e jobs test exactly
-    # these pins and the PR publishes exactly what was tested.
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      alpine: ${{ steps.latest.outputs.alpine }}
-      alpine_prev: ${{ steps.latest.outputs.alpine_prev }}
-      k8s: ${{ steps.latest.outputs.k8s }}
-      k8s_prev: ${{ steps.latest.outputs.k8s_prev }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Print versions
-        run: |
-          git --version
-          docker --version
-      - name: Resolve latest versions
-        id: latest
-        run: |
-          set -euo pipefail
-          alpine=$(curl -fsSL --retry 5 --retry-all-errors \
-            https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml |
-            awk '/^  version: /{print $2; exit}')
-          k8s=$(curl -fsSL --retry 5 --retry-all-errors https://dl.k8s.io/release/stable.txt)
-          echo "$alpine" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected alpine version: $alpine"; exit 1; }
-          echo "$k8s" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected kubernetes version: $k8s"; exit 1; }
-          alpine_prev=$(sed -nE 's/^ALPINE_VERSION[[:space:]]*\?=[[:space:]]*//p' Makefile)
-          k8s_prev=$(sed -nE 's/^KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*//p' Makefile)
-          {
-            echo "alpine=$alpine"
-            echo "k8s=$k8s"
-            echo "alpine_prev=$alpine_prev"
-            echo "k8s_prev=$k8s_prev"
-          } >>"$GITHUB_OUTPUT"
-          echo "alpine: $alpine_prev -> $alpine"
-          echo "kubernetes: $k8s_prev -> $k8s"
-      - name: Update pins
-        if: >-
-          steps.latest.outputs.alpine != steps.latest.outputs.alpine_prev ||
-          steps.latest.outputs.k8s != steps.latest.outputs.k8s_prev
-        env:
-          ALPINE: ${{ steps.latest.outputs.alpine }}
-          K8S: ${{ steps.latest.outputs.k8s }}
-        run: |
-          set -euo pipefail
-          sed -i -E 's|^(ALPINE_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${ALPINE}"'|' Makefile
-          sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\?=[[:space:]]*).*|\1'"${K8S}"'|' Makefile
-      - name: Share updated Makefile
-        uses: actions/upload-artifact@v7
-        with:
-          name: updated-makefile
-          path: Makefile
-  e2e:
-    needs:
-      - lint
-      - prepare
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-and-test.yml
-    with:
-      makefile-artifact: updated-makefile
-  create-pr:
-    needs:
-      - prepare
-      - e2e
-    permissions:
-      contents: write
-      pull-requests: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - name: Fetch updated Makefile
-        uses: actions/download-artifact@v8
-        with:
-          name: updated-makefile
-      - name: Count git status
-        id: git-status
-        run: echo "files=$(git status --porcelain | wc -l)" >>"$GITHUB_OUTPUT"
-      - name: Create pull request
-        if: steps.git-status.outputs.files != '0'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Commit the artifact Makefile on the bot branch and push it;
-          # an open PR for the branch is then already refreshed by the
-          # push, so only create one when no open PR exists yet.
-          # 41898282 is github-actions[bot]'s GitHub user id, which keeps
-          # the noreply address stable if the bot name is ever reused.
-          branch=update-versions
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -C "${branch}"
-          git add Makefile
-          git commit -m "chore: update alpine/k8s versions"
-          git push --force -u origin "${branch}"
-          if [[ -n $(gh pr list --base main --head "${branch}" --state open \
-            --json number --jq '.[0].number // empty') ]]; then
-            echo "open pull request already exists for ${branch}"
-            exit 0
-          fi
-          # Quoted heredoc: the body is literal text (backticks and all);
-          # the pin placeholders are substituted by the runner before this
-          # script runs and are version strings validated in prepare.
-          cat >pr-body.md <<'EOF'
-          Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.
-
-          | Pin                | before                                   | after                               |
-          | ------------------ | ---------------------------------------- | ----------------------------------- |
-          | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |
-          | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |
-
-          Before merging, check the release-coupled spots listed in README.md
-          ("Upgrading Kubernetes"): `KUBEADM_API_VERSION` in `entrypoint.sh`,
-          the kubelet config API, and the soft couplings.
-          EOF
-          gh pr create --base main --head "${branch}" \
-            --title "chore: update alpine/k8s versions" --body-file pr-body.md
+{
+  name: "Update versions",
+  "on": {
+    workflow_dispatch: ,
+    schedule: [{
+      cron: "0 0 * * *",
+    }],
+  },
+  concurrency: {
+    group: "update-versions",
+  },
+  jobs: {
+    lint: {
+      # Same linter as CI, run before spending any e2e compute on a change
+      # that would not pass lint anyway (e2e needs this job below).
+      permissions: {
+        contents: "read",
+      },
+      uses: "./.github/workflows/lint.yml",
+    },
+    prepare: {
+      # Resolve the new pins once, apply them, and share the updated
+      # Makefile with everything downstream: the e2e jobs test exactly
+      # these pins and the PR publishes exactly what was tested.
+      permissions: {
+        contents: "read",
+      },
+      runs-on: "ubuntu-latest",
+      timeout-minutes: 15,
+      outputs: {
+        alpine: "${{ steps.latest.outputs.alpine }}",
+        alpine_prev: "${{ steps.latest.outputs.alpine_prev }}",
+        k8s: "${{ steps.latest.outputs.k8s }}",
+        k8s_prev: "${{ steps.latest.outputs.k8s_prev }}",
+      },
+      steps: [{
+        uses: "actions/checkout@v7",
+      }, {
+        name: "Print versions",
+        run: "\
+           git --version\n\
+           docker --version\n\
+          ",
+      }, {
+        name: "Resolve latest versions",
+        id: "latest",
+        run: "\
+           set -euo pipefail\n\
+           alpine=$(curl -fsSL --retry 5 --retry-all-errors \\\n\
+          \  https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml |\n\
+          \  awk '/^  version: /{print $2; exit}')\n\
+           k8s=$(curl -fsSL --retry 5 --retry-all-errors https://dl.k8s.io/release/stable.txt)\n\
+           echo \"$alpine\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected alpine version: $alpine\"; exit 1; }\n\
+           echo \"$k8s\" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected kubernetes version: $k8s\"; exit 1; }\n\
+           alpine_prev=$(sed -nE 's/^ALPINE_VERSION[[:space:]]*\\?=[[:space:]]*//p' Makefile)\n\
+           k8s_prev=$(sed -nE 's/^KUBERNETES_VERSION[[:space:]]*\\?=[[:space:]]*//p' Makefile)\n\
+           {\n\
+          \  echo \"alpine=$alpine\"\n\
+          \  echo \"k8s=$k8s\"\n\
+          \  echo \"alpine_prev=$alpine_prev\"\n\
+          \  echo \"k8s_prev=$k8s_prev\"\n\
+           } >>\"$GITHUB_OUTPUT\"\n\
+           echo \"alpine: $alpine_prev -> $alpine\"\n\
+           echo \"kubernetes: $k8s_prev -> $k8s\"\n\
+          ",
+      }, {
+        name: "Update pins",
+        if: "steps.latest.outputs.alpine != steps.latest.outputs.alpine_prev || steps.latest.outputs.k8s != steps.latest.outputs.k8s_prev",
+        env: {
+          ALPINE: "${{ steps.latest.outputs.alpine }}",
+          K8S: "${{ steps.latest.outputs.k8s }}",
+        },
+        run: "\
+           set -euo pipefail\n\
+           sed -i -E 's|^(ALPINE_VERSION[[:space:]]*\\?=[[:space:]]*).*|\\1'\"${ALPINE}\"'|' Makefile\n\
+           sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\\?=[[:space:]]*).*|\\1'\"${K8S}\"'|' Makefile\n\
+          ",
+      }, {
+        name: "Share updated Makefile",
+        uses: "actions/upload-artifact@v7",
+        with: {
+          name: "updated-makefile",
+          path: "Makefile",
+        },
+      }],
+    },
+    e2e: {
+      needs: [
+        "lint",
+        "prepare",
+      ],
+      permissions: {
+        contents: "read",
+      },
+      uses: "./.github/workflows/build-and-test.yml",
+      with: {
+        makefile-artifact: "updated-makefile",
+      },
+    },
+    create-pr: {
+      needs: [
+        "prepare",
+        "e2e",
+      ],
+      permissions: {
+        contents: "write",
+        pull-requests: "write",
+      },
+      runs-on: "ubuntu-latest",
+      timeout-minutes: 15,
+      steps: [{
+        uses: "actions/checkout@v7",
+      }, {
+        name: "Fetch updated Makefile",
+        uses: "actions/download-artifact@v8",
+        with: {
+          name: "updated-makefile",
+        },
+      }, {
+        name: "Count git status",
+        id: "git-status",
+        run: "echo \"files=$(git status --porcelain | wc -l)\" >>\"$GITHUB_OUTPUT\"",
+      }, {
+        name: "Create pull request",
+        if: "steps.git-status.outputs.files != '0'",
+        env: {
+          GH_TOKEN: "${{ github.token }}",
+        },
+        run: "\
+           set -euo pipefail\n\
+           # Commit the artifact Makefile on the bot branch and push it;\n\
+           # an open PR for the branch is then already refreshed by the\n\
+           # push, so only create one when no open PR exists yet.\n\
+           # 41898282 is github-actions[bot]'s GitHub user id, which keeps\n\
+           # the noreply address stable if the bot name is ever reused.\n\
+           branch=update-versions\n\
+           git config user.name \"github-actions[bot]\"\n\
+           git config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"\n\
+           git switch -C \"${branch}\"\n\
+           git add Makefile\n\
+           git commit -m \"chore: update alpine/k8s versions\"\n\
+           git push --force -u origin \"${branch}\"\n\
+           if [[ -n $(gh pr list --base main --head \"${branch}\" --state open \\\n\
+          \  --json number --jq '.[0].number // empty') ]]; then\n\
+          \  echo \"open pull request already exists for ${branch}\"\n\
+          \  exit 0\n\
+           fi\n\
+           # Quoted heredoc: the body is literal text (backticks and all);\n\
+           # the pin placeholders are substituted by the runner before this\n\
+           # script runs and are version strings validated in prepare.\n\
+           cat >pr-body.md <<'EOF'\n\
+           Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.\n\
+           \n\
+           | Pin                | before                                   | after                               |\n\
+           | ------------------ | ---------------------------------------- | ----------------------------------- |\n\
+           | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |\n\
+           | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |\n\
+           \n\
+           Before merging, check the release-coupled spots listed in README.md\n\
+           (\"Upgrading Kubernetes\"): `KUBEADM_API_VERSION` in `entrypoint.sh`,\n\
+           the kubelet config API, and the soft couplings.\n\
+           EOF\n\
+           gh pr create --base main --head \"${branch}\" \\\n\
+          \  --title \"chore: update alpine/k8s versions\" --body-file pr-body.md\n\
+          ",
+      }],
+    },
+  },
+}

@@ -1,32 +1,50 @@
 ---
-name: Lint
-on:
-  workflow_dispatch:
-  workflow_call:
-jobs:
-  lint:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
-    # so CI and local runs agree. dockerfmt/prettier fetch latest on demand.
-    container: fedora:latest
-    timeout-minutes: 15
-    steps:
-      - name: Install lint tools
-        run: |
-          set -euo pipefail
-          dnf install -y git shellcheck shfmt nodejs npm golang
-          go install github.com/reteps/dockerfmt@latest
-          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
-      - name: Allow git in container
-        run: git config --global --add safe.directory '*'
-      - uses: actions/checkout@v7
-      - name: Print tool versions
-        run: |
-          shellcheck --version | sed -n '2p'
-          npx --yes prettier --version
-          dockerfmt version
-          command -v shfmt
-      - name: Lint
-        run: ./lint.sh
+{
+  name: "Lint",
+  "on": {
+    workflow_dispatch: ,
+    workflow_call: ,
+  },
+  jobs: {
+    lint: {
+      permissions: {
+        contents: "read",
+      },
+      runs-on: "ubuntu-latest",
+      # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
+      # so CI and local runs agree. dockerfmt/prettier fetch latest on
+      # demand; yamlfmt (sigs.k8s.io/yaml) formats the repo YAML files and
+      # lints the inline heredoc configs.
+      container: "fedora:latest",
+      timeout-minutes: 15,
+      steps: [{
+        name: "Install lint tools",
+        run: "\
+           set -euo pipefail\n\
+           dnf install -y git shellcheck shfmt nodejs npm golang haproxy\n\
+           go install github.com/reteps/dockerfmt@latest\n\
+           go install sigs.k8s.io/yaml/yamlfmt@latest\n\
+           echo \"$(go env GOPATH)/bin\" >>\"$GITHUB_PATH\"\n\
+          ",
+      }, {
+        name: "Allow git in container",
+        run: "git config --global --add safe.directory '*'",
+      }, {
+        uses: "actions/checkout@v7",
+      }, {
+        name: "Print tool versions",
+        run: "\
+           shellcheck --version | sed -n '2p'\n\
+           npx --yes prettier --version\n\
+           dockerfmt version\n\
+           command -v shfmt\n\
+           yamlfmt -h | sed -n '1p'\n\
+           haproxy -v | sed -n '1p'\n\
+          ",
+      }, {
+        name: "Lint",
+        run: "./lint.sh",
+      }],
+    },
+  },
+}

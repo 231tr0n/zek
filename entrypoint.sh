@@ -253,27 +253,37 @@ write_kubeadm_init_conf() {
 	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
 	mkdir -p /etc/zek
 	cat >"${KUBEADM_INIT_CONF}" <<EOF
-apiVersion: ${KUBEADM_API_VERSION}
-kind: InitConfiguration
-localAPIEndpoint:
-  advertiseAddress: ${api_ip}
-  bindPort: 6443
-nodeRegistration:
-  name: ${NODE_NAME}
-  criSocket: unix:///run/containerd/containerd.sock
 ---
-apiVersion: ${KUBEADM_API_VERSION}
-kind: ClusterConfiguration
-controlPlaneEndpoint: ${API_ENDPOINT}
-networking:
-  podSubnet: ${POD_CIDR}
+{
+  apiVersion: "${KUBEADM_API_VERSION}",
+  kind: "InitConfiguration",
+  localAPIEndpoint: {
+    advertiseAddress: "${api_ip}",
+    bindPort: 6443,
+  },
+  nodeRegistration: {
+    name: "${NODE_NAME}",
+    criSocket: "unix:///run/containerd/containerd.sock",
+  },
+}
 ---
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-# cgroupfs matches containerd's default (SystemdCgroup=false); switching
-# this to systemd also requires flipping containerd's config, or every
-# container fails to start.
-cgroupDriver: cgroupfs
+{
+  apiVersion: "${KUBEADM_API_VERSION}",
+  kind: "ClusterConfiguration",
+  controlPlaneEndpoint: "${API_ENDPOINT}",
+  networking: {
+    podSubnet: "${POD_CIDR}",
+  },
+}
+---
+{
+  apiVersion: "kubelet.config.k8s.io/v1beta1",
+  kind: "KubeletConfiguration",
+  # cgroupfs matches containerd's default (SystemdCgroup=false); switching
+  # this to systemd also requires flipping containerd's config, or every
+  # container fails to start.
+  cgroupDriver: "cgroupfs",
+}
 EOF
 }
 
@@ -285,33 +295,48 @@ write_kubeadm_join_conf() {
 	mkdir -p /etc/zek
 	if [[ ${1:-worker} == control-plane ]]; then
 		cat >"${KUBEADM_JOIN_CONF}" <<EOF
-apiVersion: ${KUBEADM_API_VERSION}
-kind: JoinConfiguration
-discovery:
-  bootstrapToken:
-    token: ${TOKEN}
-    apiServerEndpoint: ${API_ENDPOINT}
-    caCertHashes:
-      - sha256:${CA_HASH}
-controlPlane:
-  certificateKey: ${JOIN_CERT_KEY}
-nodeRegistration:
-  name: ${NODE_NAME}
-  criSocket: unix:///run/containerd/containerd.sock
+---
+{
+  apiVersion: "${KUBEADM_API_VERSION}",
+  kind: "JoinConfiguration",
+  discovery: {
+    bootstrapToken: {
+      token: "${TOKEN}",
+      apiServerEndpoint: "${API_ENDPOINT}",
+      caCertHashes: [
+        "sha256:${CA_HASH}",
+      ],
+    },
+  },
+  controlPlane: {
+    certificateKey: "${JOIN_CERT_KEY}",
+  },
+  nodeRegistration: {
+    name: "${NODE_NAME}",
+    criSocket: "unix:///run/containerd/containerd.sock",
+  },
+}
 EOF
 	else
 		cat >"${KUBEADM_JOIN_CONF}" <<EOF
-apiVersion: ${KUBEADM_API_VERSION}
-kind: JoinConfiguration
-discovery:
-  bootstrapToken:
-    token: ${TOKEN}
-    apiServerEndpoint: ${API_ENDPOINT}
-    caCertHashes:
-      - sha256:${CA_HASH}
-nodeRegistration:
-  name: ${NODE_NAME}
-  criSocket: unix:///run/containerd/containerd.sock
+---
+{
+  apiVersion: "${KUBEADM_API_VERSION}",
+  kind: "JoinConfiguration",
+  discovery: {
+    bootstrapToken: {
+      token: "${TOKEN}",
+      apiServerEndpoint: "${API_ENDPOINT}",
+      caCertHashes: [
+        "sha256:${CA_HASH}",
+      ],
+    },
+  },
+  nodeRegistration: {
+    name: "${NODE_NAME}",
+    criSocket: "unix:///run/containerd/containerd.sock",
+  },
+}
 EOF
 	fi
 }
@@ -614,7 +639,11 @@ run_lb() {
 	local cfg=/etc/haproxy/haproxy.cfg i=1 ip
 	mkdir -p /etc/haproxy
 	{
-		cat <<'EOF'
+		# HAPROXY instead of EOF marks this as config: lint.sh checks
+		# every EOF heredoc as canonical KYAML, and runs `haproxy -c`
+		# plus a tab/whitespace style check on the HAPROXY ones
+		# (assembled with a synthetic backend server).
+		cat <<'HAPROXY'
 global
 	maxconn 4096
 
@@ -633,12 +662,12 @@ frontend k8s-api
 backend apiservers
 	balance roundrobin
 	option tcp-check
-EOF
+HAPROXY
 		for ip in ${LB_BACKENDS}; do
 			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${ip}"
 			i=$((i + 1))
 		done
-		cat <<'EOF'
+		cat <<'HAPROXY'
 
 frontend stats
 	mode http
@@ -646,7 +675,7 @@ frontend stats
 	bind *:8404
 	stats enable
 	stats uri /
-EOF
+HAPROXY
 	} >"${cfg}"
 	log "load balancer for: ${LB_BACKENDS}"
 	exec haproxy -f "${cfg}"

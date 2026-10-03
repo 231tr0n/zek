@@ -1,18 +1,30 @@
 ---
-name: Pull Request CI
-on:
-  pull_request:
-    branches: [main]
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-jobs:
-  lint:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint.yml
-  build_and_test:
-    needs: lint
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-and-test.yml
+{
+  name: "Pull Request CI",
+  "on": {
+    pull_request: {
+      branches: [
+        "main",
+      ],
+    },
+  },
+  concurrency: {
+    group: "${{ github.workflow }}-${{ github.event.pull_request.number }}",
+    cancel-in-progress: true,
+  },
+  jobs: {
+    lint: {
+      permissions: {
+        contents: "read",
+      },
+      uses: "./.github/workflows/lint.yml",
+    },
+    build_and_test: {
+      needs: "lint",
+      permissions: {
+        contents: "read",
+      },
+      uses: "./.github/workflows/build-and-test.yml",
+    },
+  },
+}
