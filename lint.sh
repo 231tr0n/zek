@@ -10,15 +10,18 @@
 #                       required - the directive is stripped and shellcheck
 #                       must then report an issue
 #   lint sh manifests:  every EOF heredoc must round-trip through
-#                       sigs.k8s.io/yaml/yamlfmt -o=kyaml unchanged (k8s
-#                       manifests + kubeadm config, parsed the way the shell
-#                       expands them; non-YAML heredocs need another name)
+#                       sigs.k8s.io/yaml/yamlfmt -o=yaml unchanged (k8s
+#                       manifests, parsed the way the shell expands them;
+#                       block profile because kubeadm's config decoder
+#                       sniffs flow-style kyaml as strict JSON and fails,
+#                       so every heredoc stays in the format kubeadm
+#                       accepts - whether or not this one feeds it)
 #   lint sh lb config:  the HAPROXY heredocs are assembled over stdin with
 #                       one synthetic backend server, checked with
 #                       haproxy -c -f /dev/stdin, and style-checked for
 #                       tab-only indentation and trailing whitespace
 #   format md:          prettier --check --end-of-line lf
-#   format yaml:        yamlfmt (canonical block style, compared byte for byte)
+#   format yaml:        yamlfmt (kyaml profile, compared byte for byte)
 #   format Dockerfile:  dockerfmt -s -n --check   (space redirects + trailing newline)
 #
 # Checks run in parallel; every tool reads its payload over stdin (no
@@ -166,10 +169,10 @@ list_heredocs() {
 	done
 }
 
-# Every EOF heredoc body must be canonical KYAML: parse it exactly as the
-# shell would present it and require yamlfmt -o=kyaml to reproduce it
-# byte for byte (a parse error or any diff is a failure).
-lint_heredocs_kyaml() {
+# Every EOF heredoc body must be canonical block-style yamlfmt output:
+# parse it exactly as the shell would present it and require yamlfmt
+# -o=yaml to reproduce it byte for byte (a parse error or any diff fails).
+lint_heredocs_yaml() {
 	local src start quoted body canon rc=0
 	# shellcheck disable=SC2312  # marker stream is the loop's input by design
 	while IFS=: read -r src start quoted; do
@@ -179,14 +182,14 @@ lint_heredocs_kyaml() {
 			continue
 		fi
 		[[ -n ${body} ]] || continue
-		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1); then
-			printf '%s:%s: not parseable as YAML for kyaml conversion:\n%s\n' \
+		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=yaml 2>&1); then
+			printf '%s:%s: not parseable as YAML for formatting:\n%s\n' \
 				"${src}" "${start}" "${canon}" >&2
 			rc=1
 			continue
 		fi
 		if [[ ${body} != "${canon}" ]]; then
-			printf '%s:%s: heredoc is not canonical KYAML (diff: - source, + yamlfmt -o=kyaml):\n' \
+			printf '%s:%s: heredoc is not canonical yamlfmt block output (diff: - source, + yamlfmt -o=yaml):\n' \
 				"${src}" "${start}" >&2
 			diff <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}") | sed 's/^/  /' >&2 || true
 			rc=1
@@ -283,7 +286,7 @@ if [[ ${#sh_files[@]} -gt 0 ]]; then
 	run_check "shfmt -l -s (${#sh_files[@]} sh)" shfmt -l -s -d "${sh_files[@]}"
 	run_check "shellcheck -o all -x (${#sh_files[@]} sh)" shellcheck -o all -x "${sh_files[@]}"
 	run_check "shellcheck directives (${#sh_files[@]} sh)" lint_shellcheck_directives "${sh_files[@]}"
-	run_check "heredoc kyaml (${#sh_files[@]} sh)" lint_heredocs_kyaml "${sh_files[@]}"
+	run_check "heredoc yaml (${#sh_files[@]} sh)" lint_heredocs_yaml "${sh_files[@]}"
 	if [[ ${haproxy_tool} -eq 1 ]]; then
 		run_check "haproxy -c (assembled LB config)" lint_haproxy_c "${sh_files[@]}"
 		run_check "haproxy style (assembled LB config)" lint_haproxy_style "${sh_files[@]}"

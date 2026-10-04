@@ -42,12 +42,11 @@ Versions are pinned in the Makefile (`KUBERNETES_VERSION`,
 preloads the matching kubeadm images. A few release-coupled spots cannot be
 updated by the build — check them when the bump fails or behaves oddly:
 
-- `KUBEADM_API_VERSION` in `entrypoint.sh` — the API version of the
-  generated kubeadm init/join configs (`kubeadm.k8s.io/v1beta4`, current
-  for kubeadm 1.31–1.37). kubeadm drops old config API versions after a
-  few releases; init/join then fail with an unsupported-apiVersion error.
-- `kubelet.config.k8s.io/v1beta1` in the same heredoc — the kubelet config
-  API, stable for years; just re-check on a major bump.
+- `kubeadm init`/`kubeadm join` in `entrypoint.sh` run on CLI flags only —
+  there are no config documents, so no `kubeadm.k8s.io` API version to pin.
+  Check the release notes if init/join start rejecting a flag, and
+  re-check the kubelet `--cgroup-driver` flag the supervisor passes:
+  kubelet deprecates CLI flags over time (as it did `--fail-swap-on`).
 - Two soft couplings break without failing the build: the kube-proxy
   conntrack keys patched in `patch_kube_proxy`, and containerd's
   `bin_dirs`/`unpack_config` tweaks in `start_containerd`. If a new release

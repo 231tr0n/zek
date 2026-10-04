@@ -311,15 +311,18 @@ master_readyz() { # cluster master-index
 		grep -qx ok
 }
 
-# Is the kubelet process alive inside the node container?
+# Is the kubelet process alive inside the node container? Command line,
+# not comm: gcompat runs the glibc kubelet through musl's loader, so comm
+# reads ld-musl-x86_64. and a comm match never finds it (matching that
+# loader name would instead hit every glibc binary: kubectl, kubeadm, ...).
 kubelet_running() { # container
-	docker exec "$1" pgrep -x kubelet >/dev/null 2>&1
+	docker exec "$1" pgrep -f "/usr/local/bin/kubelet" >/dev/null 2>&1
 }
 
 # The supervisor's restart marker: proves the crash-recovery loop ran,
 # not just that a kubelet happens to be up.
 supervisor_restarted() { # container
-	docker logs "$1" 2>&1 | grep -q "kubelet exited, restarting"
+	docker logs "$1" 2>&1 | grep -c "kubelet exited, restarting" >/dev/null
 }
 
 # The kubelet config carries failSwapOn: false (appended by the
@@ -328,9 +331,12 @@ kubelet_failswapon() { # container
 	docker exec "$1" grep -q '^failSwapOn:[[:space:]]*false' /var/lib/kubelet/config.yaml
 }
 
-# Container log contains a fixed string (our [zek] markers).
+# Container log contains a fixed string (our [zek] markers). grep -c
+# reads the whole log: `grep -q` exits at the match, and under pipefail a
+# still-streaming docker logs then dies with a spurious SIGPIPE 141 that
+# fails the check even though the marker was there.
 log_has() { # container text
-	docker logs "$1" 2>&1 | grep -qF "$2"
+	docker logs "$1" 2>&1 | grep -cF "$2" >/dev/null
 }
 
 # The master published a complete credential set (admin.conf is last).
@@ -387,55 +393,38 @@ wait_coredns() {
 netcheck() {
 	local c=$1 ip_a ip_b
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Pod",
-  metadata: {
-    name: "net-a",
-  },
-  spec: {
-    nodeSelector: {
-      kubernetes.io/hostname: "${c}-worker-1",
-    },
-    restartPolicy: "Never",
-    containers: [{
-      name: "app",
-      image: "busybox:1.36",
-      command: [
-        "sleep",
-        "600",
-      ],
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "net-a"
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: "${c}-worker-1"
+  restartPolicy: "Never"
+  containers:
+    - name: "app"
+      image: "busybox:1.36"
+      command:
+        - "sleep"
+        - "600"
 EOF
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Pod",
-  metadata: {
-    name: "net-b",
-  },
-  spec: {
-    nodeSelector: {
-      kubernetes.io/hostname: "${c}-master-1",
-    },
-    tolerations: [{
-      operator: "Exists",
-    }],
-    restartPolicy: "Never",
-    containers: [{
-      name: "app",
-      image: "busybox:1.36",
-      command: [
-        "sleep",
-        "600",
-      ],
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "net-b"
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: "${c}-master-1"
+  tolerations:
+    - operator: "Exists"
+  restartPolicy: "Never"
+  containers:
+    - name: "app"
+      image: "busybox:1.36"
+      command:
+        - "sleep"
+        - "600"
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/net-a pod/net-b \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
@@ -462,74 +451,52 @@ EOF
 svccheck() {
 	local c=$1 out
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Pod",
-  metadata: {
-    name: "svc-a",
-    labels: {
-      app: "e2e-svc-a",
-    },
-  },
-  spec: {
-    restartPolicy: "Never",
-    containers: [{
-      name: "app",
-      image: "busybox:1.36",
-      command: [
-        "sh",
-        "-c",
-        "mkdir -p /www && echo pong > /www/index.html && httpd -f -p 8080 -h /www",
-      ],
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "svc-a"
+  labels:
+    app: "e2e-svc-a"
+spec:
+  restartPolicy: "Never"
+  containers:
+    - name: "app"
+      image: "busybox:1.36"
+      command:
+        - "sh"
+        - "-c"
+        - "mkdir -p /www && echo pong > /www/index.html && httpd -f -p 8080 -h /www"
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/svc-a \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Service",
-  metadata: {
-    name: "e2e-svc",
-  },
-  spec: {
-    selector: {
-      app: "e2e-svc-a",
-    },
-    ports: [{
-      port: 80,
-      targetPort: 8080,
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Service"
+metadata:
+  name: "e2e-svc"
+spec:
+  selector:
+    app: "e2e-svc-a"
+  ports:
+    - port: 80
+      targetPort: 8080
 EOF
 	# The retry loop rides out endpoint-sync lag; 15 x (fast wget failure
 	# + 2s) bounds a dead service at ~75s instead of the full e2e budget.
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Pod",
-  metadata: {
-    name: "svc-test",
-  },
-  spec: {
-    restartPolicy: "Never",
-    containers: [{
-      name: "app",
-      image: "busybox:1.36",
-      command: [
-        "sh",
-        "-c",
-        "i=0; until wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 15 ] && exit 1; sleep 2; done; nslookup kubernetes.default",
-      ],
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "svc-test"
+spec:
+  restartPolicy: "Never"
+  containers:
+    - name: "app"
+      image: "busybox:1.36"
+      command:
+        - "sh"
+        - "-c"
+        - "i=0; until wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 15 ] && exit 1; sleep 2; done; nslookup kubernetes.default"
 EOF
 	wait_for "${c}: service test pod finished" 120 svc_test_done "${c}"
 	# shellcheck disable=SC2310
@@ -592,7 +559,7 @@ k8s_minor() { # cluster -> e.g. 37, empty when unknown
 	local v
 	# shellcheck disable=SC2310
 	v=$(zk "$1" kubectl get --raw=/version 2>/dev/null) || v=""
-	printf '%s\n' "${v}" | sed -nE 's/.*"gitVersion": *"v1\.([0-9]+)\..*/\1/p'
+	printf '%s\n' "${v}" | jq -r 'if .gitVersion then (.gitVersion | split(".")[1]) else empty end' 2>/dev/null
 }
 
 resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
@@ -603,7 +570,7 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 	# newest-first.
 	releases=$(curl -fsSL --max-time 30 \
 		'https://api.github.com/repos/cilium/cilium/releases?per_page=100' 2>/dev/null |
-		sed -nE 's/.*"tag_name": *"v([0-9]+\.[0-9]+\.[0-9]+)".*/v\1/p') || releases=""
+		jq -r '.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' 2>/dev/null) || releases=""
 	[[ -n ${releases} ]] || return 0
 	fallback=$(printf '%s\n' "${releases}" | head -1)
 	[[ -n ${minor} ]] || {
@@ -721,43 +688,29 @@ test_multi_worker() {
 	# containerd work on every node even before a CNI is installed.
 	log "${c}: hostNetwork DaemonSet on all 3 nodes"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "apps/v1",
-  kind: "DaemonSet",
-  metadata: {
-    name: "e2e-hostcheck",
-    namespace: "kube-system",
-  },
-  spec: {
-    selector: {
-      matchLabels: {
-        app: "e2e-hostcheck",
-      },
-    },
-    template: {
-      metadata: {
-        labels: {
-          app: "e2e-hostcheck",
-        },
-      },
-      spec: {
-        hostNetwork: true,
-        tolerations: [{
-          operator: "Exists",
-        }],
-        containers: [{
-          name: "check",
-          image: "busybox:1.36",
-          command: [
-            "sleep",
-            "3600",
-          ],
-        }],
-      },
-    },
-  },
-}
+apiVersion: "apps/v1"
+kind: "DaemonSet"
+metadata:
+  name: "e2e-hostcheck"
+  namespace: "kube-system"
+spec:
+  selector:
+    matchLabels:
+      app: "e2e-hostcheck"
+  template:
+    metadata:
+      labels:
+        app: "e2e-hostcheck"
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: "Exists"
+      containers:
+        - name: "check"
+          image: "busybox:1.36"
+          command:
+            - "sleep"
+            - "3600"
 EOF
 	zk "${c}" kubectl -n kube-system rollout status ds/e2e-hostcheck \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
@@ -821,39 +774,26 @@ test_persistence() {
 	apply_flannel "${c}"
 	wait_nodes_ready "${c}"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "apps/v1",
-  kind: "Deployment",
-  metadata: {
-    name: "web",
-  },
-  spec: {
-    replicas: 1,
-    selector: {
-      matchLabels: {
-        app: "web",
-      },
-    },
-    template: {
-      metadata: {
-        labels: {
-          app: "web",
-        },
-      },
-      spec: {
-        containers: [{
-          name: "web",
-          image: "busybox:1.36",
-          command: [
-            "sleep",
-            "3600",
-          ],
-        }],
-      },
-    },
-  },
-}
+apiVersion: "apps/v1"
+kind: "Deployment"
+metadata:
+  name: "web"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: "web"
+  template:
+    metadata:
+      labels:
+        app: "web"
+    spec:
+      containers:
+        - name: "web"
+          image: "busybox:1.36"
+          command:
+            - "sleep"
+            - "3600"
 EOF
 	zk "${c}" kubectl rollout status deploy/web --timeout="${ZEK_E2E_TIMEOUT}s"
 	uids=$(node_uids "${c}")
@@ -920,16 +860,18 @@ EOF
 	assert_cmd "${c}: down stops everything" 0 running_count "${c}"
 	# The stop ran each container's cleanup trap; the log line is the only
 	# host-visible proof (sysctl/module restore is best-effort and shared
-	# with parallel jobs).
-	docker logs "${c}-master-1" 2>&1 | grep -q "shutting down" ||
-		fail "${c}: master-1 never logged its cleanup"
+	# with parallel jobs). Polled rather than checked once: docker logs
+	# can lag the stop by a beat.
+	wait_for "${c}: master-1 logged its cleanup" 30 log_has "${c}-master-1" \
+		"shutting down"
 	zk "${c}" up
 	assert_state "zek down/up"
 
 	log "${c}: kubelet crash on worker-1 - the supervisor restarts it"
-	docker exec "${c}-worker-1" pgrep -x kubelet >/dev/null 2>&1 ||
+	# shellcheck disable=SC2310
+	kubelet_running "${c}-worker-1" ||
 		fail "${c}: kubelet not running before the crash"
-	docker exec "${c}-worker-1" pkill -x kubelet
+	docker exec "${c}-worker-1" pkill -f "/usr/local/bin/kubelet"
 	wait_for "${c}: kubelet running again" 60 kubelet_running "${c}-worker-1"
 	wait_for "${c}: supervisor logged the restart" 60 supervisor_restarted "${c}-worker-1"
 	wait_nodes_ready "${c}"
@@ -937,7 +879,7 @@ EOF
 
 	log "${c}: kubelet config without failSwapOn - the supervisor re-adds it"
 	docker exec "${c}-worker-1" sed -i '/^failSwapOn:/d' /var/lib/kubelet/config.yaml
-	docker exec "${c}-worker-1" pkill -x kubelet
+	docker exec "${c}-worker-1" pkill -f "/usr/local/bin/kubelet"
 	wait_for "${c}: kubelet running again after config edit" 60 kubelet_running "${c}-worker-1"
 	wait_for "${c}: failSwapOn restored" 60 kubelet_failswapon "${c}-worker-1"
 	wait_nodes_ready "${c}"
@@ -977,32 +919,23 @@ test_smoke() {
 	# guard it here too. A hostNetwork pod needs no CNI in this test.
 	log "${c}: kubectl exec -- on a hostNetwork pod"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
----
-{
-  apiVersion: "v1",
-  kind: "Pod",
-  metadata: {
-    name: "e2e-exec",
-  },
-  spec: {
-    nodeSelector: {
-      kubernetes.io/hostname: "${c}-master-1",
-    },
-    hostNetwork: true,
-    tolerations: [{
-      operator: "Exists",
-    }],
-    restartPolicy: "Never",
-    containers: [{
-      name: "app",
-      image: "busybox:1.36",
-      command: [
-        "sleep",
-        "600",
-      ],
-    }],
-  },
-}
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "e2e-exec"
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: "${c}-master-1"
+  hostNetwork: true
+  tolerations:
+    - operator: "Exists"
+  restartPolicy: "Never"
+  containers:
+    - name: "app"
+      image: "busybox:1.36"
+      command:
+        - "sleep"
+        - "600"
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/e2e-exec \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
@@ -1035,7 +968,7 @@ EOF
 	log "${c}: --subnet/--master-ip reach the network and the master"
 	local sub=172.20.250.0/24 mip=172.20.250.2 got_sub got_ip
 	./zek.sh --cluster e2e-fn --subnet "${sub}" --master-ip "${mip}" \
-		--workers 0 --masters 1 up
+		up --workers 0 --masters 1
 	got_sub=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' e2e-fn-net)
 	got_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' e2e-fn-master-1)
 	./zek.sh --cluster e2e-fn destroy >/dev/null 2>&1 || true
@@ -1223,8 +1156,10 @@ test_recovery() {
 		"${ZEK_IMAGE}" worker >/dev/null
 	wait_for "${c}: NO_HOST_MODULES node registered" "${ZEK_E2E_TIMEOUT}" \
 		node_count_is "${c}" 3
-	docker exec "${c}-worker-nhm" pgrep -x kubelet >/dev/null 2>&1 ||
-		fail "${c}: NO_HOST_MODULES node has no kubelet"
+	# Polled, not a single check: the node object lands while the kubelet
+	# may still be mid-startup or between supervisor restarts.
+	wait_for "${c}: NO_HOST_MODULES node kubelet running" 60 kubelet_running \
+		"${c}-worker-nhm"
 	docker rm -f "${c}-worker-nhm" >/dev/null
 	zk "${c}" kubectl delete node "${c}-worker-nhm" --wait=false >/dev/null
 	wait_for "${c}: NO_HOST_MODULES node removed" "${ZEK_E2E_TIMEOUT}" \
