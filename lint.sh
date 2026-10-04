@@ -10,12 +10,13 @@
 #                       required - the directive is stripped and shellcheck
 #                       must then report an issue
 #   lint sh manifests:  every EOF heredoc must round-trip through
-#                       sigs.k8s.io/yaml/yamlfmt -o=yaml unchanged (k8s
+#                       sigs.k8s.io/yaml/yamlfmt -o=kyaml unchanged (k8s
 #                       manifests, parsed the way the shell expands them;
-#                       block profile because kubeadm's config decoder
-#                       sniffs flow-style kyaml as strict JSON and fails,
-#                       so every heredoc stays in the format kubeadm
-#                       accepts - whether or not this one feeds it)
+#                       kyaml profile to match the repo YAML files - only
+#                       kubectl reads the heredocs and it accepts flow
+#                       style, while kubeadm's config decoder sniffs a
+#                       leading { as strict JSON, so kubeadm runs on CLI
+#                       flags and never reads a heredoc)
 #   lint sh lb config:  the HAPROXY heredocs are assembled over stdin with
 #                       one synthetic backend server, checked with
 #                       haproxy -c -f /dev/stdin, and style-checked for
@@ -76,6 +77,19 @@ for tool in shfmt shellcheck dockerfmt yamlfmt; do
 		exit 1
 	}
 done
+
+# yamlfmt must be the k8s implementation (sigs.k8s.io/yaml/yamlfmt): it is
+# the only build with the -o=kyaml profile every YAML check compares
+# against, and another yamlfmt on PATH (e.g. mvdan.cc/yamlfmt) would
+# silently format differently from CI. The probe exercises that exact
+# profile the way the checks below call it.
+if ! yprobe=$(printf 'a: 1\n' | yamlfmt -o=kyaml 2>&1) || [[ ${yprobe} != *'{'* ]]; then
+	ybin=$(command -v yamlfmt)
+	printf '[lint] yamlfmt is not sigs.k8s.io/yaml/yamlfmt (k8s tool with -o=kyaml):\n' >&2
+	printf '[lint]   %s: %s\n' "${ybin}" "${yprobe}" >&2
+	printf '[lint]   install: go install sigs.k8s.io/yaml/yamlfmt@latest\n' >&2
+	exit 1
+fi
 
 # prettier: local binary if present, otherwise the latest version via npx
 # (CI relies on this npx fallback, so no global npm install is needed).
@@ -169,9 +183,9 @@ list_heredocs() {
 	done
 }
 
-# Every EOF heredoc body must be canonical block-style yamlfmt output:
+# Every EOF heredoc body must be canonical kyaml yamlfmt output:
 # parse it exactly as the shell would present it and require yamlfmt
-# -o=yaml to reproduce it byte for byte (a parse error or any diff fails).
+# -o=kyaml to reproduce it byte for byte (a parse error or any diff fails).
 lint_heredocs_yaml() {
 	local src start quoted body canon rc=0
 	# shellcheck disable=SC2312  # marker stream is the loop's input by design
@@ -182,14 +196,14 @@ lint_heredocs_yaml() {
 			continue
 		fi
 		[[ -n ${body} ]] || continue
-		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=yaml 2>&1); then
+		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1); then
 			printf '%s:%s: not parseable as YAML for formatting:\n%s\n' \
 				"${src}" "${start}" "${canon}" >&2
 			rc=1
 			continue
 		fi
 		if [[ ${body} != "${canon}" ]]; then
-			printf '%s:%s: heredoc is not canonical yamlfmt block output (diff: - source, + yamlfmt -o=yaml):\n' \
+			printf '%s:%s: heredoc is not canonical yamlfmt kyaml output (diff: - source, + yamlfmt -o=kyaml):\n' \
 				"${src}" "${start}" >&2
 			diff <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}") | sed 's/^/  /' >&2 || true
 			rc=1

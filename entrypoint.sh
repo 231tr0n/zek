@@ -565,7 +565,7 @@ run_lb() {
 	mkdir -p /etc/haproxy
 	{
 		# HAPROXY instead of EOF marks this as config: lint.sh checks
-		# every EOF heredoc as canonical yamlfmt block output, and runs
+		# every EOF heredoc as canonical yamlfmt kyaml output, and runs
 		# `haproxy -c` plus a tab/whitespace style check on the HAPROXY
 		# ones (assembled with a synthetic backend server).
 		cat <<'HAPROXY'

@@ -393,38 +393,55 @@ wait_coredns() {
 netcheck() {
 	local c=$1 ip_a ip_b
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Pod"
-metadata:
-  name: "net-a"
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: "${c}-worker-1"
-  restartPolicy: "Never"
-  containers:
-    - name: "app"
-      image: "busybox:1.36"
-      command:
-        - "sleep"
-        - "600"
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "net-a",
+  },
+  spec: {
+    nodeSelector: {
+      kubernetes.io/hostname: "${c}-worker-1",
+    },
+    restartPolicy: "Never",
+    containers: [{
+      name: "app",
+      image: "busybox:1.36",
+      command: [
+        "sleep",
+        "600",
+      ],
+    }],
+  },
+}
 EOF
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Pod"
-metadata:
-  name: "net-b"
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: "${c}-master-1"
-  tolerations:
-    - operator: "Exists"
-  restartPolicy: "Never"
-  containers:
-    - name: "app"
-      image: "busybox:1.36"
-      command:
-        - "sleep"
-        - "600"
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "net-b",
+  },
+  spec: {
+    nodeSelector: {
+      kubernetes.io/hostname: "${c}-master-1",
+    },
+    tolerations: [{
+      operator: "Exists",
+    }],
+    restartPolicy: "Never",
+    containers: [{
+      name: "app",
+      image: "busybox:1.36",
+      command: [
+        "sleep",
+        "600",
+      ],
+    }],
+  },
+}
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/net-a pod/net-b \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
@@ -451,52 +468,74 @@ EOF
 svccheck() {
 	local c=$1 out
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Pod"
-metadata:
-  name: "svc-a"
-  labels:
-    app: "e2e-svc-a"
-spec:
-  restartPolicy: "Never"
-  containers:
-    - name: "app"
-      image: "busybox:1.36"
-      command:
-        - "sh"
-        - "-c"
-        - "mkdir -p /www && echo pong > /www/index.html && httpd -f -p 8080 -h /www"
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "svc-a",
+    labels: {
+      app: "e2e-svc-a",
+    },
+  },
+  spec: {
+    restartPolicy: "Never",
+    containers: [{
+      name: "app",
+      image: "busybox:1.36",
+      command: [
+        "sh",
+        "-c",
+        "mkdir -p /www && echo pong > /www/index.html && httpd -f -p 8080 -h /www",
+      ],
+    }],
+  },
+}
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/svc-a \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Service"
-metadata:
-  name: "e2e-svc"
-spec:
-  selector:
-    app: "e2e-svc-a"
-  ports:
-    - port: 80
-      targetPort: 8080
+---
+{
+  apiVersion: "v1",
+  kind: "Service",
+  metadata: {
+    name: "e2e-svc",
+  },
+  spec: {
+    selector: {
+      app: "e2e-svc-a",
+    },
+    ports: [{
+      port: 80,
+      targetPort: 8080,
+    }],
+  },
+}
 EOF
 	# The retry loop rides out endpoint-sync lag; 15 x (fast wget failure
 	# + 2s) bounds a dead service at ~75s instead of the full e2e budget.
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Pod"
-metadata:
-  name: "svc-test"
-spec:
-  restartPolicy: "Never"
-  containers:
-    - name: "app"
-      image: "busybox:1.36"
-      command:
-        - "sh"
-        - "-c"
-        - "i=0; until wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 15 ] && exit 1; sleep 2; done; nslookup kubernetes.default"
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "svc-test",
+  },
+  spec: {
+    restartPolicy: "Never",
+    containers: [{
+      name: "app",
+      image: "busybox:1.36",
+      command: [
+        "sh",
+        "-c",
+        "i=0; until wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 15 ] && exit 1; sleep 2; done; nslookup kubernetes.default",
+      ],
+    }],
+  },
+}
 EOF
 	wait_for "${c}: service test pod finished" 120 svc_test_done "${c}"
 	# shellcheck disable=SC2310
@@ -688,29 +727,43 @@ test_multi_worker() {
 	# containerd work on every node even before a CNI is installed.
 	log "${c}: hostNetwork DaemonSet on all 3 nodes"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "apps/v1"
-kind: "DaemonSet"
-metadata:
-  name: "e2e-hostcheck"
-  namespace: "kube-system"
-spec:
-  selector:
-    matchLabels:
-      app: "e2e-hostcheck"
-  template:
-    metadata:
-      labels:
-        app: "e2e-hostcheck"
-    spec:
-      hostNetwork: true
-      tolerations:
-        - operator: "Exists"
-      containers:
-        - name: "check"
-          image: "busybox:1.36"
-          command:
-            - "sleep"
-            - "3600"
+---
+{
+  apiVersion: "apps/v1",
+  kind: "DaemonSet",
+  metadata: {
+    name: "e2e-hostcheck",
+    namespace: "kube-system",
+  },
+  spec: {
+    selector: {
+      matchLabels: {
+        app: "e2e-hostcheck",
+      },
+    },
+    template: {
+      metadata: {
+        labels: {
+          app: "e2e-hostcheck",
+        },
+      },
+      spec: {
+        hostNetwork: true,
+        tolerations: [{
+          operator: "Exists",
+        }],
+        containers: [{
+          name: "check",
+          image: "busybox:1.36",
+          command: [
+            "sleep",
+            "3600",
+          ],
+        }],
+      },
+    },
+  },
+}
 EOF
 	zk "${c}" kubectl -n kube-system rollout status ds/e2e-hostcheck \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
@@ -774,26 +827,39 @@ test_persistence() {
 	apply_flannel "${c}"
 	wait_nodes_ready "${c}"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "apps/v1"
-kind: "Deployment"
-metadata:
-  name: "web"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: "web"
-  template:
-    metadata:
-      labels:
-        app: "web"
-    spec:
-      containers:
-        - name: "web"
-          image: "busybox:1.36"
-          command:
-            - "sleep"
-            - "3600"
+---
+{
+  apiVersion: "apps/v1",
+  kind: "Deployment",
+  metadata: {
+    name: "web",
+  },
+  spec: {
+    replicas: 1,
+    selector: {
+      matchLabels: {
+        app: "web",
+      },
+    },
+    template: {
+      metadata: {
+        labels: {
+          app: "web",
+        },
+      },
+      spec: {
+        containers: [{
+          name: "web",
+          image: "busybox:1.36",
+          command: [
+            "sleep",
+            "3600",
+          ],
+        }],
+      },
+    },
+  },
+}
 EOF
 	zk "${c}" kubectl rollout status deploy/web --timeout="${ZEK_E2E_TIMEOUT}s"
 	uids=$(node_uids "${c}")
@@ -919,23 +985,32 @@ test_smoke() {
 	# guard it here too. A hostNetwork pod needs no CNI in this test.
 	log "${c}: kubectl exec -- on a hostNetwork pod"
 	zk "${c}" kubectl apply -f - >/dev/null <<EOF
-apiVersion: "v1"
-kind: "Pod"
-metadata:
-  name: "e2e-exec"
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: "${c}-master-1"
-  hostNetwork: true
-  tolerations:
-    - operator: "Exists"
-  restartPolicy: "Never"
-  containers:
-    - name: "app"
-      image: "busybox:1.36"
-      command:
-        - "sleep"
-        - "600"
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "e2e-exec",
+  },
+  spec: {
+    nodeSelector: {
+      kubernetes.io/hostname: "${c}-master-1",
+    },
+    hostNetwork: true,
+    tolerations: [{
+      operator: "Exists",
+    }],
+    restartPolicy: "Never",
+    containers: [{
+      name: "app",
+      image: "busybox:1.36",
+      command: [
+        "sleep",
+        "600",
+      ],
+    }],
+  },
+}
 EOF
 	zk "${c}" kubectl wait --for=condition=Ready pod/e2e-exec \
 		--timeout="${ZEK_E2E_TIMEOUT}s"
