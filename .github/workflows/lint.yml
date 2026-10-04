@@ -14,7 +14,8 @@
       # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
       # so CI and local runs agree. dockerfmt/prettier fetch latest on
       # demand; yamlfmt (sigs.k8s.io/yaml) formats the repo YAML files and
-      # lints the inline heredoc configs.
+      # lints the inline heredoc configs; actionlint checks this workflow
+      # plus the shell of every run: block.
       container: "fedora:latest",
       timeout-minutes: 15,
       steps: [{
@@ -24,6 +25,7 @@
            dnf install -y git shellcheck shfmt nodejs npm golang haproxy\n\
            go install github.com/reteps/dockerfmt@latest\n\
            go install sigs.k8s.io/yaml/yamlfmt@latest\n\
+           go install github.com/rhysd/actionlint/cmd/actionlint@latest\n\
            echo \"$(go env GOPATH)/bin\" >>\"$GITHUB_PATH\"\n\
           ",
       }, {
@@ -39,6 +41,7 @@
            dockerfmt version\n\
            command -v shfmt\n\
            yamlfmt -h | sed -n '1p'\n\
+           actionlint --version | sed -n '1p'\n\
            haproxy -v | sed -n '1p'\n\
           ",
       }, {

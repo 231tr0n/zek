@@ -158,8 +158,9 @@
            | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |\n\
            \n\
            Before merging, check the release-coupled spots listed in README.md\n\
-           (\"Upgrading Kubernetes\"): `KUBEADM_API_VERSION` in `entrypoint.sh`,\n\
-           the kubelet config API, and the soft couplings.\n\
+           (\"Upgrading Kubernetes\"): the kubeadm init/join CLI flags and the\n\
+           kubelet `--cgroup-driver` flag in `entrypoint.sh`, plus the soft\n\
+           couplings (kube-proxy conntrack keys, containerd bin_dirs/unpack_config).\n\
            EOF\n\
            gh pr create --base main --head \"${branch}\" \\\n\
           \  --title \"chore: update alpine/k8s versions\" --body-file pr-body.md\n\

@@ -150,6 +150,11 @@ haproxy at `<subnet>.10`:
   cluster is created — joiners start immediately after, while the
   uploaded certificates are fresh.
 
+The masters walk up from `--master-ip` (default `<subnet>.2`): with the
+defaults at most **8 masters** fit, since master 9 would land on
+`<subnet>.10` — the load balancer's own IP — and zek refuses that
+combination before creating anything.
+
 Use **odd** master counts: etcd needs a majority to stay writable. 1 master
 has no redundancy, 2 masters lose quorum if either fails, 3 masters survive
 one failure. Failover is plain: `docker stop <cluster>-master-2` — haproxy

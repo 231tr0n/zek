@@ -75,7 +75,7 @@ die() {
 run_logged() { # logfile desc cmd...
 	local logfile=$1 desc=$2
 	shift 2
-	if ! "$@" >"${logfile}" 2>&1; then
+	if ! "$@" > "${logfile}" 2>&1; then
 		cat "${logfile}" >&2
 		die "${desc}"
 	fi
@@ -88,16 +88,16 @@ cleanup() {
 	# otherwise an idle host module could be pulled out from under the host).
 	# Unloading may fail while other processes still use them, which is fine.
 	log "shutting down"
-	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2>/dev/null || true
-	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2>/dev/null || true
+	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2> /dev/null || true
+	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2> /dev/null || true
 	for key in "${!SYSCTL_BEFORE[@]}"; do
-		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" >/dev/null 2>&1 || true
+		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" > /dev/null 2>&1 || true
 	done
 	if [[ ${NO_HOST_MODULES:-0} != 1 ]]; then
 		for module in br_netfilter vxlan; do
 			case " ${HOST_MODULES_PRESENT} " in
-			*" ${module} "*) ;;
-			*) rmmod "${module}" 2>/dev/null || true ;;
+				*" ${module} "*) ;;
+				*) rmmod "${module}" 2> /dev/null || true ;;
 			esac
 		done
 	fi
@@ -114,12 +114,12 @@ preflight_host() {
 		if [[ -d "/sys/module/${module}" ]]; then
 			HOST_MODULES_PRESENT="${HOST_MODULES_PRESENT} ${module}"
 		else
-			modprobe "${module}" 2>/dev/null || true
+			modprobe "${module}" 2> /dev/null || true
 		fi
 	done
 	for key in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
-		SYSCTL_BEFORE[${key}]="$(sysctl -n "${key}" 2>/dev/null || true)"
-		sysctl -w "${key}=1" >/dev/null 2>&1 || true
+		SYSCTL_BEFORE[${key}]="$(sysctl -n "${key}" 2> /dev/null || true)"
+		sysctl -w "${key}=1" > /dev/null 2>&1 || true
 	done
 	# Every node container runs as uid 0 in the init namespace, so they all
 	# share the host's per-uid inotify instance quota (default 128). A
@@ -129,8 +129,8 @@ preflight_host() {
 	# other zek containers still need it).
 	if [[ -w /proc/sys/fs/inotify/max_user_instances ]]; then
 		local limit
-		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"
-		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 >/dev/null; } 2>/dev/null || true
+		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2> /dev/null || echo 0)"
+		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 > /dev/null; } 2> /dev/null || true
 	fi
 }
 
@@ -146,14 +146,14 @@ ensure_resolv_conf() {
 	# below provides the upstreams.
 	upstreams="${NODE_DNS:-}"
 	if [[ -z ${upstreams} ]]; then
-		upstreams="$(grep -oE '([0-9]+\.){3}[0-9]+' /etc/resolv.conf |
-			grep -vE '^127\.|^169\.254\.' | sort -u | tr '\n' ' ')" || true
+		upstreams="$(grep -oE '([0-9]+\.){3}[0-9]+' /etc/resolv.conf \
+			| grep -vE '^127\.|^169\.254\.' | sort -u | tr '\n' ' ')" || true
 	fi
 	[[ -n ${upstreams} ]] || upstreams="1.1.1.1 8.8.8.8"
 	{
 		echo "search ."
 		for nameserver in ${upstreams}; do echo "nameserver ${nameserver}"; done
-	} >/etc/resolv.conf
+	} > /etc/resolv.conf
 }
 
 ensure_etc_kubernetes() {
@@ -166,28 +166,28 @@ ensure_etc_kubernetes() {
 }
 
 start_containerd() {
-	[[ -f /etc/containerd/config.toml ]] || containerd config default >/etc/containerd/config.toml
+	[[ -f /etc/containerd/config.toml ]] || containerd config default > /etc/containerd/config.toml
 	# Search both the Alpine-provided and user-installed CNI binaries.
 	sed -i "s|bin_dirs = \[.*\]|bin_dirs = ['/opt/cni/bin', '/usr/libexec/cni']|" /etc/containerd/config.toml
 	# /var/lib lives on the container's overlay rootfs (no volume), and overlay
 	# cannot be nested on overlay, so use the native snapshotter instead.
 	sed -i "s|^\([[:space:]]*snapshotter = \).*|\1'native'|" /etc/containerd/config.toml
-	# containerd >=2.3 the transfer service only accepts unpack requests whose
-	# snapshotter is listed in its unpack_config; the default just knows the
-	# default (overlayfs) one. Without this, every CRI pull - kubeadm, crictl,
-	# kubelet - fails with "no unpack platforms defined".
+	# In containerd >=2.3 the transfer service only accepts unpack requests
+	# whose snapshotter is listed in its unpack_config; the generated config
+	# only knows the default (overlayfs) one. Without this, every CRI pull -
+	# kubeadm, crictl, kubelet - fails with "no unpack platforms defined".
 	if ! grep -q "unpack_config" /etc/containerd/config.toml; then
 		local host_arch
 		case "$(uname -m)" in
-		x86_64) host_arch="amd64" ;;
-		aarch64) host_arch="arm64" ;;
-		armv7l) host_arch="arm" ;;
-		*) host_arch="amd64" ;;
+			x86_64) host_arch="amd64" ;;
+			aarch64) host_arch="arm64" ;;
+			armv7l) host_arch="arm" ;;
+			*) host_arch="amd64" ;;
 		esac
 		sed -i "/\[plugins.'io.containerd.transfer.v1.local'\]/a\\
   unpack_config = [{ platform = \"linux/${host_arch}\", snapshotter = \"native\" }]" /etc/containerd/config.toml
 	fi
-	containerd >/var/log/containerd.log 2>&1 &
+	containerd > /var/log/containerd.log 2>&1 &
 	CONTAINERD_PID=$!
 	for _ in $(seq 1 60); do
 		[[ -S /run/containerd/containerd.sock ]] && return 0
@@ -200,8 +200,8 @@ cleanup_stale_cri() {
 	# Purge dead pods/sandboxes left by a previous node instance so kubelet
 	# recreates them fresh; images are kept.
 	log "purging stale containers from previous node instance"
-	crictl rmp -f -a >/dev/null 2>&1 || true
-	crictl rm -f -a >/dev/null 2>&1 || true
+	crictl rmp -f -a > /dev/null 2>&1 || true
+	crictl rm -f -a > /dev/null 2>&1 || true
 }
 
 import_k8s_images() {
@@ -210,7 +210,7 @@ import_k8s_images() {
 	# /opt/zek/images. Import them into the CRI image store (content only,
 	# --no-unpack: no mounts needed, unpacking happens lazily when the kubelet
 	# first pulls them). Only runs on a fresh node, once.
-	if ! command -v ctr >/dev/null 2>&1; then
+	if ! command -v ctr > /dev/null 2>&1; then
 		log "WARNING: ctr not installed; skipping kubeadm image preload"
 		return 0
 	fi
@@ -218,8 +218,8 @@ import_k8s_images() {
 	local tarball
 	for tarball in /opt/zek/images/*.tar; do
 		[[ -e ${tarball} ]] || continue
-		ctr --namespace k8s.io images import --no-unpack "${tarball}" >/dev/null 2>&1 ||
-			log "WARNING: failed to import ${tarball}"
+		ctr --namespace k8s.io images import --no-unpack "${tarball}" > /dev/null 2>&1 \
+			|| log "WARNING: failed to import ${tarball}"
 	done
 }
 
@@ -231,9 +231,9 @@ master_ip() {
 # sha256 of the CA public key - the exact format kubeadm expects for the
 # caCertHashes join-discovery field ("sha256:<hash>").
 get_ca_hash() {
-	openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt |
-		openssl pkey -pubin -outform der 2>/dev/null |
-		openssl dgst -sha256 -hex | sed 's/^.*= //'
+	openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt \
+		| openssl pkey -pubin -outform der 2> /dev/null \
+		| openssl dgst -sha256 -hex | sed 's/^.*= //'
 }
 
 patch_kube_proxy() {
@@ -243,15 +243,15 @@ patch_kube_proxy() {
 	local dir=/etc/zek/kube-proxy
 	mkdir -p "${dir}"
 	export KUBECONFIG=/etc/kubernetes/admin.conf
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' >"${dir}/config.conf"
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' >"${dir}/kubeconfig.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' > "${dir}/config.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' > "${dir}/kubeconfig.conf"
 	[[ -s "${dir}/config.conf" ]] || return 0
 	sed -i -e 's/^\(  maxPerCore: \)null/\10/' -e 's/^\(  min: \)null/\10/' "${dir}/config.conf"
 	kubectl -n kube-system create configmap kube-proxy \
 		--from-file=config.conf="${dir}/config.conf" \
 		--from-file=kubeconfig.conf="${dir}/kubeconfig.conf" \
-		--dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
-	kubectl -n kube-system rollout restart daemonset kube-proxy >/dev/null 2>&1 || true
+		--dry-run=client -o yaml | kubectl apply -f - > /dev/null 2>&1 || true
+	kubectl -n kube-system rollout restart daemonset kube-proxy > /dev/null 2>&1 || true
 }
 
 # failSwapOn belongs in the kubelet config file: the --fail-swap-on CLI flag
@@ -262,7 +262,7 @@ ensure_kubelet_config() {
 	[[ -f ${KUBELET_CONFIG} ]] || return 0
 	sed -i 's/^failSwapOn:[[:space:]]*.*/failSwapOn: false/' "${KUBELET_CONFIG}"
 	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "${KUBELET_CONFIG}" && return 0
-	printf '\nfailSwapOn: false\n' >>"${KUBELET_CONFIG}"
+	printf '\nfailSwapOn: false\n' >> "${KUBELET_CONFIG}"
 }
 
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config
@@ -284,8 +284,8 @@ kubelet_supervisor() {
 				local flag
 				for flag in ${KUBELET_KUBEADM_ARGS:-}; do
 					case "${flag}" in
-					--fail-swap-on | --fail-swap-on=*) ;;
-					*) args+=("${flag}") ;;
+						--fail-swap-on | --fail-swap-on=*) ;;
+						*) args+=("${flag}") ;;
 					esac
 				done
 			fi
@@ -308,15 +308,15 @@ kubelet_supervisor() {
 			# Kill by command line, not comm: gcompat runs the glibc
 			# kubelet through musl's loader, so comm is ld-musl-x86_64.
 			# and a comm match never finds it.
-			pkill -f "/usr/local/bin/kubelet" >/dev/null 2>&1 || true
+			pkill -f "/usr/local/bin/kubelet" > /dev/null 2>&1 || true
 			# cgroupfs matches containerd's default (SystemdCgroup=false);
 			# switching this to systemd also requires flipping containerd's
 			# config, or every container fails to start. Last on the line so
 			# it beats kubeadm's generated config.yaml (flags > config file).
 			kubelet --config "${KUBELET_CONFIG}" --hostname-override "${NODE_NAME}" \
-				--v=2 "${args[@]}" --cgroup-driver=cgroupfs 2>&1 |
-				tee -a /var/log/kubelet.log |
-				awk '
+				--v=2 "${args[@]}" --cgroup-driver=cgroupfs 2>&1 \
+				| tee -a /var/log/kubelet.log \
+				| awk '
 					inval {
 						if (substr($0, 1, 1) == "\t" ||
 							$0 ~ /^[[:space:]]*>[[:space:]]*$/) next
@@ -328,7 +328,7 @@ kubelet_supervisor() {
 				' &
 			local pid=$!
 			log "kubelet running (full log: /var/log/kubelet.log)"
-			wait "${pid}" 2>/dev/null || true
+			wait "${pid}" 2> /dev/null || true
 			log "kubelet exited, restarting"
 		fi
 		sleep 2
@@ -346,19 +346,19 @@ ensure_shared_mounts() {
 	# Calico's eBPF bootstrap and cilium mount host fs types (bpffs) into pods
 	# with mount propagation; kubelet rejects that unless the parent mounts are
 	# shared. Applies to this container's mount namespace only.
-	mount --make-rshared / 2>/dev/null || true
-	mount --make-rshared /sys 2>/dev/null || true
-	mount --make-rshared /run 2>/dev/null || true
+	mount --make-rshared / 2> /dev/null || true
+	mount --make-rshared /sys 2> /dev/null || true
+	mount --make-rshared /run 2> /dev/null || true
 }
 
 ensure_bpffs() {
 	# Pre-mount the BPF filesystem so eBPF CNIs (cilium, calico eBPF) start
 	# cleanly instead of racing to mount it in-band on every start. A no-op
 	# when a CNI already mounted it or the host lacks BPF support.
-	grep -q " /sys/fs/bpf " /proc/mounts 2>/dev/null && return 0
+	grep -q " /sys/fs/bpf " /proc/mounts 2> /dev/null && return 0
 	mkdir -p /sys/fs/bpf
-	mount -t bpf bpf /sys/fs/bpf 2>/dev/null ||
-		log "WARNING: bpffs not mounted at /sys/fs/bpf (BPF-based CNIs may need it)"
+	mount -t bpf bpf /sys/fs/bpf 2> /dev/null \
+		|| log "WARNING: bpffs not mounted at /sys/fs/bpf (BPF-based CNIs may need it)"
 }
 
 node_setup() {
@@ -385,7 +385,11 @@ publish_cluster_credentials() {
 	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
-	ca_hash="$(get_ca_hash)"
+	# Explicit check: the resume path calls this from the right of || where
+	# errexit is off, and a failed hash would only surface later as a
+	# confusing "could not extract the join credentials".
+	# shellcheck disable=SC2310  # failure is handled by the || die
+	ca_hash="$(get_ca_hash)" || die "cannot hash the cluster CA (/etc/kubernetes/pki/ca.crt missing?)"
 	# Generate the certificate key ourselves and pass it to upload-certs
 	# instead of scraping it from kubeadm's human-readable output - that
 	# wording changed between releases before (v1.37 moved it to its own
@@ -393,19 +397,19 @@ publish_cluster_credentials() {
 	# 32-byte AES key, so 64 hex characters.
 	cert_key="$(openssl rand -hex 32)"
 	for i in $(seq 1 60); do
-		token="$(kubeadm token create --ttl 0 2>/dev/null | tr -d '\n')" || token=""
+		token="$(kubeadm token create --ttl 0 2> /dev/null | tr -d '\n')" || token=""
 		uploaded=""
 		kubeadm init phase upload-certs --upload-certs \
-			--certificate-key "${cert_key}" >/dev/null 2>&1 && uploaded=1
+			--certificate-key "${cert_key}" > /dev/null 2>&1 && uploaded=1
 		[[ -n ${token} ]] && [[ -n ${uploaded} ]] && break
 		sleep 2
 	done
-	[[ -n ${token} ]] && [[ -n ${uploaded} ]] && [[ -n ${ca_hash} ]] ||
-		die "could not extract the join credentials (token/certificate key/CA hash)"
-	printf '%s' "${token}" >"${CLUSTER_DIR}/token"
-	printf '%s' "${cert_key}" >"${CLUSTER_DIR}/cert-key"
-	echo "${API_ENDPOINT}" >"${CLUSTER_DIR}/api-endpoint"
-	printf '%s' "${ca_hash}" >"${CLUSTER_DIR}/ca-hash"
+	[[ -n ${token} ]] && [[ -n ${uploaded} ]] && [[ -n ${ca_hash} ]] \
+		|| die "could not extract the join credentials (token/certificate key/CA hash)"
+	printf '%s' "${token}" > "${CLUSTER_DIR}/token"
+	printf '%s' "${cert_key}" > "${CLUSTER_DIR}/cert-key"
+	echo "${API_ENDPOINT}" > "${CLUSTER_DIR}/api-endpoint"
+	printf '%s' "${ca_hash}" > "${CLUSTER_DIR}/ca-hash"
 	cp /etc/kubernetes/admin.conf "${CLUSTER_DIR}/admin.conf"
 	log "published join credentials to ${CLUSTER_DIR} (endpoint: ${API_ENDPOINT})"
 }
@@ -452,18 +456,16 @@ init_control_plane() {
 # through the API endpoint with the certificate key published by the first
 # master, becoming a member of the stacked etcd cluster.
 join_control_plane() {
-	[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] &&
-		[[ -n ${JOIN_CERT_KEY:-} ]] ||
-		die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY"
-	TOKEN="${JOIN_TOKEN}"
-	CA_HASH="${JOIN_CA_HASH}"
-	API_ENDPOINT="${JOIN_API_ENDPOINT}"
-	log "joining ${NODE_NAME} as a control-plane node via ${API_ENDPOINT}"
+	[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
+		&& [[ -n ${JOIN_CERT_KEY:-} ]] \
+		|| die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY"
+	local token="${JOIN_TOKEN}" ca_hash="${JOIN_CA_HASH}" endpoint="${JOIN_API_ENDPOINT}"
+	log "joining ${NODE_NAME} as a control-plane node via ${endpoint}"
 	import_k8s_images
 	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
-		kubeadm join "${API_ENDPOINT}" \
-		--token "${TOKEN}" \
-		--discovery-token-ca-cert-hash "sha256:${CA_HASH}" \
+		kubeadm join "${endpoint}" \
+		--token "${token}" \
+		--discovery-token-ca-cert-hash "sha256:${ca_hash}" \
 		--certificate-key "${JOIN_CERT_KEY}" \
 		--control-plane \
 		--node-name "${NODE_NAME}" \
@@ -494,13 +496,13 @@ run_master() {
 	#   marker checked here (they touch it themselves after joining).
 	if [[ ! -f /etc/kubernetes/kubelet.conf ]] && [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 		log "interrupted control-plane setup detected; resetting partial state"
-		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
-	elif [[ -f /etc/kubernetes/kubelet.conf ]] && [[ ${MASTER_JOIN:-0} != 1 ]] &&
-		[[ ! -f "${CLUSTER_DIR}/init-complete" ]] &&
-		[[ ! -f "${CLUSTER_DIR}/admin.conf" ]] &&
-		[[ ! -f "${CLUSTER_DIR}/token" ]]; then
+		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
+	elif [[ -f /etc/kubernetes/kubelet.conf ]] && [[ ${MASTER_JOIN:-0} != 1 ]] \
+		&& [[ ! -f "${CLUSTER_DIR}/init-complete" ]] \
+		&& [[ ! -f "${CLUSTER_DIR}/admin.conf" ]] \
+		&& [[ ! -f "${CLUSTER_DIR}/token" ]]; then
 		log "interrupted control-plane init detected; resetting partial state"
-		kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
+		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
 	fi
 
 	# kubelet.conf exists after either kubeadm init or a control-plane join,
@@ -534,19 +536,17 @@ run_worker() {
 		# starts clean. kubelet.conf marks a complete join.
 		if [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 			log "interrupted join detected; resetting partial state"
-			kubeadm reset --force --ignore-preflight-errors=all >/dev/null 2>&1 || true
+			kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
 		fi
-		[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] ||
-			die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT"
-		TOKEN="${JOIN_TOKEN}"
-		CA_HASH="${JOIN_CA_HASH}"
-		API_ENDPOINT="${JOIN_API_ENDPOINT}"
-		log "joining ${NODE_NAME} to ${API_ENDPOINT}"
+		[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
+			|| die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT"
+		local token="${JOIN_TOKEN}" ca_hash="${JOIN_CA_HASH}" endpoint="${JOIN_API_ENDPOINT}"
+		log "joining ${NODE_NAME} to ${endpoint}"
 		import_k8s_images
 		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
-			kubeadm join "${API_ENDPOINT}" \
-			--token "${TOKEN}" \
-			--discovery-token-ca-cert-hash "sha256:${CA_HASH}" \
+			kubeadm join "${endpoint}" \
+			--token "${token}" \
+			--discovery-token-ca-cert-hash "sha256:${ca_hash}" \
 			--node-name "${NODE_NAME}" \
 			--cri-socket=unix:///run/containerd/containerd.sock \
 			--ignore-preflight-errors=all
@@ -568,7 +568,7 @@ run_lb() {
 		# every EOF heredoc as canonical yamlfmt kyaml output, and runs
 		# `haproxy -c` plus a tab/whitespace style check on the HAPROXY
 		# ones (assembled with a synthetic backend server).
-		cat <<'HAPROXY'
+		cat << 'HAPROXY'
 global
 	maxconn 4096
 
@@ -592,7 +592,7 @@ HAPROXY
 			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${ip}"
 			i=$((i + 1))
 		done
-		cat <<'HAPROXY'
+		cat << 'HAPROXY'
 
 frontend stats
 	mode http
@@ -601,7 +601,7 @@ frontend stats
 	stats enable
 	stats uri /
 HAPROXY
-	} >"${cfg}"
+	} > "${cfg}"
 	log "load balancer for: ${LB_BACKENDS}"
 	exec haproxy -f "${cfg}"
 }
@@ -638,90 +638,90 @@ parse_role_flags() {
 	ROLE_ARGS=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--)
-			# forward the delimiter: `kubectl exec POD -- CMD` needs it
-			shift
-			ROLE_ARGS+=("--" "$@")
-			break
-			;;
-		--cluster-dir)
-			[[ $# -ge 2 ]] || die "--cluster-dir needs a value"
-			CLUSTER_DIR="$2"
-			shift 2
-			;;
-		--cluster-dir=*) CLUSTER_DIR="${1#*=}" && shift ;;
-		--node-name)
-			[[ $# -ge 2 ]] || die "--node-name needs a value"
-			NODE_NAME="$2"
-			shift 2
-			;;
-		--node-name=*) NODE_NAME="${1#*=}" && shift ;;
-		--pod-cidr)
-			[[ $# -ge 2 ]] || die "--pod-cidr needs a value"
-			POD_CIDR="$2"
-			shift 2
-			;;
-		--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
-		--node-dns)
-			[[ $# -ge 2 ]] || die "--node-dns needs a value"
-			NODE_DNS="$2"
-			shift 2
-			;;
-		--node-dns=*) NODE_DNS="${1#*=}" && shift ;;
-		--api-endpoint)
-			[[ $# -ge 2 ]] || die "--api-endpoint needs a value"
-			API_ENDPOINT="$2"
-			shift 2
-			;;
-		--api-endpoint=*) API_ENDPOINT="${1#*=}" && shift ;;
-		--master-join)
-			MASTER_JOIN=1
-			shift
-			;;
-		--join-token)
-			[[ $# -ge 2 ]] || die "--join-token needs a value"
-			JOIN_TOKEN="$2"
-			shift 2
-			;;
-		--join-token=*) JOIN_TOKEN="${1#*=}" && shift ;;
-		--join-ca-hash)
-			[[ $# -ge 2 ]] || die "--join-ca-hash needs a value"
-			JOIN_CA_HASH="$2"
-			shift 2
-			;;
-		--join-ca-hash=*) JOIN_CA_HASH="${1#*=}" && shift ;;
-		--join-api-endpoint)
-			[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value"
-			JOIN_API_ENDPOINT="$2"
-			shift 2
-			;;
-		--join-api-endpoint=*) JOIN_API_ENDPOINT="${1#*=}" && shift ;;
-		--join-cert-key)
-			[[ $# -ge 2 ]] || die "--join-cert-key needs a value"
-			JOIN_CERT_KEY="$2"
-			shift 2
-			;;
-		--join-cert-key=*) JOIN_CERT_KEY="${1#*=}" && shift ;;
-		--lb-backends)
-			[[ $# -ge 2 ]] || die "--lb-backends needs a value"
-			LB_BACKENDS="$2"
-			shift 2
-			;;
-		--lb-backends=*) LB_BACKENDS="${1#*=}" && shift ;;
-		--kubeconfig)
-			[[ $# -ge 2 ]] || die "--kubeconfig needs a value"
-			KUBECONFIG="$2"
-			shift 2
-			;;
-		--kubeconfig=*) KUBECONFIG="${1#*=}" && shift ;;
-		--no-host-modules)
-			NO_HOST_MODULES=1
-			shift
-			;;
-		*)
-			ROLE_ARGS+=("$1")
-			shift
-			;;
+			--)
+				# forward the delimiter: `kubectl exec POD -- CMD` needs it
+				shift
+				ROLE_ARGS+=("--" "$@")
+				break
+				;;
+			--cluster-dir)
+				[[ $# -ge 2 ]] || die "--cluster-dir needs a value"
+				CLUSTER_DIR="$2"
+				shift 2
+				;;
+			--cluster-dir=*) CLUSTER_DIR="${1#*=}" && shift ;;
+			--node-name)
+				[[ $# -ge 2 ]] || die "--node-name needs a value"
+				NODE_NAME="$2"
+				shift 2
+				;;
+			--node-name=*) NODE_NAME="${1#*=}" && shift ;;
+			--pod-cidr)
+				[[ $# -ge 2 ]] || die "--pod-cidr needs a value"
+				POD_CIDR="$2"
+				shift 2
+				;;
+			--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
+			--node-dns)
+				[[ $# -ge 2 ]] || die "--node-dns needs a value"
+				NODE_DNS="$2"
+				shift 2
+				;;
+			--node-dns=*) NODE_DNS="${1#*=}" && shift ;;
+			--api-endpoint)
+				[[ $# -ge 2 ]] || die "--api-endpoint needs a value"
+				API_ENDPOINT="$2"
+				shift 2
+				;;
+			--api-endpoint=*) API_ENDPOINT="${1#*=}" && shift ;;
+			--master-join)
+				MASTER_JOIN=1
+				shift
+				;;
+			--join-token)
+				[[ $# -ge 2 ]] || die "--join-token needs a value"
+				JOIN_TOKEN="$2"
+				shift 2
+				;;
+			--join-token=*) JOIN_TOKEN="${1#*=}" && shift ;;
+			--join-ca-hash)
+				[[ $# -ge 2 ]] || die "--join-ca-hash needs a value"
+				JOIN_CA_HASH="$2"
+				shift 2
+				;;
+			--join-ca-hash=*) JOIN_CA_HASH="${1#*=}" && shift ;;
+			--join-api-endpoint)
+				[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value"
+				JOIN_API_ENDPOINT="$2"
+				shift 2
+				;;
+			--join-api-endpoint=*) JOIN_API_ENDPOINT="${1#*=}" && shift ;;
+			--join-cert-key)
+				[[ $# -ge 2 ]] || die "--join-cert-key needs a value"
+				JOIN_CERT_KEY="$2"
+				shift 2
+				;;
+			--join-cert-key=*) JOIN_CERT_KEY="${1#*=}" && shift ;;
+			--lb-backends)
+				[[ $# -ge 2 ]] || die "--lb-backends needs a value"
+				LB_BACKENDS="$2"
+				shift 2
+				;;
+			--lb-backends=*) LB_BACKENDS="${1#*=}" && shift ;;
+			--kubeconfig)
+				[[ $# -ge 2 ]] || die "--kubeconfig needs a value"
+				KUBECONFIG="$2"
+				shift 2
+				;;
+			--kubeconfig=*) KUBECONFIG="${1#*=}" && shift ;;
+			--no-host-modules)
+				NO_HOST_MODULES=1
+				shift
+				;;
+			*)
+				ROLE_ARGS+=("$1")
+				shift
+				;;
 		esac
 	done
 }
@@ -729,13 +729,13 @@ parse_role_flags() {
 # Validate the role, drop it from the args, then parse the flags: what
 # remains is what the role receives.
 case "${1:-}" in
-master | worker | lb | kubectl)
-	ROLE="$1"
-	shift
-	;;
-*)
-	die "usage: $0 {master|worker|lb|kubectl} [flags] [kubectl-args...]"
-	;;
+	master | worker | lb | kubectl)
+		ROLE="$1"
+		shift
+		;;
+	*)
+		die "usage: $0 {master|worker|lb|kubectl} [flags] [kubectl-args...]"
+		;;
 esac
 parse_role_flags "$@"
 "run_${ROLE}" "${ROLE_ARGS[@]}"

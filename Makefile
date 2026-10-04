@@ -42,6 +42,7 @@ lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 			dnf install -y git shellcheck shfmt nodejs npm golang haproxy; \
 			go install github.com/reteps/dockerfmt@latest; \
 			go install sigs.k8s.io/yaml/yamlfmt@latest; \
+			go install github.com/rhysd/actionlint/cmd/actionlint@latest; \
 			export PATH="$$(go env GOPATH)/bin:$$PATH"; \
 			git config --global --add safe.directory "*"; \
 			shellcheck --version | sed -n "2p"; \
@@ -49,6 +50,7 @@ lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 			dockerfmt version; \
 			command -v shfmt; \
 			yamlfmt -h | sed -n "1p"; \
+			actionlint --version | sed -n "1p"; \
 			haproxy -v | sed -n "1p"; \
 			./lint.sh'
 

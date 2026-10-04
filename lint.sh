@@ -1,42 +1,59 @@
 #!/usr/bin/env bash
 #
-# lint - format/lint checks for every sh, Dockerfile, markdown and YAML
-# file in the repo. CI runs this same script (.github/workflows/lint.yml).
-# All tools run in their strictest mode:
+# lint - format/lint checks for every sh, Dockerfile, markdown, YAML and
+# GitHub Actions file in the repo. CI runs this same script
+# (.github/workflows/lint.yml). All tools run in their strictest mode:
 #
-#   format sh:          shfmt -l -s -d   (list + simplify + diff)
+#   format sh:          shfmt -l -s -d -i 0 -bn -ci -sr
+#                       (list + simplify + diff; tabs; binary operators at
+#                       the start of continuation lines; indented case
+#                       arms; space after redirect operators)
 #   lint sh:            shellcheck -o all -x   (all optional checks + follow sources)
 #   lint sh directives: every '# shellcheck disable=' line must still be
 #                       required - the directive is stripped and shellcheck
 #                       must then report an issue
-#   lint sh manifests:  every EOF heredoc must round-trip through
-#                       sigs.k8s.io/yaml/yamlfmt -o=kyaml unchanged (k8s
-#                       manifests, parsed the way the shell expands them;
-#                       kyaml profile to match the repo YAML files - only
-#                       kubectl reads the heredocs and it accepts flow
+#   lint sh heredocs:   every heredoc must have a known delimiter and be
+#                       linted as what it is: EOF bodies must round-trip
+#                       through sigs.k8s.io/yaml/yamlfmt -o=kyaml unchanged
+#                       (k8s manifests, parsed the way the shell expands
+#                       them; kyaml profile to match the repo YAML files -
+#                       only kubectl reads the heredocs and it accepts flow
 #                       style, while kubeadm's config decoder sniffs a
 #                       leading { as strict JSON, so kubeadm runs on CLI
-#                       flags and never reads a heredoc)
+#                       flags and never reads a heredoc); HAPROXY bodies go
+#                       through the LB config checks below; AWK bodies must
+#                       parse as awk programs
 #   lint sh lb config:  the HAPROXY heredocs are assembled over stdin with
 #                       one synthetic backend server, checked with
 #                       haproxy -c -f /dev/stdin, and style-checked for
 #                       tab-only indentation and trailing whitespace
+#   lint Dockerfile:    dockerfmt -s -n --check (space redirects + trailing
+#                       newline); every RUN heredoc body is a shell script,
+#                       so it is also checked with shellcheck (sh dialect,
+#                       the Dockerfile RUN default) and shfmt
+#   lint actions:       actionlint over .github/workflows (also runs the
+#                       sh checks over every run: block)
 #   format md:          prettier --check --end-of-line lf
 #   format yaml:        yamlfmt (kyaml profile, compared byte for byte)
-#   format Dockerfile:  dockerfmt -s -n --check   (space redirects + trailing newline)
 #
 # Checks run in parallel; every tool reads its payload over stdin (no
 # intermediate files - only the ordered per-check report buffers).
 #
-# Fix locally with:  shfmt -w -s <files>  |  prettier --write <files>  |
+# Fix locally with:  shfmt -w -s -i 0 -bn -ci -sr <files>  |
+#                    prettier --write <files>  |
 #                    dockerfmt -w Dockerfile  |  yamlfmt -w <files>  |
 #                    dnf install haproxy  |
-#                    go install sigs.k8s.io/yaml/yamlfmt@latest
+#                    go install sigs.k8s.io/yaml/yamlfmt@latest  |
+#                    go install github.com/rhysd/actionlint/cmd/actionlint@latest
 #
 # The check functions only ever run through run_check's dynamic dispatch
 # (their names are passed as arguments), so SC2329 - the unused-function
-# check - is disabled for this file below.
-# shellcheck disable=SC2329
+# check - is disabled for this file. SC2310 - "function invoked in a
+# condition" - is disabled too: run_check calls the checks under `if`,
+# which turns errexit off inside, so the heredoc checks status-check their
+# marker lists explicitly (a plain assignment would swallow an unterminated
+# heredoc into an empty list and pass vacuously).
+# shellcheck disable=SC2329,SC2310
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -58,7 +75,7 @@ run_check() { # desc cmd...
 			printf 'FAIL %s\n' "${desc}"
 			exit 1
 		fi
-	} >"${buf}" 2>&1 &
+	} > "${buf}" 2>&1 &
 	check_pids+=("$!")
 }
 wait_checks() {
@@ -71,8 +88,8 @@ wait_checks() {
 	check_pids=() check_bufs=()
 }
 
-for tool in shfmt shellcheck dockerfmt yamlfmt; do
-	command -v "${tool}" >/dev/null 2>&1 || {
+for tool in shfmt shellcheck dockerfmt yamlfmt actionlint; do
+	command -v "${tool}" > /dev/null 2>&1 || {
 		printf '[lint] missing tool: %s (install it to run this check)\n' "${tool}" >&2
 		exit 1
 	}
@@ -93,9 +110,9 @@ fi
 
 # prettier: local binary if present, otherwise the latest version via npx
 # (CI relies on this npx fallback, so no global npm install is needed).
-if command -v prettier >/dev/null 2>&1; then
+if command -v prettier > /dev/null 2>&1; then
 	prettier_cmd=(prettier)
-elif command -v npx >/dev/null 2>&1; then
+elif command -v npx > /dev/null 2>&1; then
 	prettier_cmd=(npx --yes prettier)
 else
 	printf '[lint] missing tool: prettier (install prettier or node/npx)\n' >&2
@@ -105,7 +122,7 @@ fi
 # The LB config checks need a haproxy binary; its absence fails lint but
 # does not short-circuit the other checks.
 haproxy_tool=1
-if ! command -v haproxy >/dev/null 2>&1; then
+if ! command -v haproxy > /dev/null 2>&1; then
 	printf '[lint] missing tool: haproxy (dnf install haproxy / apt install haproxy)\n' >&2
 	status=1
 	haproxy_tool=0
@@ -127,26 +144,29 @@ md_list=$(git_list '*.md')
 yaml_list=$(git_list '*.yml' '*.yaml')
 docker_list=$(git_list 'Dockerfile*' '*Dockerfile*')
 sh_files=() md_files=() yaml_files=() docker_files=()
-[[ -n ${sh_list} ]] && mapfile -t sh_files <<<"${sh_list}"
-[[ -n ${md_list} ]] && mapfile -t md_files <<<"${md_list}"
-[[ -n ${yaml_list} ]] && mapfile -t yaml_files <<<"${yaml_list}"
-[[ -n ${docker_list} ]] && mapfile -t docker_files <<<"${docker_list}"
+[[ -n ${sh_list} ]] && mapfile -t sh_files <<< "${sh_list}"
+[[ -n ${md_list} ]] && mapfile -t md_files <<< "${md_list}"
+[[ -n ${yaml_list} ]] && mapfile -t yaml_files <<< "${yaml_list}"
+[[ -n ${docker_list} ]] && mapfile -t docker_files <<< "${docker_list}"
 
 # awk program printing one heredoc body to stdout: -s is the opener line,
 # -d the delimiter line, -u=1 for quoted openers (no shell escaping to
 # strip; an unquoted heredoc's \$ is a literal dollar for the shell, so
 # the YAML parser must see plain $).
 body_awk=$(
-	cat <<'AWK'
+	cat << 'AWK'
 	NR > s && $0 == d { exit }
 	NR > s { line = $0; if (u == 0) gsub(/\\\$/, "$", line); print line }
 AWK
 )
 
-# list_heredocs DELIM SRC... - emit one "src:line:quoted" marker per
-# closed heredoc with that delimiter. Mirrors the shell: comment lines are
-# never openers (bash ignores them), a here-string (<<<) can never match,
-# and the terminator line must equal the delimiter exactly.
+# list_heredocs DELIM SRC... - emit one "src:line:quoted:delimiter" marker
+# per closed heredoc. DELIM selects the markers: a delimiter name, or "all"
+# for every heredoc. Mirrors the shell: comment lines are never openers
+# (bash ignores them), a here-string (<<<) can never match, and the
+# terminator line must equal the delimiter exactly. Callers must check the
+# status: an unterminated heredoc exits 1 and must not degrade into an
+# empty marker stream that the checks below would pass vacuously.
 list_heredocs() {
 	local delim=$1 src
 	shift
@@ -161,7 +181,7 @@ list_heredocs() {
 					sub(/[\047"]+$/, "", name)
 					q = (m ~ /[\047"]/)
 					curdelim = name
-					istarget = (name == delim)
+					istarget = (delim == "all" || name == delim)
 					inbody = 1
 					start = FNR
 				}
@@ -169,7 +189,7 @@ list_heredocs() {
 			}
 			{
 				if ($0 == curdelim) {
-					if (istarget) printf "%s:%d:%d\n", src, start, q
+					if (istarget) printf "%s:%d:%d:%s\n", src, start, q, name
 					inbody = 0
 				}
 			}
@@ -179,7 +199,7 @@ list_heredocs() {
 					exit 1
 				}
 			}
-		' "${src}"
+		' "${src}" || return 1
 	done
 }
 
@@ -187,9 +207,12 @@ list_heredocs() {
 # parse it exactly as the shell would present it and require yamlfmt
 # -o=kyaml to reproduce it byte for byte (a parse error or any diff fails).
 lint_heredocs_yaml() {
-	local src start quoted body canon rc=0
-	# shellcheck disable=SC2312  # marker stream is the loop's input by design
-	while IFS=: read -r src start quoted; do
+	local src start quoted _name body canon markers rc=0
+	if ! markers=$(list_heredocs EOF "$@"); then
+		return 1
+	fi
+	while IFS=: read -r src start quoted _name; do
+		[[ -n ${src} ]] || continue
 		if ! body=$(awk -v s="${start}" -v d=EOF -v u="${quoted}" "${body_awk}" "${src}"); then
 			printf '%s:%s: cannot read heredoc body\n' "${src}" "${start}" >&2
 			rc=1
@@ -208,7 +231,53 @@ lint_heredocs_yaml() {
 			diff <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}") | sed 's/^/  /' >&2 || true
 			rc=1
 		fi
-	done < <(list_heredocs EOF "$@")
+	done <<< "${markers}"
+	return "${rc}"
+}
+
+# Every heredoc must have a delimiter the checks above (or the checks below)
+# understand, so a new heredoc cannot silently escape linting: EOF is the
+# kyaml manifest check, HAPROXY the LB config checks, AWK the awk parse
+# check in this file.
+lint_heredoc_coverage() {
+	local src start quoted name markers rc=0
+	if ! markers=$(list_heredocs all "$@"); then
+		return 1
+	fi
+	while IFS=: read -r src start quoted name; do
+		[[ -n ${src} ]] || continue
+		case "${name}" in
+			EOF | HAPROXY | AWK) ;;
+			*)
+				printf '%s:%s: heredoc delimiter %s is not linted (known: EOF=kyaml manifests, HAPROXY=LB config, AWK=awk programs)\n' \
+					"${src}" "${start}" "${name}" >&2
+				rc=1
+				;;
+		esac
+	done <<< "${markers}"
+	return "${rc}"
+}
+
+# Every AWK heredoc body must parse as an awk program. The body_awk program
+# in this file is what every check above reads heredoc bodies with, so a
+# typo in it would otherwise corrupt the marker stream itself.
+lint_heredoc_awk() {
+	local src start quoted _name body markers rc=0
+	if ! markers=$(list_heredocs AWK "$@"); then
+		return 1
+	fi
+	while IFS=: read -r src start quoted _name; do
+		[[ -n ${src} ]] || continue
+		if ! body=$(awk -v s="${start}" -v d=AWK -v u="${quoted}" "${body_awk}" "${src}"); then
+			printf '%s:%s: cannot read AWK heredoc body\n' "${src}" "${start}" >&2
+			rc=1
+			continue
+		fi
+		if ! awk -f <(printf '%s\n' "${body}") < /dev/null 2> /dev/null; then
+			printf '%s:%s: heredoc body does not parse as an awk program\n' "${src}" "${start}" >&2
+			rc=1
+		fi
+	done <<< "${markers}"
 	return "${rc}"
 }
 
@@ -221,7 +290,7 @@ lint_shellcheck_directives() {
 	for f in "$@"; do
 		while IFS=: read -r l _; do
 			[[ -n ${l} ]] || continue
-			if sed "${l}d" "${f}" | shellcheck -o all -x - >/dev/null 2>&1; then
+			if sed "${l}d" "${f}" | shellcheck -o all -x - > /dev/null 2>&1; then
 				printf '%s:%s: unnecessary shellcheck disable (shellcheck passes without it)\n' \
 					"${f}" "${l}" >&2
 				rc=1
@@ -235,9 +304,12 @@ lint_shellcheck_directives() {
 # heredoc bodies in order, with one synthetic backend server line between
 # them (run_lb prints a real one per control-plane IP at runtime).
 assemble_haproxy() {
-	local src start quoted body first=1
-	# shellcheck disable=SC2312  # marker stream is the loop's input by design
-	while IFS=: read -r src start quoted; do
+	local src start quoted _name body markers first=1
+	if ! markers=$(list_heredocs HAPROXY "$@"); then
+		return 1
+	fi
+	while IFS=: read -r src start quoted _name; do
+		[[ -n ${src} ]] || continue
 		if ! body=$(awk -v s="${start}" -v d=HAPROXY -v u="${quoted}" "${body_awk}" "${src}"); then
 			printf 'cannot read HAPROXY heredoc %s:%s\n' "${src}" "${start}" >&2
 			return 1
@@ -248,7 +320,7 @@ assemble_haproxy() {
 			printf '\tserver cp1 127.0.0.1:6443 check inter 2s fall 3 rise 2\n'
 		fi
 		printf '%s\n' "${body}"
-	done < <(list_heredocs HAPROXY "$@")
+	done <<< "${markers}"
 	if [[ ${first} -eq 1 ]]; then
 		printf 'no HAPROXY heredocs found (run_lb in entrypoint.sh)\n' >&2
 		return 1
@@ -276,6 +348,41 @@ lint_haproxy_style() { # src... - whitespace rules for the assembled config
 	fi
 }
 
+# Every Dockerfile RUN heredoc body is a shell script that docker executes,
+# so it gets the same treatment as a .sh file: shellcheck (sh dialect, the
+# Dockerfile RUN default shell) and shfmt. The heredoc must sit on a RUN
+# line - that is the only Dockerfile form that executes a heredoc as shell.
+lint_dockerfile_heredocs() { # src...
+	local src start quoted name body markers opener rc=0
+	if ! markers=$(list_heredocs all "$@"); then
+		return 1
+	fi
+	while IFS=: read -r src start quoted name; do
+		[[ -n ${src} ]] || continue
+		opener=$(sed -n "${start}p" "${src}")
+		if [[ ${opener} != *"RUN <<"* ]]; then
+			printf '%s:%s: heredoc is not executed by a RUN step (only RUN heredocs are linted as shell)\n' \
+				"${src}" "${start}" >&2
+			rc=1
+			continue
+		fi
+		if ! body=$(awk -v s="${start}" -v d="${name}" -v u="${quoted}" "${body_awk}" "${src}"); then
+			printf '%s:%s: cannot read heredoc body\n' "${src}" "${start}" >&2
+			rc=1
+			continue
+		fi
+		if ! printf '%s\n' "${body}" | shellcheck --shell=sh -o all -x -; then
+			rc=1
+		fi
+		if ! printf '%s\n' "${body}" | shfmt -ln posix -s -d -i 0 -bn -ci -sr - > /dev/null; then
+			printf '%s:%s: RUN heredoc body is not canonical shfmt output (fix: shfmt -w -s -i 0 -bn -ci -sr in the body)\n' \
+				"${src}" "${start}" >&2
+			rc=1
+		fi
+	done <<< "${markers}"
+	return "${rc}"
+}
+
 # Every repo YAML file must be canonical yamlfmt output (kyaml profile).
 # yamlfmt -d always exits 0, even on a diff, so compare its stdout to
 # the file byte for byte instead.
@@ -297,10 +404,13 @@ lint_yamlfmt() { # files...
 }
 
 if [[ ${#sh_files[@]} -gt 0 ]]; then
-	run_check "shfmt -l -s (${#sh_files[@]} sh)" shfmt -l -s -d "${sh_files[@]}"
+	run_check "shfmt -l -s -i 0 -bn -ci -sr (${#sh_files[@]} sh)" \
+		shfmt -l -s -d -i 0 -bn -ci -sr "${sh_files[@]}"
 	run_check "shellcheck -o all -x (${#sh_files[@]} sh)" shellcheck -o all -x "${sh_files[@]}"
 	run_check "shellcheck directives (${#sh_files[@]} sh)" lint_shellcheck_directives "${sh_files[@]}"
 	run_check "heredoc yaml (${#sh_files[@]} sh)" lint_heredocs_yaml "${sh_files[@]}"
+	run_check "heredoc coverage (${#sh_files[@]} sh)" lint_heredoc_coverage "${sh_files[@]}"
+	run_check "heredoc awk (${#sh_files[@]} sh)" lint_heredoc_awk "${sh_files[@]}"
 	if [[ ${haproxy_tool} -eq 1 ]]; then
 		run_check "haproxy -c (assembled LB config)" lint_haproxy_c "${sh_files[@]}"
 		run_check "haproxy style (assembled LB config)" lint_haproxy_style "${sh_files[@]}"
@@ -316,7 +426,9 @@ if [[ ${#docker_files[@]} -gt 0 ]]; then
 	for f in "${docker_files[@]}"; do
 		run_check "dockerfmt -s -n (${f})" dockerfmt -s -n --check "${f}"
 	done
+	run_check "RUN heredoc shell (${#docker_files[@]} Dockerfile)" lint_dockerfile_heredocs "${docker_files[@]}"
 fi
+run_check "actionlint" actionlint
 wait_checks
 
 if [[ ${status} -ne 0 ]]; then
