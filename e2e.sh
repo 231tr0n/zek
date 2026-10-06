@@ -12,14 +12,20 @@
 #   single-node    1 master, 0 workers: the smallest cluster still works,
 #                  kubeadm's null kube-proxy conntrack limits were
 #                  rewritten to numbers (patch_kube_proxy, both maxPerCore
-#                  and min), and the preloaded kubeadm images are actually
-#                  in the containerd store (import ran on first init)
+#                  and min), the preloaded kubeadm images are actually
+#                  in the containerd store (import ran on first init), and
+#                  the image HEALTHCHECK reads the local daemons: healthy
+#                  at rest, unhealthy when containerd dies (docker keeps
+#                  the container running) and healthy again after the
+#                  restart
 #   multi-master   3 masters + 1 worker: HA init/join behind the LB, all
 #                  control-plane static pods (apiserver, etcd, scheduler,
 #                  controller-manager) Running on every master, apiserver
-#                  logs and a port-forward streaming through the LB, 3 etcd
-#                  members, quorum survives docker stop/start of a master,
-#                  and `zek down`/`up` restarts the HA cluster incl. the LB
+#                  logs and a port-forward streaming through the LB, the
+#                  LB container's HEALTHCHECK (haproxy stats page) turns
+#                  healthy, 3 etcd members, quorum survives docker
+#                  stop/start of a master, and `zek down`/`up` restarts
+#                  the HA cluster incl. the LB
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -30,7 +36,8 @@
 #                  cluster DNS and external DNS forwarding
 #   cilium         same with cilium (cilium CLI downloaded on demand,
 #                  version matched to the cluster's k8s release)
-#   smoke          the zek.sh surface: status, logs, kubectl exec (the
+#   smoke          the zek.sh surface: status (incl. every HEALTHCHECK
+#                  verdict rendering), logs, kubectl exec (the
 #                  `--` delimiter and stdin with -i), every flag in both
 #                  spellings + env precedence + loud error paths (zek
 #                  input validation, e2e test selection, entrypoint),
@@ -438,6 +445,32 @@ container_running() {
 	[[ ${state} == true ]]
 }
 
+# The image's HEALTHCHECK verdict (docker ps cannot format .State.Health).
+# Assigned before the comparison: the file's pattern for a failed probe -
+# an empty capture simply compares false and wait_for retries.
+docker_health() { # container -> healthy|unhealthy|starting|empty
+	docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2> /dev/null
+}
+
+healthy_is() { # container
+	local got
+	got=$(docker_health "$1")
+	[[ ${got} == healthy ]]
+}
+
+unhealthy_is() { # container
+	local got
+	got=$(docker_health "$1")
+	[[ ${got} == unhealthy ]]
+}
+
+# containerd is no longer running inside the container (pkill sends the
+# signal; this waits for the process to actually be gone before a restart
+# would race the dying one for the socket).
+containerd_gone() { # container
+	! docker exec "$1" pgrep -x containerd > /dev/null 2>&1
+}
+
 # Is the apiserver inside a master container serving? (no CNI needed)
 master_readyz() { # cluster master-index
 	docker exec "${1}-master-${2}" curl -skf https://127.0.0.1:6443/readyz 2> /dev/null \
@@ -831,6 +864,8 @@ test_multi_master() {
 	done
 	# shellcheck disable=SC2310
 	container_running "${c}-lb" || fail "${c}: load balancer is not running"
+	# The lb branch of the image HEALTHCHECK: haproxy's stats page.
+	wait_for "${c}: load balancer healthy" 120 healthy_is "${c}-lb"
 	wait_for "${c}: control plane readyz" 120 readyz_ok "${c}"
 	# The other control-plane static pods, once the API serves: kubeadm
 	# starts them (leader-elected) on every control-plane node.
@@ -1199,7 +1234,7 @@ EOF
 }
 
 test_single_node() {
-	local c=$1 images
+	local c=$1 images out
 	# The smallest cluster: one master, zero workers.
 	up "${c}" 0 1
 	assert_cmd "${c}: node count" 1 node_count "${c}"
@@ -1231,6 +1266,35 @@ test_single_node() {
 	if log_has "${c}-master-1" "failed to import"; then
 		fail "${c}: the kubeadm image preload logged a failure"
 	fi
+	# The image HEALTHCHECK reads the local daemons (containerd's process
+	# plus kubelet's healthz - the cluster state it must NOT use: this
+	# node is NotReady without a CNI). Flip it off and back: unhealthy
+	# is advisory metadata, so docker keeps the container running, and
+	# the verdict recovers with the daemon.
+	wait_for "${c}: master container healthy" 120 healthy_is "${c}-master-1"
+	log "${c}: killing containerd must turn the HEALTHCHECK unhealthy"
+	docker exec "${c}-master-1" pkill -x containerd \
+		|| fail "${c}: pkill -x containerd failed"
+	wait_for "${c}: containerd gone" 30 containerd_gone "${c}-master-1"
+	wait_for "${c}: master unhealthy after containerd died" 120 \
+		unhealthy_is "${c}-master-1"
+	# shellcheck disable=SC2310
+	container_running "${c}-master-1" \
+		|| fail "${c}: docker stopped the unhealthy container"
+	# ...and status renders the same verdict docker inspect reports.
+	# shellcheck disable=SC2310
+	out=$(zk "${c}" status 2>&1) || fail "${c}: status failed: ${out}"
+	grep -E "^${c}-master-1[[:space:]]+running[[:space:]]+unhealthy$" \
+		<<< "${out}" > /dev/null \
+		|| fail "${c}: status misses the unhealthy verdict for ${c}-master-1: ${out}"
+	log "${c}: restarting containerd must turn the HEALTHCHECK healthy"
+	# The same command entrypoint.sh runs in start_containerd (its config
+	# edits already live in the file), detached so the exec does not hold
+	# the probe loop's hand.
+	docker exec -d "${c}-master-1" sh -c \
+		'containerd > /var/log/containerd.log 2>&1 &'
+	wait_for "${c}: master healthy after the containerd restart" 120 \
+		healthy_is "${c}-master-1"
 }
 
 # The zek.sh surface no other test reaches: kubectl exec's `--`, flag
@@ -1240,12 +1304,20 @@ test_single_node() {
 test_smoke() {
 	local c=$1 before after out
 	up "${c}" 1 1
+	# status prints the HEALTHCHECK verdict as its own column, so the
+	# master's first successful probe has to land before the read.
+	wait_for "${c}: master container healthy" 120 healthy_is "${c}-master-1"
 	# status: lists the node containers and the cluster nodes; merge
 	# stderr so a failing status lands in the FAIL line instead of
 	# being lost in the shared output (the entrypoint logs to stderr).
 	# shellcheck disable=SC2310
 	out=$(zk "${c}" status 2>&1) || fail "${c}: status failed: ${out}"
 	[[ ${out} == *"${c}-master-1"* ]] || fail "${c}: status misses ${c}-master-1"
+	# Pin the health column itself: name, state and verdict in order,
+	# so a status that drops or reorders it stops passing silently.
+	grep -E "^${c}-master-1[[:space:]]+running[[:space:]]+healthy$" \
+		<<< "${out}" > /dev/null \
+		|| fail "${c}: status misses the health verdict for ${c}-master-1"
 	# logs follows the container (-f), so bound it; the entrypoint's own
 	# [zek] lines must come through. timeout execs a binary (zk is a
 	# shell function) and its group kill is what actually stops
@@ -1495,6 +1567,11 @@ EOF
 	out=$(zk "${c}" status 2>&1) || fail "${c}: status on a stopped cluster failed: ${out}"
 	[[ ${out} == *"is stopped"* ]] \
 		|| fail "${c}: status on a stopped cluster: ${out}"
+	# docker runs no probes on a stopped container, so the health column
+	# must read `-` instead of the last verdict it had while running.
+	grep -E "^${c}-master-1[[:space:]]+exited[[:space:]]+-$" \
+		<<< "${out}" > /dev/null \
+		|| fail "${c}: status on a stopped cluster misses the '-' health column: ${out}"
 	# shellcheck disable=SC2310
 	out=$(zk "${c}" down 2>&1) || fail "${c}: second down failed: ${out}"
 	[[ ${out} == *"is not running"* ]] \
@@ -1522,6 +1599,15 @@ EOF
 	out=$(zk "${c}" --image "${ZEK_IMAGE}" --dns 1.1.1.1 \
 		--pod-cidr 10.245.0.0/16 --mounts "${WORK_DIR}:/e2e-mount" \
 		clean "${c}-worker-1" 2>&1) || fail "${c}: clean failed: ${out}"
+	# The recreated worker cannot be healthy this early - the fresh
+	# container runs no kubelet until kubeadm join has written its
+	# config - so its probes fail inside the health start period and
+	# status must render the running/starting verdict.
+	# shellcheck disable=SC2310
+	out=$(zk "${c}" status 2>&1) || fail "${c}: status after clean failed: ${out}"
+	grep -E "^${c}-worker-1[[:space:]]+running[[:space:]]+starting$" \
+		<<< "${out}" > /dev/null \
+		|| fail "${c}: status misses the starting verdict for ${c}-worker-1: ${out}"
 	wait_for "${c}: worker-1 re-registered after clean" "${ZEK_E2E_TIMEOUT}" \
 		node_count_is "${c}" 2
 	assert_cmd "${c}: --image on the recreated worker" "${ZEK_IMAGE}" \

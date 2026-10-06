@@ -65,7 +65,7 @@ credentials in one run.
 
 ```sh
 ./zek.sh up --workers 2 --masters 1    # create: 1 master + 2 workers
-./zek.sh status                        # node containers + cluster nodes
+./zek.sh status                        # node containers (state + health) + cluster nodes
 ./zek.sh kubectl get nodes
 ./zek.sh down                          # stop everything (state is kept)
 ./zek.sh up                            # restart the same topology
@@ -240,3 +240,4 @@ reset.
 - `kube-proxy`'s automatic conntrack table tuning is disabled via its ConfigMap because the global `nf_conntrack_max` sysctl is not writable from a container netns.
 - Containerd's CNI plugin search path is set to `['/opt/cni/bin', '/usr/libexec/cni']` since CNI providers install their plugin binary into `/opt/cni/bin`.
 - `--dns` is a convenience for the node's own resolution; the entrypoint rewrites `/etc/resolv.conf` to the same upstream so coredns (which uses `dnsPolicy: Default`) does not forward to itself and loop.
+- The image carries a `HEALTHCHECK`; `docker ps` and `./zek.sh status` show its verdict per container (`healthy`/`unhealthy`/`starting`, `-` while docker is not probing it, i.e. stopped). It probes the container's own daemons — haproxy's stats page on the lb, containerd plus kubelet's healthz on nodes — and never the cluster (a node stays NotReady until a CNI is installed, so cluster state would mislabel a healthy container). Docker never restarts or stops a container for reporting unhealthy.

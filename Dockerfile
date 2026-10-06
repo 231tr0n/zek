@@ -63,4 +63,17 @@ EOF
 
 COPY entrypoint.sh /entrypoint.sh
 
+# Advisory metadata only: docker never restarts or stops a container for
+# reporting unhealthy (restart policies ignore it; only Swarm/compose
+# consumes it), so .State-driven logic and `docker ps` running/exited are
+# unaffected. It probes the local daemons, never the cluster: a node is
+# NotReady until the user installs a CNI, workers hold no kubeconfig, and
+# an API outage would label healthy containers bad. lb -> haproxy's stats
+# page; nodes -> containerd alive AND kubelet's healthz (both started by
+# entrypoint.sh, kubelet under its supervisor). The 120s start period
+# covers kubeadm init/join before kubelet answers its healthz.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -sf -m 2 http://127.0.0.1:8404/ > /dev/null || \
+    { pgrep -x containerd > /dev/null && curl -sf -m 2 http://127.0.0.1:10248/healthz > /dev/null; }
+
 ENTRYPOINT ["/entrypoint.sh"]

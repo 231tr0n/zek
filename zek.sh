@@ -24,7 +24,8 @@
 #   ./zek.sh [flags] clean <name>
 #                               evict a worker and recreate it with a fresh
 #                               netns (drops any CNI iptables/ipsets/bpf residue)
-#   ./zek.sh [flags] status     show node containers and cluster nodes
+#   ./zek.sh [flags] status     show node containers, their health, and
+#                               cluster nodes
 #   ./zek.sh [flags] kubectl <args...>
 #                               run kubectl against the cluster (may be
 #                               piped manifests)
@@ -718,11 +719,23 @@ cmd_clean() {
 cmd_status() {
 	# shellcheck disable=SC2310
 	net_exists || die "no cluster named ${CLUSTER} (create it with: $0 --cluster ${CLUSTER} up)"
-	local running=0 name state rows
-	rows=$(docker ps -a --format '{{.Names}}\t{{.State}}' -f network="${NET_NAME}") || rows=""
-	while IFS=$'\t' read -r name state; do
+	local running=0 name state status health rows
+	rows=$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' -f network="${NET_NAME}") || rows=""
+	while IFS=$'\t' read -r name state status; do
 		[[ -n ${name} ]] || continue
-		printf '%-25s %s\n' "${name}" "${state}"
+		# docker ps cannot format .State.Health (State is a plain string
+		# there), but the HEALTHCHECK verdict rides the end of .Status
+		# for a running container - and only the starting one carries a
+		# "health: " prefix (`Up 3 seconds (health: starting)` vs
+		# `Up 25 seconds (unhealthy)`). `-` marks a container docker is
+		# not probing (stopped/created) or one without a healthcheck.
+		health=-
+		if [[ ${status} =~ \((healthy|unhealthy)\)$ ]]; then
+			health=${BASH_REMATCH[1]}
+		elif [[ ${status} =~ \(health:[[:space:]]starting\)$ ]]; then
+			health=starting
+		fi
+		printf '%-25s %-8s %s\n' "${name}" "${state}" "${health}"
 		[[ ${state} == running ]] && running=$((running + 1))
 	done <<< "${rows}"
 	[[ ${running} == 0 ]] && {
