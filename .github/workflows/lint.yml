@@ -5,11 +5,20 @@
     workflow_dispatch: ,
     workflow_call: ,
   },
+  # Workflow-level default: every run: block gets bash's -eo pipefail
+  # (the Linux default without this is `sh -e` in containers and `bash -e`
+  # with no pipefail elsewhere), and the default token scope is read-only
+  # for jobs that do not ask for more.
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
   jobs: {
     lint: {
-      permissions: {
-        contents: "read",
-      },
       runs-on: "ubuntu-latest",
       # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
       # so CI and local runs agree. dockerfmt/prettier fetch latest on

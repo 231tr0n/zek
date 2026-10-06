@@ -14,10 +14,11 @@
 # Flags: every input env var can also be passed as a flag after the role
 # (the name in lower case with '_' as '-', e.g. POD_CIDR -> --pod-cidr); the
 # flag wins when both are set (value flags take --flag value or
-# --flag=value; --master-join and --no-host-modules are bare booleans).
-# `--` ends flag parsing; it and everything after it is left for the role -
-# kubectl arguments pass through (kubectl needs the `--` itself, e.g. for
-# `exec POD -- CMD`):
+# --flag=value; --master-join and --no-host-modules are bare booleans, also
+# accepted as --flag=1). Unknown arguments die on the node roles - only the
+# kubectl role forwards them. `--` ends flag parsing; it and everything
+# after it is left for the role - kubectl arguments pass through (kubectl
+# needs the `--` itself, e.g. for `exec POD -- CMD`):
 #   --cluster-dir PATH        (CLUSTER_DIR, default /etc/cluster)
 #   --node-name NAME          (NODE_NAME, default the container hostname)
 #   --pod-cidr CIDR           (POD_CIDR, default 10.244.0.0/16)
@@ -32,6 +33,8 @@
 #   --kubeconfig PATH         (KUBECONFIG; kubectl defaults to the published
 #                              admin.conf)
 #   --no-host-modules         (NO_HOST_MODULES=1: skip host module setup)
+#   WAIT_TIMEOUT (env only, no flag: zek.sh passes --timeout through) bounds
+#   the kubectl role's wait for the published config; default 600s.
 #
 # Persistence and host isolation:
 #   - Everything lives on the container's own writable layer: node state
@@ -61,7 +64,12 @@ readonly KUBEADM_FLAGS=/var/lib/kubelet/kubeadm-flags.env
 CONTAINERD_PID=""
 SUPERVISOR_PID=""
 declare -A SYSCTL_BEFORE=()
-HOST_MODULES_PRESENT=""
+# Modules the host already had before preflight_host ran (space separated):
+# cleanup only unloads the ones NOT in this list. Set at the end of
+# preflight_host, so cleanup can tell "we never set the host up" (an early
+# die) from "we loaded something" - an empty list must never trigger rmmod.
+HOST_SETUP_DONE=""
+HOST_MODULES_PREEXISTING=""
 
 log() { echo "[zek] $*" >&2; }
 die() {
@@ -82,28 +90,42 @@ run_logged() { # logfile desc cmd...
 }
 
 cleanup() {
+	# Clear the traps first: a TERM arriving mid-cleanup must not re-enter
+	# this function, and the shell keeps the status that triggered the EXIT
+	# trap (die's non-zero, or 0 from `exit 0` in the TERM handler), so a
+	# failed kubeadm run still exits non-zero.
+	trap - EXIT TERM INT
 	# Undo the host-level kernel setup: restore sysctls and unload any modules
 	# we loaded (only ones the host did not already have; with
 	# NO_HOST_MODULES=1 nothing was loaded, so the unload is skipped too -
 	# otherwise an idle host module could be pulled out from under the host).
 	# Unloading may fail while other processes still use them, which is fine.
 	log "shutting down"
+	local key module
 	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2> /dev/null || true
 	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2> /dev/null || true
 	for key in "${!SYSCTL_BEFORE[@]}"; do
 		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" > /dev/null 2>&1 || true
 	done
-	if [[ ${NO_HOST_MODULES:-0} != 1 ]]; then
+	# Only touch host modules when preflight_host actually ran: die() can
+	# fire before that (flag parsing, kubeadm failures on a first start),
+	# and an empty "loaded by us" list would otherwise rmmod modules the
+	# host itself was using.
+	if [[ ${HOST_SETUP_DONE:-0} == 1 ]]; then
 		for module in br_netfilter vxlan; do
-			case " ${HOST_MODULES_PRESENT} " in
+			case " ${HOST_MODULES_PREEXISTING} " in
 				*" ${module} "*) ;;
 				*) rmmod "${module}" 2> /dev/null || true ;;
 			esac
 		done
 	fi
-	exit 0
 }
-trap cleanup TERM INT
+# Run cleanup exactly once on every exit path: docker stop sends TERM
+# (converted to exit 0 so the stop is not reported as a failure), and
+# die()/kubeadm failures reach it through the EXIT trap with their status
+# intact.
+trap 'exit 0' TERM INT
+trap cleanup EXIT
 
 preflight_host() {
 	# In-memory kernel setup only: it does not survive a reboot and touches no
@@ -112,7 +134,7 @@ preflight_host() {
 	[[ ${NO_HOST_MODULES:-0} == 1 ]] && return 0
 	for module in br_netfilter vxlan; do
 		if [[ -d "/sys/module/${module}" ]]; then
-			HOST_MODULES_PRESENT="${HOST_MODULES_PRESENT} ${module}"
+			HOST_MODULES_PREEXISTING="${HOST_MODULES_PREEXISTING} ${module}"
 		else
 			modprobe "${module}" 2> /dev/null || true
 		fi
@@ -132,6 +154,10 @@ preflight_host() {
 		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2> /dev/null || echo 0)"
 		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 > /dev/null; } 2> /dev/null || true
 	fi
+	# Marked only on the fall-through path: with NO_HOST_MODULES=1 the
+	# early return above leaves it unset, and cleanup then keeps its hands
+	# off the host's modules.
+	HOST_SETUP_DONE=1
 }
 
 ensure_resolv_conf() {
@@ -189,6 +215,8 @@ start_containerd() {
 	fi
 	containerd > /var/log/containerd.log 2>&1 &
 	CONTAINERD_PID=$!
+	# 60s is plenty for containerd to create its socket; a longer budget
+	# would only hide a broken install, and the log has the reason.
 	for _ in $(seq 1 60); do
 		[[ -S /run/containerd/containerd.sock ]] && return 0
 		sleep 1
@@ -223,9 +251,11 @@ import_k8s_images() {
 	done
 }
 
-# First global IPv4: the node's own address on the cluster network.
-master_ip() {
-	ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1
+# First global IPv4: the node's own address on the cluster network. awk
+# reads the whole input (no early exit) so `ip` never dies of SIGPIPE -
+# under pipefail that would kill the caller with no message.
+node_ip() {
+	ip -4 -o addr show scope global | awk 'NR == 1 { sub(/\/.*/, "", $4); print $4 }'
 }
 
 # sha256 of the CA public key - the exact format kubeadm expects for the
@@ -242,7 +272,7 @@ patch_kube_proxy() {
 	log "disabling kube-proxy conntrack tuning"
 	local dir=/etc/zek/kube-proxy
 	mkdir -p "${dir}"
-	export KUBECONFIG=/etc/kubernetes/admin.conf
+	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
 	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' > "${dir}/config.conf"
 	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' > "${dir}/kubeconfig.conf"
 	[[ -s "${dir}/config.conf" ]] || return 0
@@ -276,6 +306,8 @@ kubelet_supervisor() {
 			ensure_kubelet_config
 			local -a args=()
 			if [[ -f ${KUBEADM_FLAGS} ]]; then
+				# kubeadm generates this file at runtime, so shellcheck
+				# cannot read it here.
 				# shellcheck source=/dev/null
 				source "${KUBEADM_FLAGS}"
 				# Drop any deprecated CLI copy kubeadm may still ship
@@ -302,11 +334,11 @@ kubelet_supervisor() {
 			# multi-line `...=<` block with a tab-indented body and a
 			# lone `>` closer that carry no I-prefix - awk drops those
 			# with the header. fflush() keeps the sparse output
-			# realtime through the pipe; wait returns the awk pid, so if
-			# awk ever died while kubelet was still alive, the pkill
+			# in real time through the pipe; wait returns the awk pid, so
+			# if awk ever died while kubelet was still alive, the pkill
 			# keeps the start below from ever running two kubelets.
 			# Kill by command line, not comm: gcompat runs the glibc
-			# kubelet through musl's loader, so comm is ld-musl-x86_64.
+			# kubelet through musl's loader, so comm is ld-musl-x86_64,
 			# and a comm match never finds it.
 			pkill -f "/usr/local/bin/kubelet" > /dev/null 2>&1 || true
 			# cgroupfs matches containerd's default (SystemdCgroup=false);
@@ -338,7 +370,11 @@ kubelet_supervisor() {
 ensure_cni_dirs() {
 	# Nodes start with no CNI; the user installs one whose installer runs as a
 	# non-root pod user (e.g. calico uses uid 10001) and drops binaries/config
-	# onto the node. Pre-create those paths world-writable so it works.
+	# onto the node. Pre-create both paths world-writable so it works:
+	# /usr/libexec/cni is where Alpine's packages put plugins, /opt/cni/bin
+	# is where the CNI providers' installers drop theirs (containerd's
+	# bin_dirs above searches both).
+	local dir
 	for dir in /etc/cni/net.d /opt/cni/bin; do mkdir -p "${dir}" && chmod 0777 "${dir}"; done
 }
 
@@ -382,7 +418,7 @@ node_setup() {
 # they are retried briefly.
 publish_cluster_credentials() {
 	local token="" cert_key="" ca_hash uploaded i
-	API_ENDPOINT="${API_ENDPOINT:-$(master_ip):6443}"
+	API_ENDPOINT="${API_ENDPOINT:-$(node_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
 	# Explicit check: the resume path calls this from the right of || where
@@ -421,7 +457,7 @@ publish_cluster_credentials() {
 # passes it as API_ENDPOINT, the :- default covers runs without it.
 init_control_plane() {
 	local api_ip
-	api_ip="$(master_ip)"
+	api_ip="$(node_ip)"
 	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
 	log "initializing control plane on ${NODE_NAME} (${api_ip})"
 	mkdir -p "${CLUSTER_DIR}"
@@ -483,25 +519,26 @@ run_master() {
 	# be resumed by kubeadm, so wipe it and start over. Two interruption
 	# points need handling:
 	# - certs written but no kubelet.conf yet (interrupted very early);
-	# - kubelet.conf present but the init never finished. kubelet.conf is
-	#   written in the kubeconfig phase, long before wait-control-plane,
+	# - kubelet.conf present but the kubeadm run never finished. kubelet.conf
+	#   is written in the kubeconfig phase, long before wait-control-plane,
 	#   the bootstrap-token RBAC that lets nodes fetch cluster-info, and
 	#   the addons - so an init that dies in wait-control-plane (hard 4m
 	#   budget; parallel clusters can exceed it) would otherwise resume
 	#   as a half-initialized cluster whose joins all 403 on
-	#   cluster-info. Without completion evidence (the init-complete
-	#   marker, or published credentials which only exist after a
-	#   completed init) wipe and start over. Control-plane joins are
-	#   exempt: their nodes never publish credentials and never get the
-	#   marker checked here (they touch it themselves after joining).
+	#   cluster-info. The same holds for an interrupted control-plane
+	#   join: its kubelet.conf also appears before the etcd member add
+	#   and static-pod write finish. Without completion evidence (the
+	#   init-complete marker, which both init and join write last, or
+	#   published credentials, which only exist after a completed init)
+	#   wipe and start over - the interrupted run is then redone below.
 	if [[ ! -f /etc/kubernetes/kubelet.conf ]] && [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 		log "interrupted control-plane setup detected; resetting partial state"
 		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
-	elif [[ -f /etc/kubernetes/kubelet.conf ]] && [[ ${MASTER_JOIN:-0} != 1 ]] \
+	elif [[ -f /etc/kubernetes/kubelet.conf ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/init-complete" ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/admin.conf" ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/token" ]]; then
-		log "interrupted control-plane init detected; resetting partial state"
+		log "interrupted control-plane init/join detected; resetting partial state"
 		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
 	fi
 
@@ -512,10 +549,15 @@ run_master() {
 		log "control plane already set up, resuming"
 		# Complete a publish that was interrupted by a crash/restart -
 		# admin.conf is written last and marks the set as complete.
-		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || {
+		# Only the first master publishes: a joining master never has
+		# admin.conf on its own layer, and republishing would rotate the
+		# bootstrap token and certificate key the stored credentials
+		# still point at (kubeadm's upload-certs secret), breaking the
+		# next control-plane join.
+		if [[ ${MASTER_JOIN:-0} != 1 && ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
 			log "published credentials incomplete; republishing"
 			publish_cluster_credentials
-		}
+		fi
 	elif [[ ${MASTER_JOIN:-0} == 1 ]]; then
 		join_control_plane
 	else
@@ -615,7 +657,11 @@ run_kubectl() {
 	if [[ -z ${KUBECONFIG:-} ]]; then
 		if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
 			log "waiting for cluster config on master (${CLUSTER_DIR})"
-			for _ in $(seq 1 300); do
+			# Bounded by WAIT_TIMEOUT (zek.sh passes --timeout through,
+			# default 600s) so a dead master fails this call instead of
+			# hanging every `zek kubectl` poll for ten minutes.
+			local deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
+			while [[ ${SECONDS} -lt ${deadline} ]]; do
 				[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
 				sleep 2
 			done
@@ -631,9 +677,9 @@ run_kubectl() {
 # Consume the configuration flags for the current role; every input env var
 # has a flag twin of the same name (see the header). What is left -
 # everything unrecognized, plus `--` and everything after it - stays in
-# ROLE_ARGS: kubectl arguments (and the `--` delimiter itself, which kubectl
-# needs for exec/attach) pass through, the node roles ignore them as they
-# always did.
+# ROLE_ARGS: for the kubectl role that is how kubectl arguments (and the
+# `--` delimiter itself, which kubectl needs for exec/attach) pass through;
+# the node roles die on stray arguments instead of ignoring them.
 parse_role_flags() {
 	ROLE_ARGS=()
 	while [[ $# -gt 0 ]]; do
@@ -674,10 +720,11 @@ parse_role_flags() {
 				shift 2
 				;;
 			--api-endpoint=*) API_ENDPOINT="${1#*=}" && shift ;;
-			--master-join)
+			--master-join | --master-join=1)
 				MASTER_JOIN=1
 				shift
 				;;
+			--master-join=*) die "--master-join is a boolean; use --master-join (or --master-join=1)" ;;
 			--join-token)
 				[[ $# -ge 2 ]] || die "--join-token needs a value"
 				JOIN_TOKEN="$2"
@@ -714,11 +761,18 @@ parse_role_flags() {
 				shift 2
 				;;
 			--kubeconfig=*) KUBECONFIG="${1#*=}" && shift ;;
-			--no-host-modules)
+			--no-host-modules | --no-host-modules=1)
 				NO_HOST_MODULES=1
 				shift
 				;;
+			--no-host-modules=*) die "--no-host-modules is a boolean; use --no-host-modules (or --no-host-modules=1)" ;;
 			*)
+				# Only the kubectl role forwards arguments. A stray
+				# argument on a node role would otherwise vanish
+				# silently - e.g. `master --master-join=1` used to
+				# quietly run kubeadm init instead of a join.
+				[[ ${ROLE} == kubectl ]] \
+					|| die "unknown argument '${1}' for role ${ROLE} (only the kubectl role takes passthrough arguments)"
 				ROLE_ARGS+=("$1")
 				shift
 				;;

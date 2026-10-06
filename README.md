@@ -99,8 +99,10 @@ ZEK_TIMEOUT=120 ./zek.sh up # same, via environment
 The `--cluster` flag (or `ZEK_CLUSTER`, default `zek`) selects the cluster for
 every command. All containers and the Docker network carry the cluster name as
 prefix (`prod-master-1`, `prod-worker-1`, `prod-lb`, `prod-net`). Each cluster
-gets its own subnet — the first free `172.20.X.0/24`, so parallel clusters
-never overlap (override with `--subnet` or `ZEK_SUBNET`).
+gets its own subnet — the first free `172.20.X.0/24`, scanned from the live
+docker networks so concurrent clusters running with defaults don't collide. A
+race or an explicit `--subnet`/`ZEK_SUBNET` that is already in use fails the
+network create loudly instead of overlapping.
 
 ### Flags and environment
 
@@ -108,18 +110,18 @@ Every setting exists twice: as a flag and as an environment variable. The
 flag wins when both are set. Global flags go before the command
 (`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
 
-| Variable        | Flag          | Effect                                                    |
-| --------------- | ------------- | --------------------------------------------------------- |
-| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                              |
-| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                    |
-| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                         |
-| `ZEK_NODES`     | `--workers`   | Workers for the first `up` (default `1`)                  |
-| `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                  |
-| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24` |
-| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                  |
-| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                      |
-| `POD_CIDR`      | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`)    |
-| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers            |
+| Variable        | Flag          | Effect                                                                             |
+| --------------- | ------------- | ---------------------------------------------------------------------------------- |
+| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                                       |
+| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                             |
+| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                                                  |
+| `ZEK_NODES`     | `--workers`   | Workers for the first `up` (default `1`)                                           |
+| `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                                           |
+| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                          |
+| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                                           |
+| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                                               |
+| `ZEK_POD_CIDR`  | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`, `POD_CIDR` as legacy alias) |
+| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers                                     |
 
 ```sh
 ./zek.sh --mounts "/srv/data:/mnt/data" up   # host dir inside every node container
@@ -134,11 +136,12 @@ reconfigured.
 
 ## High availability (`--masters 3`)
 
-With more than one master, zek starts an extra container `zek-lb` running
-haproxy at `<subnet>.10`:
+With more than one master, zek starts an extra container `<cluster>-lb`
+(haproxy) at `<subnet>.10`:
 
 - haproxy listens on `6443`, round-robins to every master's apiserver and
-  health-checks them (`;csv` stats page at `http://<lb-ip>:8404/`).
+  health-checks them (stats page at `http://<lb-ip>:8404/`, CSV at
+  `http://<lb-ip>:8404/;csv`).
 - kubeadm's `controlPlaneEndpoint` is that address, so every kubeconfig
   (all kubelets, kubectl, scheduler, controller-manager) talks to the
   endpoint — kubeadm also puts it into the apiserver certificate SANs.
@@ -171,7 +174,7 @@ After `kubectl get nodes` shows the control plane, install your CNI of
 choice. Nodes transition to `Ready` once the CNI daemonsets run.
 
 ```sh
-# flannel (vxlan backend; matches the default POD_CIDR=10.244.0.0/16)
+# flannel (vxlan backend; matches the default ZEK_POD_CIDR=10.244.0.0/16)
 ./zek.sh kubectl apply -f - < <(curl -sL https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml)
 
 # cilium (tested with v1.20.2)

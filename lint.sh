@@ -36,12 +36,13 @@
 #   format md:          prettier --check --end-of-line lf
 #   format yaml:        yamlfmt (kyaml profile, compared byte for byte)
 #
-# Checks run in parallel; every tool reads its payload over stdin (no
-# intermediate files - only the ordered per-check report buffers).
+# Checks run in parallel; every check reads its payload directly (file
+# paths on the command line, or the heredoc bodies piped over stdin) and
+# only writes the ordered per-check report buffers to disk (mktemp).
 #
 # Fix locally with:  shfmt -w -s -i 0 -bn -ci -sr <files>  |
 #                    prettier --write <files>  |
-#                    dockerfmt -w Dockerfile  |  yamlfmt -w <files>  |
+#                    dockerfmt -s -n -w Dockerfile  |  yamlfmt -w -o=kyaml <files>  |
 #                    dnf install haproxy  |
 #                    go install sigs.k8s.io/yaml/yamlfmt@latest  |
 #                    go install github.com/rhysd/actionlint/cmd/actionlint@latest
@@ -57,6 +58,13 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# No arguments: every file comes from git, so a stray argument (a typo'd
+# glob, a forgotten remove) must not be silently ignored.
+if [[ $# -ne 0 ]]; then
+	printf '[lint] usage: %s (takes no arguments)\n' "${0}" >&2
+	exit 1
+fi
 
 status=0
 
@@ -164,9 +172,11 @@ AWK
 # per closed heredoc. DELIM selects the markers: a delimiter name, or "all"
 # for every heredoc. Mirrors the shell: comment lines are never openers
 # (bash ignores them), a here-string (<<<) can never match, and the
-# terminator line must equal the delimiter exactly. Callers must check the
-# status: an unterminated heredoc exits 1 and must not degrade into an
-# empty marker stream that the checks below would pass vacuously.
+# terminator line must equal the delimiter exactly - `<<-` (tab-indented
+# terminators) is not supported and fails loudly as an unterminated
+# heredoc. Callers must check the status: an unterminated heredoc exits 1
+# and must not degrade into an empty marker stream that the checks below
+# would pass vacuously.
 list_heredocs() {
 	local delim=$1 src
 	shift
@@ -238,7 +248,10 @@ lint_heredocs_yaml() {
 # Every heredoc must have a delimiter the checks above (or the checks below)
 # understand, so a new heredoc cannot silently escape linting: EOF is the
 # kyaml manifest check, HAPROXY the LB config checks, AWK the awk parse
-# check in this file.
+# check in this file. Only *.sh files are scanned here: heredocs in
+# workflow run: blocks are covered by actionlint's embedded shell
+# checks instead, and a Dockerfile RUN heredoc is linted as shell by
+# lint_dockerfile_heredocs (its EOF body is covered here as well).
 lint_heredoc_coverage() {
 	local src start quoted name markers rc=0
 	if ! markers=$(list_heredocs all "$@"); then
@@ -262,7 +275,7 @@ lint_heredoc_coverage() {
 # in this file is what every check above reads heredoc bodies with, so a
 # typo in it would otherwise corrupt the marker stream itself.
 lint_heredoc_awk() {
-	local src start quoted _name body markers rc=0
+	local src start quoted _name body err markers rc=0
 	if ! markers=$(list_heredocs AWK "$@"); then
 		return 1
 	fi
@@ -273,8 +286,9 @@ lint_heredoc_awk() {
 			rc=1
 			continue
 		fi
-		if ! awk -f <(printf '%s\n' "${body}") < /dev/null 2> /dev/null; then
-			printf '%s:%s: heredoc body does not parse as an awk program\n' "${src}" "${start}" >&2
+		if ! err=$(awk -f <(printf '%s\n' "${body}") < /dev/null 2>&1 > /dev/null); then
+			printf '%s:%s: heredoc body does not parse as an awk program:\n%s\n' \
+				"${src}" "${start}" "${err}" >&2
 			rc=1
 		fi
 	done <<< "${markers}"
@@ -333,9 +347,10 @@ lint_haproxy_c() { # src... - syntax-check the assembled config
 
 lint_haproxy_style() { # src... - whitespace rules for the assembled config
 	local cfg
-	cfg=$(assemble_haproxy "$@")
-	if [[ -z ${cfg} ]]; then
-		printf 'haproxy style: assembled LB config is empty\n' >&2
+	# Honor assemble_haproxy's status: its error is already on stderr,
+	# and style-checking a partially assembled config would hide the
+	# failure (errexit is off under run_check's `if`).
+	if ! cfg=$(assemble_haproxy "$@"); then
 		return 1
 	fi
 	if ! printf '%s\n' "${cfg}" | awk '
@@ -350,19 +365,29 @@ lint_haproxy_style() { # src... - whitespace rules for the assembled config
 
 # Every Dockerfile RUN heredoc body is a shell script that docker executes,
 # so it gets the same treatment as a .sh file: shellcheck (sh dialect, the
-# Dockerfile RUN default shell) and shfmt. The heredoc must sit on a RUN
-# line - that is the only Dockerfile form that executes a heredoc as shell.
+# Dockerfile RUN default shell) and shfmt. The heredoc must sit at the end
+# of a leading RUN instruction - that is the only Dockerfile form that
+# executes a heredoc as shell - and must be EOF-terminated like every other
+# linted heredoc (the coverage check above allows no other name).
 lint_dockerfile_heredocs() { # src...
 	local src start quoted name body markers opener rc=0
+	# In a variable: the << in a literal =~ RHS parses as a redirect.
+	local run_re='^[[:space:]]*RUN[[:space:]]+<<'
 	if ! markers=$(list_heredocs all "$@"); then
 		return 1
 	fi
 	while IFS=: read -r src start quoted name; do
 		[[ -n ${src} ]] || continue
 		opener=$(sed -n "${start}p" "${src}")
-		if [[ ${opener} != *"RUN <<"* ]]; then
+		if [[ ! ${opener} =~ ${run_re} ]]; then
 			printf '%s:%s: heredoc is not executed by a RUN step (only RUN heredocs are linted as shell)\n' \
 				"${src}" "${start}" >&2
+			rc=1
+			continue
+		fi
+		if [[ ${name} != EOF ]]; then
+			printf '%s:%s: RUN heredoc delimiter %s is not EOF (the only name linted here)\n' \
+				"${src}" "${start}" "${name}" >&2
 			rc=1
 			continue
 		fi

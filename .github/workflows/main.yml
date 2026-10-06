@@ -12,18 +12,24 @@
     group: "${{ github.workflow }}-${{ github.ref }}",
     cancel-in-progress: true,
   },
+  # Workflow-level default: every run: block gets bash's -eo pipefail,
+  # and the default token scope is read-only; the push job below asks
+  # for the packages write it needs on top (job-level permissions
+  # replace this default entirely).
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
   jobs: {
     lint: {
-      permissions: {
-        contents: "read",
-      },
       uses: "./.github/workflows/lint.yml",
     },
     build_and_test: {
       needs: "lint",
-      permissions: {
-        contents: "read",
-      },
       uses: "./.github/workflows/build-and-test.yml",
     },
     push: {

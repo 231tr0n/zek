@@ -15,11 +15,10 @@ TAG       := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-$(BUILD_ID)
 # scripts can pin the combo without tracking the git-based BUILD_ID.
 COMBO_TAG := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-latest
 
-# Shared build+tag recipe; $(1) is extra docker build flags (build-nocache
-# passes --no-cache to force the image preload step to re-run).
-
 .PHONY: build build-nocache lint help
 
+# Shared build+tag recipe; $(1) is extra docker build flags (build-nocache
+# passes --no-cache to force the image preload step to re-run).
 define build_image
 	$(DOCKER) build $(1) -t $(IMAGE):$(TAG) \
 	--build-arg ALPINE_VERSION=$(ALPINE_VERSION) \

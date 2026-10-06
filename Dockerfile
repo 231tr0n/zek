@@ -4,6 +4,10 @@ FROM alpine:${ALPINE_VERSION}
 ARG KUBERNETES_VERSION
 ARG TARGETARCH
 
+# gcompat: the kubeadm/kubelet/kubectl binaries from dl.k8s.io are
+# glibc-linked; on alpine's musl they run through gcompat's loader (a
+# comm read of kubelet therefore shows ld-musl-x86_64, see
+# kubelet_running in e2e.sh).
 RUN apk add --no-cache \
     bash ca-certificates containerd containerd-ctr runc cni-plugins iptables ip6tables nftables cri-tools \
     haproxy \
@@ -20,8 +24,10 @@ RUN apk add --no-cache \
 RUN mkdir -p /opt/cni && ln -sfn /usr/libexec/cni /opt/cni/bin
 
 RUN <<'EOF'
-# Both come from the build (Makefile passes them); fail with a clear
-# message instead of set -u's bare error when one is missing.
+# KUBERNETES_VERSION comes from the Makefile's --build-arg; TARGETARCH
+# is BuildKit's automatic platform argument (the ARG TARGETARCH above
+# needs no --build-arg). Fail with a clear message instead of set -u's
+# bare error when one is missing.
 KUBERNETES_VERSION=${KUBERNETES_VERSION:?KUBERNETES_VERSION is required}
 TARGETARCH=${TARGETARCH:?TARGETARCH is required}
 set -eux

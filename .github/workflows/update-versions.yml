@@ -10,22 +10,28 @@
   concurrency: {
     group: "update-versions",
   },
+  # Workflow-level default: every run: block gets bash's -eo pipefail,
+  # and the default token scope is read-only; the create-pr job below
+  # asks for the write scopes it needs on top (job-level permissions
+  # replace this default entirely).
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
   jobs: {
     lint: {
       # Same linter as CI, run before spending any e2e compute on a change
       # that would not pass lint anyway (e2e needs this job below).
-      permissions: {
-        contents: "read",
-      },
       uses: "./.github/workflows/lint.yml",
     },
     prepare: {
       # Resolve the new pins once, apply them, and share the updated
       # Makefile with everything downstream: the e2e jobs test exactly
       # these pins and the PR publishes exactly what was tested.
-      permissions: {
-        contents: "read",
-      },
       runs-on: "ubuntu-latest",
       timeout-minutes: 15,
       outputs: {
@@ -55,6 +61,8 @@
            echo \"$k8s\" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected kubernetes version: $k8s\"; exit 1; }\n\
            alpine_prev=$(sed -nE 's/^ALPINE_VERSION[[:space:]]*\\?=[[:space:]]*//p' Makefile)\n\
            k8s_prev=$(sed -nE 's/^KUBERNETES_VERSION[[:space:]]*\\?=[[:space:]]*//p' Makefile)\n\
+          \  echo \"$alpine_prev\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected alpine_prev: $alpine_prev\"; exit 1; }\n\
+          \  echo \"$k8s_prev\" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected k8s_prev: $k8s_prev\"; exit 1; }\n\
            {\n\
           \  echo \"alpine=$alpine\"\n\
           \  echo \"k8s=$k8s\"\n\
@@ -90,9 +98,6 @@
         "lint",
         "prepare",
       ],
-      permissions: {
-        contents: "read",
-      },
       uses: "./.github/workflows/build-and-test.yml",
       with: {
         makefile-artifact: "updated-makefile",
@@ -120,7 +125,14 @@
       }, {
         name: "Count git status",
         id: "git-status",
-        run: "echo \"files=$(git status --porcelain | wc -l)\" >>\"$GITHUB_OUTPUT\"",
+        # set -euo pipefail: without it a failing `git status` (index
+        # locked, shallow clone gone wrong) would be masked by wc -l's
+        # success, report 0 files and silently skip the PR.
+        run: "\
+           set -euo pipefail\n\
+           files=$(git status --porcelain | wc -l)\n\
+           echo \"files=${files}\" >>\"$GITHUB_OUTPUT\"\n\
+          ",
       }, {
         name: "Create pull request",
         if: "steps.git-status.outputs.files != '0'",
@@ -140,11 +152,20 @@
            git switch -C \"${branch}\"\n\
            git add Makefile\n\
            git commit -m \"chore: update alpine/k8s versions\"\n\
-           git push --force -u origin \"${branch}\"\n\
-           if [[ -n $(gh pr list --base main --head \"${branch}\" --state open \\\n\
-          \  --json number --jq '.[0].number // empty') ]]; then\n\
-          \  echo \"open pull request already exists for ${branch}\"\n\
-          \  exit 0\n\
+           # --force-with-lease: refuse to clobber a branch tip that\n\
+           # moved since this run fetched it (plain --force would not).\n\
+           git push --force-with-lease -u origin \"${branch}\"\n\
+           # Capture the query: an gh failure inside [[ -n $(...) ]]\n\
+           # would be swallowed as an empty answer and create a\n\
+           # duplicate PR on top of an existing one.\n\
+           if ! pr=$(gh pr list --base main --head \"${branch}\" --state open \\\n\
+           --json number --jq '.[0].number // empty'); then\n\
+           echo \"could not query open PRs for ${branch}\" >&2\n\
+           exit 1\n\
+           fi\n\
+           if [[ -n ${pr} ]]; then\n\
+           echo \"open pull request already exists for ${branch}\"\n\
+           exit 0\n\
            fi\n\
            # Quoted heredoc: the body is literal text (backticks and all);\n\
            # the pin placeholders are substituted by the runner before this\n\

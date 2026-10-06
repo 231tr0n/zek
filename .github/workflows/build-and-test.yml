@@ -12,11 +12,19 @@
       },
     },
   },
+  # Workflow-level default: every run: block gets bash's -eo pipefail,
+  # and the default token scope is read-only (this workflow only checks
+  # out, builds and tests).
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
   jobs: {
     build_and_test: {
-      permissions: {
-        contents: "read",
-      },
       runs-on: "ubuntu-latest",
       timeout-minutes: 90,
       strategy: {
