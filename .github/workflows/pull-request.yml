@@ -12,9 +12,9 @@
     group: "${{ github.workflow }}-${{ github.event.pull_request.number }}",
     cancel-in-progress: true,
   },
-  # Workflow-level default: every run: block gets bash's -eo pipefail,
-  # and the default token scope is read-only (both jobs only check out,
-  # lint and test).
+  # Workflow-level defaults: pin bash for every run: block (on ubuntu
+  # GitHub already runs `bash -eo pipefail`) and keep the default token
+  # scope read-only (both jobs only check out, lint and test).
   permissions: {
     contents: "read",
   },

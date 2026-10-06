@@ -50,11 +50,11 @@
 # The check functions only ever run through run_check's dynamic dispatch
 # (their names are passed as arguments), so SC2329 - the unused-function
 # check - is disabled for this file. SC2310 - "function invoked in a
-# condition" - is disabled too: run_check calls the checks under `if`,
-# which turns errexit off inside, so the heredoc checks status-check their
-# marker lists explicitly (a plain assignment would swallow an unterminated
-# heredoc into an empty list and pass vacuously).
-# shellcheck disable=SC2329,SC2310
+# condition" - is disabled per site instead: run_check calls the checks
+# under `if`, which turns errexit off inside, so the heredoc checks
+# status-check their marker lists explicitly (a plain assignment would
+# swallow an unterminated heredoc into an empty list and pass vacuously).
+# shellcheck disable=SC2329
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -171,12 +171,15 @@ AWK
 # list_heredocs DELIM SRC... - emit one "src:line:quoted:delimiter" marker
 # per closed heredoc. DELIM selects the markers: a delimiter name, or "all"
 # for every heredoc. Mirrors the shell: comment lines are never openers
-# (bash ignores them), a here-string (<<<) can never match, and the
-# terminator line must equal the delimiter exactly - `<<-` (tab-indented
-# terminators) is not supported and fails loudly as an unterminated
-# heredoc. Callers must check the status: an unterminated heredoc exits 1
-# and must not degrade into an empty marker stream that the checks below
-# would pass vacuously.
+# (bash ignores them), a trailing "# ..." comment after code is stripped
+# before matching (so `echo hi # << EOF` is not an opener), a here-string
+# (<<<) can never match, and the terminator line must equal the delimiter
+# exactly - `<<-` (tab-indented terminators) is not supported and fails
+# loudly as an unterminated heredoc, as do `<< -EOF` (spaced dash) and two
+# openers on one line. A backslash before the delimiter (`<<\EOF`,
+# `<< \EOF`) quotes it like a quoted opener and is accepted. Callers must
+# check the status: an unterminated heredoc exits 1 and must not degrade
+# into an empty marker stream that the checks below would pass vacuously.
 list_heredocs() {
 	local delim=$1 src
 	shift
@@ -184,12 +187,30 @@ list_heredocs() {
 		awk -v delim="${delim}" -v src="${src}" '
 			/^[ \t]*#/ && !inbody { next }
 			!inbody {
-				if (match($0, /<<-?[ \t]*[\047"]?[A-Za-z_][A-Za-z0-9_]*/)) {
-					m = substr($0, RSTART, RLENGTH)
+				line = $0
+				if (match(line, /[ \t]#/)) {
+					pre = substr(line, 1, RSTART)
+					if (pre ~ /<</) {
+						line = pre
+					} else {
+						next
+					}
+				}
+				if (line ~ /<<[ \t]+-/) {
+					printf "spaced-dash heredoc not supported: %s:%d\n", src, FNR > "/dev/stderr"
+					exit 1
+				}
+				if (match(line, /<<-?[ \t]*\\?[\047"]?[A-Za-z_][A-Za-z0-9_]*/)) {
+					m = substr(line, RSTART, RLENGTH)
+					rest = substr(line, RSTART + RLENGTH)
+					if (rest ~ /<</) {
+						printf "multiple heredocs on one line not supported: %s:%d\n", src, FNR > "/dev/stderr"
+						exit 1
+					}
 					name = m
-					sub(/^<<-?[ \t]*[\047"]?/, "", name)
+					sub(/^<<-?[ \t]*\\?[\047"]?/, "", name)
 					sub(/[\047"]+$/, "", name)
-					q = (m ~ /[\047"]/)
+					q = (m ~ /[\047"]/ || m ~ /\\/)
 					curdelim = name
 					istarget = (delim == "all" || name == delim)
 					inbody = 1
@@ -218,6 +239,7 @@ list_heredocs() {
 # -o=kyaml to reproduce it byte for byte (a parse error or any diff fails).
 lint_heredocs_yaml() {
 	local src start quoted _name body canon markers rc=0
+	# shellcheck disable=SC2310
 	if ! markers=$(list_heredocs EOF "$@"); then
 		return 1
 	fi
@@ -228,7 +250,11 @@ lint_heredocs_yaml() {
 			rc=1
 			continue
 		fi
-		[[ -n ${body} ]] || continue
+		if [[ -z ${body} ]]; then
+			printf '%s:%s: empty EOF heredoc (no YAML body to lint)\n' "${src}" "${start}" >&2
+			rc=1
+			continue
+		fi
 		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1); then
 			printf '%s:%s: not parseable as YAML for formatting:\n%s\n' \
 				"${src}" "${start}" "${canon}" >&2
@@ -254,6 +280,7 @@ lint_heredocs_yaml() {
 # lint_dockerfile_heredocs (its EOF body is covered here as well).
 lint_heredoc_coverage() {
 	local src start quoted name markers rc=0
+	# shellcheck disable=SC2310
 	if ! markers=$(list_heredocs all "$@"); then
 		return 1
 	fi
@@ -276,6 +303,7 @@ lint_heredoc_coverage() {
 # typo in it would otherwise corrupt the marker stream itself.
 lint_heredoc_awk() {
 	local src start quoted _name body err markers rc=0
+	# shellcheck disable=SC2310
 	if ! markers=$(list_heredocs AWK "$@"); then
 		return 1
 	fi
@@ -295,23 +323,42 @@ lint_heredoc_awk() {
 	return "${rc}"
 }
 
-# Every '# shellcheck disable=' directive must be required: strip the line
-# and let shellcheck decide. shellcheck reads the file over stdin (the
-# shebang in the stream picks the dialect), so nothing hits the disk; an
-# expected problem is silenced, a passing run is the violation.
+# Every '# shellcheck disable=' directive must be required for one of the
+# codes it lists: strip the line and require shellcheck to report at least
+# one of those codes (a file-level pass, or a failure in an unrelated code
+# only, means the directive is unnecessary). shellcheck reads the file over
+# stdin (the shebang in the stream picks the dialect), so nothing hits the
+# disk. Only disable= directives are checked here; source= directives
+# (e.g. for runtime-generated files) are out of scope.
 lint_shellcheck_directives() {
-	local f l rc=0
-	for f in "$@"; do
-		while IFS=: read -r l _; do
-			[[ -n ${l} ]] || continue
-			if sed "${l}d" "${f}" | shellcheck -o all -x - > /dev/null 2>&1; then
-				printf '%s:%s: unnecessary shellcheck disable (shellcheck passes without it)\n' \
-					"${f}" "${l}" >&2
+	local file lineno rc=0
+	for file in "$@"; do
+		while IFS=: read -r lineno _; do
+			[[ -n ${lineno} ]] || continue
+			# shellcheck disable=SC2310
+			if ! required_shellcheck_codes "${file}" "${lineno}"; then
+				printf '%s:%s: unnecessary shellcheck disable (none of its codes fire without it)\n' \
+					"${file}" "${lineno}" >&2
 				rc=1
 			fi
-		done < <(grep -nE '^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]+disable=' "${f}" || true)
+		done < <(grep -nE '^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]+disable=' "${file}" || true)
 	done
 	return "${rc}"
+}
+
+# required_shellcheck_codes FILE LINENO - true when removing the disable
+# directive on LINENO makes shellcheck report one of its listed codes.
+required_shellcheck_codes() {
+	local file=$1 lineno=$2 line codes pattern output
+	line=$(sed -n "${lineno}p" "${file}")
+	codes=$(printf '%s\n' "${line}" | sed -nE 's/.*disable=([A-Za-z0-9, ]+).*/\1/p' | tr -d ' ')
+	[[ -n ${codes} ]] || return 0
+	pattern=$(printf '%s\n' "${codes}" | sed 's/,/|/g')
+	if ! output=$(sed "${lineno}d" "${file}" | shellcheck -o all -x -f gcc - 2>&1); then
+		printf '%s\n' "${output}" | grep -qE "\[(${pattern})\]"
+	else
+		return 1
+	fi
 }
 
 # assemble_haproxy SRC... - print the complete LB config: the HAPROXY
@@ -319,6 +366,7 @@ lint_shellcheck_directives() {
 # them (run_lb prints a real one per control-plane IP at runtime).
 assemble_haproxy() {
 	local src start quoted _name body markers first=1
+	# shellcheck disable=SC2310
 	if ! markers=$(list_heredocs HAPROXY "$@"); then
 		return 1
 	fi
@@ -342,7 +390,16 @@ assemble_haproxy() {
 }
 
 lint_haproxy_c() { # src... - syntax-check the assembled config
-	assemble_haproxy "$@" | haproxy -c -f /dev/stdin
+	local cfg
+	# Same guard as lint_haproxy_style: assemble_haproxy's error is
+	# already on stderr, and piping a partial config into haproxy would
+	# hide it behind haproxy's own confusing empty-input failure
+	# (errexit is off under run_check's `if`).
+	# shellcheck disable=SC2310
+	if ! cfg=$(assemble_haproxy "$@"); then
+		return 1
+	fi
+	printf '%s\n' "${cfg}" | haproxy -c -f /dev/stdin
 }
 
 lint_haproxy_style() { # src... - whitespace rules for the assembled config
@@ -350,6 +407,7 @@ lint_haproxy_style() { # src... - whitespace rules for the assembled config
 	# Honor assemble_haproxy's status: its error is already on stderr,
 	# and style-checking a partially assembled config would hide the
 	# failure (errexit is off under run_check's `if`).
+	# shellcheck disable=SC2310
 	if ! cfg=$(assemble_haproxy "$@"); then
 		return 1
 	fi
@@ -373,6 +431,7 @@ lint_dockerfile_heredocs() { # src...
 	local src start quoted name body markers opener rc=0
 	# In a variable: the << in a literal =~ RHS parses as a redirect.
 	local run_re='^[[:space:]]*RUN[[:space:]]+<<'
+	# shellcheck disable=SC2310
 	if ! markers=$(list_heredocs all "$@"); then
 		return 1
 	fi
@@ -420,7 +479,7 @@ lint_yamlfmt() { # files...
 			continue
 		fi
 		if ! cmp -s <(printf '%s\n' "${out}") "${f}"; then
-			printf '%s: not canonical yamlfmt output (diff: - file, + yamlfmt):\n' "${f}" >&2
+			printf '%s: not canonical yamlfmt output (diff: < yamlfmt, > file):\n' "${f}" >&2
 			diff <(printf '%s\n' "${out}") "${f}" | sed 's/^/  /' >&2 || true
 			rc=1
 		fi

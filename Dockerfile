@@ -8,16 +8,17 @@ ARG TARGETARCH
 # glibc-linked; on alpine's musl they run through gcompat's loader (a
 # comm read of kubelet therefore shows ld-musl-x86_64, see
 # kubelet_running in e2e.sh).
-RUN apk add --no-cache \
-    bash ca-certificates containerd containerd-ctr runc cni-plugins iptables ip6tables nftables cri-tools \
-    haproxy \
-    gcompat \
-    coreutils findutils grep gawk sed diffutils \
-    procps-ng \
-    curl inetutils-telnet netcat-openbsd traceroute bind-tools openssh-client mtr \
-    iproute2 iputils ethtool nfs-utils socat conntrack-tools ebtables \
-    openssl kmod ipset tar \
-    lsof strace tcpdump jq yq less vim tree file
+# apk packages float on purpose (only the base ALPINE_VERSION and the k8s
+# binaries below are pinned); bump the base image to move them forward.
+# Heredoc form on purpose: BuildKit logs a multi-line RUN as one giant
+# joined line, unreadable for 30+ packages. No `set -x` in the body for
+# the same reason (it would echo that line back).
+RUN <<'EOF'
+# Single line on purpose: a `\` continuation inside this heredoc cannot
+# satisfy shfmt (tabs) and dockerfmt (spaces) at once - while the build
+# log only ever shows the short `RUN <<'EOF'` header either way.
+apk add --no-cache bash ca-certificates containerd containerd-ctr runc cni-plugins iptables ip6tables nftables cri-tools haproxy gcompat coreutils findutils grep gawk sed diffutils procps-ng curl inetutils-telnet netcat-openbsd traceroute bind-tools openssh-client mtr iproute2 iputils ethtool nfs-utils socat conntrack-tools ebtables openssl kmod ipset tar lsof strace tcpdump jq yq less vim tree file
+EOF
 
 # The base CNI plugins ship in /usr/libexec/cni; symlink /opt/cni/bin to it so
 # anything a user's CNI installs there is also visible to containerd.
@@ -53,7 +54,8 @@ for _ in $(seq 1 60); do
 	sleep 1
 done
 [ -S /run/containerd/containerd.sock ]
-for image in $(kubeadm config images list --kubernetes-version "${KUBERNETES_VERSION}"); do
+images=$(kubeadm config images list --kubernetes-version "${KUBERNETES_VERSION}") || exit 1
+for image in ${images}; do
 	ctr --namespace k8s.io content fetch --platform "linux/${TARGETARCH}" "${image}"
 	ctr --namespace k8s.io images export --platform "linux/${TARGETARCH}" "/opt/zek/images/$(basename "${image}").tar" "${image}"
 done

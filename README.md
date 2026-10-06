@@ -58,8 +58,8 @@ updated by the build — check them when the bump fails or behaves oddly:
 
 Smoke-test the bump end-to-end with
 `./zek.sh up --masters 2 --workers 1`: it exercises `kubeadm init`, a
-control-plane join (certificate key), a worker join and the published
-credentials in one run.
+control-plane join (certificate key), a worker join, the load balancer and
+the published credentials in one run.
 
 ## Quick start
 
@@ -110,18 +110,18 @@ Every setting exists twice: as a flag and as an environment variable. The
 flag wins when both are set. Global flags go before the command
 (`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
 
-| Variable        | Flag          | Effect                                                                             |
-| --------------- | ------------- | ---------------------------------------------------------------------------------- |
-| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                                       |
-| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                             |
-| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                                                  |
-| `ZEK_NODES`     | `--workers`   | Workers for the first `up` (default `1`)                                           |
-| `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                                           |
-| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                          |
-| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                                           |
-| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                                               |
-| `ZEK_POD_CIDR`  | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`, `POD_CIDR` as legacy alias) |
-| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers                                     |
+| Variable        | Flag          | Effect                                                                    |
+| --------------- | ------------- | ------------------------------------------------------------------------- |
+| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                              |
+| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                    |
+| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                                         |
+| `ZEK_WORKERS`   | `--workers`   | Workers for the first `up` (default `1`, `0` allowed: control-plane only) |
+| `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                                  |
+| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                 |
+| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                                  |
+| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                                      |
+| `ZEK_POD_CIDR`  | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`)                    |
+| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers                            |
 
 ```sh
 ./zek.sh --mounts "/srv/data:/mnt/data" up   # host dir inside every node container
@@ -154,9 +154,11 @@ With more than one master, zek starts an extra container `<cluster>-lb`
   uploaded certificates are fresh.
 
 The masters walk up from `--master-ip` (default `<subnet>.2`): with the
-defaults at most **8 masters** fit, since master 9 would land on
-`<subnet>.10` — the load balancer's own IP — and zek refuses that
-combination before creating anything.
+default `/24` subnet and default `--master-ip` at most **8 masters** fit,
+since master 9 would land on `<subnet>.10` — the load balancer's own IP —
+and zek refuses that combination before creating anything. A custom
+`--subnet`/`--master-ip` moves the limit, and the network, gateway and
+broadcast addresses are always refused.
 
 Use **odd** master counts: etcd needs a majority to stay writable. 1 master
 has no redundancy, 2 masters lose quorum if either fails, 3 masters survive

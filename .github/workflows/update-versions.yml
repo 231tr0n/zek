@@ -7,13 +7,16 @@
       cron: "0 0 * * *",
     }],
   },
+  # Static group serializes daily runs on purpose (no
+  # cancel-in-progress): a version bump must not supersede another.
   concurrency: {
     group: "update-versions",
   },
-  # Workflow-level default: every run: block gets bash's -eo pipefail,
-  # and the default token scope is read-only; the create-pr job below
-  # asks for the write scopes it needs on top (job-level permissions
-  # replace this default entirely).
+  # Workflow-level defaults: pin bash for every run: block (on ubuntu
+  # GitHub already runs `bash -eo pipefail`) and keep the default token
+  # scope read-only; the create-pr job below asks for the write scopes
+  # it needs on top (job-level permissions replace this default
+  # entirely).
   permissions: {
     contents: "read",
   },
@@ -85,11 +88,16 @@
            sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\\?=[[:space:]]*).*|\\1'\"${K8S}\"'|' Makefile\n\
           ",
       }, {
+        # Always shared (even when the pins did not change): e2e always
+        # fetches this artifact via the makefile-artifact input
+        # (build-and-test.yml), so a conditional upload would break the
+        # no-op run. The name must stay "updated-makefile" on both sides.
         name: "Share updated Makefile",
-        uses: "actions/upload-artifact@v7",
+        uses: "actions/upload-artifact@v8",
         with: {
           name: "updated-makefile",
           path: "Makefile",
+          retention-days: 7,
         },
       }],
     },
@@ -104,6 +112,8 @@
       },
     },
     create-pr: {
+      # Both needs are intentional: e2e implies prepare, but the PR body
+      # below reads needs.prepare.outputs.* directly.
       needs: [
         "prepare",
         "e2e",

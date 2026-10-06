@@ -33,6 +33,7 @@ build: ## Build + tag $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
 build-nocache: ## Build, forcing the image preload step to re-run
 	$(call build_image,--no-cache)
 
+# Keep in sync with .github/workflows/lint.yml (same image, packages and go installs).
 lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	$(DOCKER) run --rm \
 		-v "$(PWD):/repo:z" -w /repo \

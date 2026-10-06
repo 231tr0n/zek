@@ -46,17 +46,16 @@
 #   --master-ip IP          first master's IP (ZEK_MASTER_IP, default
 #                           <subnet>.2)
 #   --dns IP                upstream DNS for the node containers (ZEK_DNS)
-#   --pod-cidr CIDR         pod subnet passed to kubeadm (ZEK_POD_CIDR or
-#                           POD_CIDR, default 10.244.0.0/16)
+#   --pod-cidr CIDR         pod subnet passed to kubeadm (ZEK_POD_CIDR,
+#                           default 10.244.0.0/16)
 #   --mounts SPEC           extra host bind mounts for the nodes: a
 #                           space-separated list of
 #                           host-path:container-path[:options] (ZEK_MOUNTS)
-#   up-only flags: --workers N (ZEK_NODES), --masters M (ZEK_MASTERS).
+#   up-only flags: --workers N (ZEK_WORKERS), --masters M (ZEK_MASTERS).
 #
 # Env overrides: the env twin of every flag above - ZEK_CLUSTER,
 #                ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET, ZEK_MASTER_IP, ZEK_DNS,
-#                ZEK_POD_CIDR (or POD_CIDR), ZEK_MOUNTS, ZEK_NODES,
-#                ZEK_MASTERS.
+#                ZEK_POD_CIDR, ZEK_MOUNTS, ZEK_WORKERS, ZEK_MASTERS.
 set -euo pipefail
 
 log() { echo "[zek] $*" >&2; }
@@ -97,7 +96,7 @@ require_ipv4() { # <value> cidr|addr <label>
 	local octet
 	IFS=. read -r -a parts <<< "${value%%/*}"
 	for octet in "${parts[@]}"; do
-		# The test above rejects leading zeros outright (docker's IP
+		# The test below rejects leading zeros outright (docker's IP
 		# parser does too); 10#... below just keeps the arithmetic
 		# decimal instead of octal.
 		[[ ${octet} != 0[0-9]* ]] \
@@ -114,16 +113,19 @@ IMAGE="${ZEK_IMAGE:-zek:latest}"
 SUBNET="${ZEK_SUBNET:-}"
 MASTER_IP="${ZEK_MASTER_IP:-}"
 DNS="${ZEK_DNS:-}"
-# ZEK_POD_CIDR is the flag's env twin; POD_CIDR is a compatibility alias.
 # Empty here means "let entrypoint.sh default kubeadm to 10.244.0.0/16".
-POD_CIDR="${ZEK_POD_CIDR:-${POD_CIDR:-}}"
+POD_CIDR="${ZEK_POD_CIDR:-}"
 MOUNTS="${ZEK_MOUNTS:-}"
-# ZEK_NODES counts workers only (historic name); masters are ZEK_MASTERS.
-# Both are validated against the *effective* value in cmd_up, after the
-# flags below may have overridden them - flag > env must hold even for
-# invalid env values.
-DEFAULT_WORKERS="${ZEK_NODES:-1}"
-DEFAULT_MASTERS="${ZEK_MASTERS:-1}"
+# ZEK_WORKERS is the env twin of --workers. Both worker/master values
+# are validated against the *effective* value in cmd_up, after the flags
+# below may have overridden them - flag > env must hold even for invalid
+# env values. Named ENV_* (not DEFAULT_*): they come from the
+# environment, and cmd_up's flags override them.
+ENV_WORKERS="${ZEK_WORKERS:-1}"
+ENV_MASTERS="${ZEK_MASTERS:-1}"
+# Join credentials published by the first master (read_join_credentials):
+# declared here so `set -u` never sees an implicit global.
+CRED_ARGS=()
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--cluster)
@@ -186,14 +188,14 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 [[ ${CLUSTER} =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
-	|| die "invalid cluster name '${CLUSTER}' (letters, digits, '-' and '_' only)"
+	|| die "invalid cluster name '${CLUSTER}' (letters, digits, '-' and '_' only; check --cluster/ZEK_CLUSTER)"
 [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] \
-	|| die "invalid timeout '${WAIT_TIMEOUT}' (expected seconds >= 1)"
-[[ -n ${IMAGE} ]] || die "--image needs a value"
-require_ipv4 "${SUBNET}" cidr subnet
-require_ipv4 "${MASTER_IP}" addr "master IP"
-require_ipv4 "${DNS}" addr "DNS IP"
-require_ipv4 "${POD_CIDR}" cidr "pod CIDR"
+	|| die "invalid timeout '${WAIT_TIMEOUT}' (expected seconds >= 1; check --timeout/ZEK_TIMEOUT)"
+[[ -n ${IMAGE} ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
+require_ipv4 "${SUBNET}" cidr "subnet (--subnet/ZEK_SUBNET)"
+require_ipv4 "${MASTER_IP}" addr "master IP (--master-ip/ZEK_MASTER_IP)"
+require_ipv4 "${DNS}" addr "DNS IP (--dns/ZEK_DNS)"
+require_ipv4 "${POD_CIDR}" cidr "pod CIDR (--pod-cidr/ZEK_POD_CIDR)"
 
 NET_NAME="${CLUSTER}-net"
 MASTER_NAME="${CLUSTER}-master-1"
@@ -222,10 +224,10 @@ NODE_ARGS=(
 # dies before any container is created.
 mount_entries=()
 [[ -n ${MOUNTS} ]] && read -r -a mount_entries <<< "${MOUNTS}"
-for m in "${mount_entries[@]}"; do
-	[[ ${m} =~ ^[^:]+:/[^:]+(:[^:]*)?$ ]] \
-		|| die "invalid mount '${m}' (expected host-path:container-path[:options])"
-	NODE_ARGS+=(-v "${m}")
+for mount in "${mount_entries[@]}"; do
+	[[ ${mount} =~ ^[^:]+:/[^:]+(:[^:]*)?$ ]] \
+		|| die "invalid mount '${mount}' (expected host-path:container-path[:options]; check --mounts/ZEK_MOUNTS)"
+	NODE_ARGS+=(-v "${mount}")
 done
 
 net_exists() { docker network inspect "${NET_NAME}" > /dev/null 2>&1; }
@@ -264,14 +266,15 @@ pick_subnet() {
 		echo "${SUBNET}"
 		return
 	}
-	# Collect the occupied subnets word by word through plain assignments:
-	# no quotes or line breaks nested inside $(...), which also keeps
-	# GitHub's syntax highlighter from derailing.
-	local i net nets subnets subnet candidate used_subnets=""
-	nets="$(docker network ls -q)"
-	for net in ${nets}; do
-		subnets="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "${net}")"
-		for subnet in ${subnets}; do
+	# Collect the occupied subnets word by word: the `for X in ${list}`
+	# splits are intentional word-splitting, while command arguments
+	# inside $(...) stay quoted (which also keeps GitHub's syntax
+	# highlighter from derailing).
+	local i net_id net_list subnet_list subnet candidate used_subnets=""
+	net_list="$(docker network ls -q)"
+	for net_id in ${net_list}; do
+		subnet_list="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "${net_id}")"
+		for subnet in ${subnet_list}; do
 			used_subnets="${used_subnets} ${subnet}"
 		done
 	done
@@ -430,9 +433,9 @@ master_node_ip() {
 # Decimal 32-bit form of a dotted-quad IPv4 address.
 ip_to_int() {
 	local octet ipn=0
-	local -a o=()
-	IFS=. read -r -a o <<< "$1"
-	for octet in "${o[@]}"; do
+	local -a octets=()
+	IFS=. read -r -a octets <<< "$1"
+	for octet in "${octets[@]}"; do
 		ipn=$((ipn << 8 | 10#${octet}))
 	done
 	echo "${ipn}"
@@ -460,27 +463,27 @@ require_host_ip() { # <ip> <cidr> <label>
 	local ipn netn mask gateway broadcast
 	# shellcheck disable=SC2310
 	ip_in_cidr "${ip}" "${cidr}" \
-		|| die "${label} ${ip} is outside the cluster subnet ${cidr} (check --subnet/--master-ip)"
+		|| die "${label} ${ip} is outside the cluster subnet ${cidr} (check --subnet/ZEK_SUBNET and --master-ip/ZEK_MASTER_IP)"
 	ipn=$(ip_to_int "${ip}")
 	netn=$(ip_to_int "${cidr%/*}")
 	mask=$(((0xFFFFFFFF << (32 - 10#${prefix})) & 0xFFFFFFFF))
 	gateway=$((netn + 1))
 	broadcast=$((netn | (~mask & 0xFFFFFFFF)))
 	if ((ipn == netn)); then
-		die "${label} ${ip} is the network address of ${cidr}"
+		die "${label} ${ip} is the network address of ${cidr} (check --subnet/ZEK_SUBNET and --master-ip/ZEK_MASTER_IP)"
 	fi
 	if ((ipn == gateway)); then
-		die "${label} ${ip} is the gateway of ${cidr}"
+		die "${label} ${ip} is the gateway of ${cidr} (check --subnet/ZEK_SUBNET and --master-ip/ZEK_MASTER_IP)"
 	fi
 	if ((ipn == broadcast)); then
-		die "${label} ${ip} is the broadcast address of ${cidr}"
+		die "${label} ${ip} is the broadcast address of ${cidr} (check --subnet/ZEK_SUBNET and --master-ip/ZEK_MASTER_IP)"
 	fi
 	return 0
 }
 
 create_cluster() {
 	local workers="$1" masters="$2"
-	local net_subnet subnet_prefix lb_ip endpoint ip i backends=""
+	local net_subnet subnet_prefix lb_ip endpoint master_addr i backends=""
 	local have_net=0
 
 	# Reuse this cluster's own network when it exists (retry after a
@@ -511,18 +514,18 @@ create_cluster() {
 	# --master-ip while the LB owns <subnet>.10, so a master landing on
 	# .10 dies here too.
 	for i in $(seq 1 "${masters}"); do
-		ip=$(master_node_ip "${i}")
-		require_host_ip "${ip}" "${net_subnet}" "master ${i}"
+		master_addr=$(master_node_ip "${i}")
+		require_host_ip "${master_addr}" "${net_subnet}" "master ${i}"
 		if [[ ${masters} -gt 1 ]]; then
-			[[ ${ip} != "${lb_ip}" ]] \
-				|| die "master ${i} would get IP ${ip}, which is the load balancer's IP (${lb_ip}); change --master-ip or lower --masters"
-			backends="${backends:+${backends} }${ip}"
+			[[ ${master_addr} != "${lb_ip}" ]] \
+				|| die "master ${i} would get IP ${master_addr}, which is the load balancer's IP (${lb_ip}); change --master-ip/ZEK_MASTER_IP or lower --masters/ZEK_MASTERS"
+			backends="${backends:+${backends} }${master_addr}"
 		fi
 	done
 	if [[ ${masters} -gt 1 ]]; then
 		require_host_ip "${lb_ip}" "${net_subnet}" "load balancer"
 	fi
-	if [[ ${have_net} == 0 ]]; then
+	if [[ ${have_net} -eq 0 ]]; then
 		ensure_net "${net_subnet}"
 	fi
 	if [[ ${masters} -gt 1 ]]; then
@@ -570,8 +573,8 @@ restart_cluster() {
 	local have_masters have_workers
 	have_masters="$(count_masters)"
 	have_workers="$(count_workers)"
-	if { [[ ${workers_set} == 1 ]] && [[ ${workers} != "${have_workers}" ]]; } \
-		|| { [[ ${masters_set} == 1 ]] && [[ ${masters} != "${have_masters}" ]]; }; then
+	if { [[ ${workers_set} -eq 1 ]] && [[ ${workers} -ne ${have_workers} ]]; } \
+		|| { [[ ${masters_set} -eq 1 ]] && [[ ${masters} -ne ${have_masters} ]]; }; then
 		warn "cluster ${CLUSTER} already exists with ${have_masters} master(s) and ${have_workers} worker(s); topology is fixed, ignoring --masters/--workers"
 	fi
 
@@ -629,7 +632,7 @@ cmd_up() {
 				shift
 				;;
 			[0-9]*)
-				[[ ${workers_set} == 0 ]] \
+				[[ ${workers_set} -eq 0 ]] \
 					|| die "unexpected argument '$1' (a bare number is a --workers shorthand; it may appear once)"
 				workers="$1"
 				workers_set=1
@@ -638,27 +641,27 @@ cmd_up() {
 			*) usage ;;
 		esac
 	done
-	if [[ ${workers_set} == 1 && -z ${workers} ]]; then
+	if [[ ${workers_set} -eq 1 && -z ${workers} ]]; then
 		die "--workers needs a value"
 	fi
-	if [[ ${masters_set} == 1 && -z ${masters} ]]; then
+	if [[ ${masters_set} -eq 1 && -z ${masters} ]]; then
 		die "--masters needs a value"
 	fi
-	workers="${workers:-${DEFAULT_WORKERS}}"
-	masters="${masters:-${DEFAULT_MASTERS}}"
+	workers="${workers:-${ENV_WORKERS}}"
+	masters="${masters:-${ENV_MASTERS}}"
 	# Validate the effective values (flag > env) here, after the merge, so
-	# a bad ZEK_NODES/ZEK_MASTERS is always overridable by a valid flag.
+	# a bad ZEK_WORKERS/ZEK_MASTERS is always overridable by a valid flag.
 	# Bounds are checked by string length first: bash arithmetic would
 	# silently wrap a 20-digit literal and `seq 1 <huge>` eats the disk.
 	# No leading zeros either - $((08)) is a hard arithmetic error later.
 	[[ ${workers} =~ ^(0|[1-9][0-9]*)$ ]] \
-		|| die "invalid workers '${workers}' (expected a plain number 0-64; check --workers/ZEK_NODES)"
+		|| die "invalid workers '${workers}' (expected a plain number 0-64; check --workers/ZEK_WORKERS)"
 	[[ ${masters} =~ ^[1-9][0-9]*$ ]] \
 		|| die "invalid masters '${masters}' (expected a number 1-64; check --masters/ZEK_MASTERS)"
 	{ [[ ${#workers} -le 3 ]] && ((10#${workers} <= 64)); } \
-		|| die "workers ${workers} out of range (0-64)"
+		|| die "workers ${workers} out of range (0-64; check --workers/ZEK_WORKERS)"
 	{ [[ ${#masters} -le 3 ]] && ((10#${masters} <= 64)); } \
-		|| die "masters ${masters} out of range (1-64)"
+		|| die "masters ${masters} out of range (1-64; check --masters/ZEK_MASTERS)"
 
 	# shellcheck disable=SC2310
 	if node_exists "${MASTER_NAME}"; then
@@ -673,10 +676,10 @@ cmd_down() {
 	local name list
 	list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}") || list=""
 	[[ -n ${list} ]] && mapfile -t names <<< "${list}"
-	[[ ${#names[@]} -gt 0 ]] || {
+	if [[ ${#names[@]} -eq 0 ]]; then
 		log "cluster ${CLUSTER} is not running"
 		return 0
-	}
+	fi
 	for name in "${names[@]}"; do
 		log "stopping ${name}"
 		docker stop "${name}" > /dev/null
@@ -738,10 +741,10 @@ cmd_status() {
 		printf '%-25s %-8s %s\n' "${name}" "${state}" "${health}"
 		[[ ${state} == running ]] && running=$((running + 1))
 	done <<< "${rows}"
-	[[ ${running} == 0 ]] && {
+	if [[ ${running} -eq 0 ]]; then
 		log "cluster ${CLUSTER} is stopped"
 		return 0
-	}
+	fi
 	echo
 	# shellcheck disable=SC2310
 	kube get nodes -o wide || log "control plane not reachable"
@@ -761,10 +764,10 @@ cmd_destroy() {
 		docker network rm "${NET_NAME}" > /dev/null
 		removed=1
 	fi
-	[[ ${removed} == 1 ]] || {
+	if [[ ${removed} -eq 0 ]]; then
 		log "no cluster named ${CLUSTER}"
 		return 0
-	}
+	fi
 	log "removed cluster ${CLUSTER} (containers + network ${NET_NAME})"
 }
 

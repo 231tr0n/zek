@@ -60,6 +60,9 @@ NODE_NAME="${NODE_NAME:-$(hostname)}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 readonly KUBELET_CONFIG=/var/lib/kubelet/config.yaml
 readonly KUBEADM_FLAGS=/var/lib/kubelet/kubeadm-flags.env
+# Passthrough kubectl args (plus `--` itself) collected by parse_role_flags;
+# node roles must leave this empty (they die on stray args instead).
+ROLE_ARGS=()
 
 CONTAINERD_PID=""
 SUPERVISOR_PID=""
@@ -111,7 +114,7 @@ cleanup() {
 	# fire before that (flag parsing, kubeadm failures on a first start),
 	# and an empty "loaded by us" list would otherwise rmmod modules the
 	# host itself was using.
-	if [[ ${HOST_SETUP_DONE:-0} == 1 ]]; then
+	if [[ ${HOST_SETUP_DONE:-0} -eq 1 ]]; then
 		for module in br_netfilter vxlan; do
 			case " ${HOST_MODULES_PREEXISTING} " in
 				*" ${module} "*) ;;
@@ -131,7 +134,7 @@ preflight_host() {
 	# In-memory kernel setup only: it does not survive a reboot and touches no
 	# disk. Skip entirely with NO_HOST_MODULES=1 if the host manages its own
 	# modules (e.g. they were already loaded at boot).
-	[[ ${NO_HOST_MODULES:-0} == 1 ]] && return 0
+	[[ ${NO_HOST_MODULES:-0} -eq 1 ]] && return 0
 	for module in br_netfilter vxlan; do
 		if [[ -d "/sys/module/${module}" ]]; then
 			HOST_MODULES_PREEXISTING="${HOST_MODULES_PREEXISTING} ${module}"
@@ -522,8 +525,9 @@ run_master() {
 	# - kubelet.conf present but the kubeadm run never finished. kubelet.conf
 	#   is written in the kubeconfig phase, long before wait-control-plane,
 	#   the bootstrap-token RBAC that lets nodes fetch cluster-info, and
-	#   the addons - so an init that dies in wait-control-plane (hard 4m
-	#   budget; parallel clusters can exceed it) would otherwise resume
+	#   the addons - so an init that dies in wait-control-plane (4m budget,
+	#   kubeadm's default; re-check `kubeadm init --help` on a k8s bump -
+	#   parallel clusters can exceed it) would otherwise resume
 	#   as a half-initialized cluster whose joins all 403 on
 	#   cluster-info. The same holds for an interrupted control-plane
 	#   join: its kubelet.conf also appears before the etcd member add
@@ -554,11 +558,11 @@ run_master() {
 		# bootstrap token and certificate key the stored credentials
 		# still point at (kubeadm's upload-certs secret), breaking the
 		# next control-plane join.
-		if [[ ${MASTER_JOIN:-0} != 1 && ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+		if [[ ${MASTER_JOIN:-0} -ne 1 && ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
 			log "published credentials incomplete; republishing"
 			publish_cluster_credentials
 		fi
-	elif [[ ${MASTER_JOIN:-0} == 1 ]]; then
+	elif [[ ${MASTER_JOIN:-0} -eq 1 ]]; then
 		join_control_plane
 	else
 		init_control_plane
@@ -603,7 +607,7 @@ run_worker() {
 # taken out of rotation. The stats page on :8404 shows backend state.
 run_lb() {
 	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs"
-	local cfg=/etc/haproxy/haproxy.cfg i=1 ip
+	local cfg=/etc/haproxy/haproxy.cfg i=1 backend_ip
 	mkdir -p /etc/haproxy
 	{
 		# HAPROXY instead of EOF marks this as config: lint.sh checks
@@ -630,8 +634,8 @@ backend apiservers
 	balance roundrobin
 	option tcp-check
 HAPROXY
-		for ip in ${LB_BACKENDS}; do
-			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${ip}"
+		for backend_ip in ${LB_BACKENDS}; do
+			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${backend_ip}"
 			i=$((i + 1))
 		done
 		cat << 'HAPROXY'
@@ -792,4 +796,10 @@ case "${1:-}" in
 		;;
 esac
 parse_role_flags "$@"
+# `--` bypasses the unknown-argument die above by design (kubectl needs the
+# delimiter itself for `exec POD -- CMD`), so a node role that received one
+# must still die here instead of silently ignoring the trailing args.
+if [[ ${ROLE} != kubectl && ${#ROLE_ARGS[@]} -gt 0 ]]; then
+	die "unknown argument '${ROLE_ARGS[0]}' for role ${ROLE} (only the kubectl role takes passthrough arguments)"
+fi
 "run_${ROLE}" "${ROLE_ARGS[@]}"
