@@ -429,8 +429,28 @@ ds_ready() { # cluster ds-name
 # answering: wget through it must return the pod's page (the forward
 # runs inside the given container, so the fetch happens there too).
 pf_serves() { # container
-	docker exec "$1" wget -qO- --timeout=10 http://127.0.0.1:8090/ \
+	docker exec "$1" wget -qO- --timeout=20 http://127.0.0.1:8090/ \
 		2> /dev/null | grep -q pf-ok
+}
+
+# (Re)start the detached port-forward for the e2e-pf pod inside the given
+# cluster's master-1; its log lands in /tmp/e2e-pf.log there for the retry
+# path below to dump. -d keeps it alive detached (it is polled, so startup
+# latency does not matter).
+start_port_forward() { # cluster
+	docker exec -d "$1-master-1" env KUBECONFIG=/etc/kubernetes/admin.conf \
+		sh -c 'kubectl port-forward --address 0.0.0.0 pod/e2e-pf 8090:80 > /tmp/e2e-pf.log 2>&1'
+}
+
+# True once the forward serves (60s of 2s polls, like wait_for but
+# non-fatal so the caller can retry the establishment first).
+poll_port_forward() { # cluster
+	local deadline=$((SECONDS + 60))
+	# shellcheck disable=SC2310
+	until pf_serves "$1"; do
+		[[ ${SECONDS} -lt ${deadline} ]] || return 1
+		sleep 2
+	done
 }
 
 # podCIDR of smoke's throwaway e2e-fn master: the controller-manager
@@ -988,12 +1008,20 @@ EOF
 		--timeout="${ZEK_E2E_TIMEOUT}s"
 	# kubectl runs inside the master container: bind the forward to all
 	# interfaces there and fetch it with a docker exec wget from the same
-	# container (-d keeps the forward alive detached; it is polled, so
-	# startup latency does not matter).
-	docker exec -d "${cluster}-master-1" env KUBECONFIG=/etc/kubernetes/admin.conf \
-		kubectl port-forward --address 0.0.0.0 pod/e2e-pf 8090:80
-	wait_for "${cluster}: port-forward serves through the LB" 60 \
-		pf_serves "${cluster}-master-1"
+	# container.
+	start_port_forward "${cluster}"
+	# kubectl port-forward does not retry its initial API connection, so a
+	# stillborn forward under load looks identical to a slow one for the
+	# whole budget: on timeout dump its log and establish once more (a real
+	# breakage fails the second attempt too).
+	# shellcheck disable=SC2310
+	if ! poll_port_forward "${cluster}"; then
+		docker exec "${cluster}-master-1" cat /tmp/e2e-pf.log 2> /dev/null || true
+		docker exec "${cluster}-master-1" pkill -f "port-forward" 2> /dev/null || true
+		start_port_forward "${cluster}"
+		wait_for "${cluster}: port-forward serves through the LB (retry)" 60 \
+			pf_serves "${cluster}-master-1"
+	fi
 	# Idle through the LB: the forward and its haproxy connection sit
 	# open with zero traffic, then must answer on the same connection.
 	sleep 8
@@ -1242,7 +1270,7 @@ test_cilium() {
 # and `zek down`/`up` cycles below exercise. No test reboots the host
 # (it would kill the parallel jobs).
 test_persistence() {
-	local cluster=$1 start_uids start_web out purges_before
+	local cluster=$1 start_uids start_web out purges_before repubs_before repubs_after
 	up "${cluster}" 1 1
 	log "${cluster}: installing flannel + workload"
 	apply_flannel "${cluster}"
@@ -1348,21 +1376,24 @@ EOF
 	assert_state "worker restart"
 
 	log "${cluster}: docker restart the master"
-	# Count first: the purge line is also logged on the initial start, so
-	# matching its mere existence would pass without the restart purging.
+	# Count both lines first: the purge line is also logged on the initial
+	# start, and a complete-heal during bring-up may already have logged a
+	# republish - matching mere existence would pass a missing restart
+	# purge, or fail a clean restart on the old republish line.
 	purges_before=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "purging stale containers" || true)
+	repubs_before=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "published credentials incomplete; republishing" || true)
 	docker restart "${cluster}-master-1" > /dev/null
 	# node_setup purges dead CRI sandboxes on every start so the new
 	# kubelet never reattaches to them (cleanup_stale_cri).
 	wait_for "${cluster}: stale CRI purged on restart" 60 log_count_grew "${cluster}-master-1" \
 		"purging stale containers from previous node instance" "${purges_before}"
-	# The credentials were complete, so the resume path must not rotate
-	# them - the master-1 twin of the join-master guard in multi-master.
-	# shellcheck disable=SC2310
-	if log_has "${cluster}-master-1" "republishing"; then
-		fail "${cluster}: master-1 republished complete credentials on resume"
-	fi
 	assert_state "master restart"
+	# The credentials were complete, so the resume must not have rotated
+	# them - the master-1 twin of the join-master guard in multi-master,
+	# compared by count (assert_state above already waited out the resume,
+	# so no new line by now means none is coming).
+	repubs_after=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "published credentials incomplete; republishing" || true)
+	assert_eq "${cluster}: no republish on resume" "${repubs_before}" "${repubs_after}"
 
 	log "${cluster}: zek down + zek up"
 	zk "${cluster}" down
@@ -2115,7 +2146,15 @@ EOF
 	fi
 	[[ ${out} == *"expected 2 nodes after 5s, saw 1"* ]] \
 		|| fail "${cluster}: wrong error for the missing node: ${out}"
-	docker exec "${cluster}-worker-1" sh -c 'kill -CONT $(pgrep -f "[/]usr/local/bin/kubelet")'
+	# CONT alone cannot heal it: a kubelet only registers at startup, so a
+	# resumed one would fail status updates forever instead of
+	# re-registering. Restart it instead (-9: a STOPped process cannot run
+	# TERM handlers, so TERM would stay pending and the supervisor would
+	# never restart it); the supervisor starts a fresh kubelet that
+	# registers anew.
+	docker exec "${cluster}-worker-1" sh -c 'pkill -9 -f "[/]usr/local/bin/kubelet"'
+	wait_for "${cluster}: supervisor logged the kubelet restart" 60 log_has "${cluster}-worker-1" \
+		"kubelet exited, restarting"
 	wait_for "${cluster}: worker-1 re-registered" "${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 2
 	wait_for "${cluster}: control plane readyz after re-register" 120 readyz_ok "${cluster}"
 

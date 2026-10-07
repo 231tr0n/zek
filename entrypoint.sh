@@ -578,8 +578,11 @@ complete_interrupted_init() {
 	log "completing the interrupted init (tail phases only)"
 	tail_version="$(kubeadm version -o short)" || return 1
 	advertise_ip="$(node_ip)"
+	# upload-config is NOT skipped: it creates kubeadm-config (and its
+	# read RBAC for joining nodes), and an init that died before it is
+	# exactly what leaves joins forbidden. Verified idempotent.
 	if ! kubeadm init \
-		--skip-phases=preflight,certs,kubeconfig,kubelet-start,control-plane,etcd,wait-control-plane,upload-config \
+		--skip-phases=preflight,certs,kubeconfig,kubelet-start,control-plane,etcd,wait-control-plane \
 		--kubernetes-version="${tail_version}" \
 		--apiserver-advertise-address="${advertise_ip}" \
 		--apiserver-bind-port=6443 \
