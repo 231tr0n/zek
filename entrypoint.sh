@@ -561,6 +561,10 @@ complete_interrupted_init() {
 	[[ -f /etc/kubernetes/admin.conf ]] || return 1
 	[[ -n "$(ls -A /etc/kubernetes/manifests 2> /dev/null || true)" ]] || return 1
 	export KUBECONFIG=/etc/kubernetes/admin.conf
+	# Same default as init_control_plane (which never ran on this path):
+	# a bare expansion would die on unbound variable under `set -u` even
+	# inside the caller's `if !`, bypassing the reset fallback.
+	API_ENDPOINT="${API_ENDPOINT:-$(node_ip):6443}"
 	log "published credentials incomplete; republishing"
 	# WAIT_TIMEOUT rides in from zek.sh (--timeout); default like the
 	# kubectl role's wait below when running outside it.

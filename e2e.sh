@@ -447,7 +447,7 @@ start_port_forward() { # cluster
 poll_port_forward() { # cluster
 	local deadline=$((SECONDS + 60))
 	# shellcheck disable=SC2310
-	until pf_serves "$1"; do
+	until pf_serves "$1-master-1"; do
 		[[ ${SECONDS} -lt ${deadline} ]] || return 1
 		sleep 2
 	done
