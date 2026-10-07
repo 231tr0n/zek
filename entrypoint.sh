@@ -250,6 +250,21 @@ import_k8s_images() {
 		warn "ctr not installed; skipping kubeadm image preload"
 		return 0
 	fi
+	# Fast path: the store survives restarts and re-inits run this again,
+	# so without this check every one of them would re-import all seven
+	# tarballs (~500MB of reads) for nothing - under parallel-cluster load
+	# that I/O alone can eat minutes out of the bring-up budget. A partial
+	# store (killed mid-import) falls through and repairs itself with a
+	# full re-import below.
+	local store_images want_image missing=0
+	store_images="$(ctr --namespace k8s.io images ls -q 2> /dev/null)" || store_images=""
+	for want_image in kube-apiserver kube-controller-manager kube-scheduler kube-proxy etcd coredns pause; do
+		[[ ${store_images} == *"${want_image}"* ]] || missing=1
+	done
+	if [[ ${missing} -eq 0 ]]; then
+		log "kubeadm images already in the containerd store; skipping import"
+		return 0
+	fi
 	log "importing preloaded kubeadm images"
 	local tarball
 	for tarball in /opt/zek/images/*.tar; do

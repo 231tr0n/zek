@@ -1066,6 +1066,10 @@ EOF
 	docker restart "${cluster}-master-2" > /dev/null
 	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
 		"interrupted control-plane setup detected; resetting partial state"
+	# The re-join re-runs the image import with a full store, so it must
+	# take the skip fast path instead of re-reading ~500MB of tarballs.
+	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
+		"already in the containerd store; skipping import"
 	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
 	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
 	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
