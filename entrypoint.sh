@@ -569,29 +569,27 @@ complete_interrupted_init() {
 		[[ ${SECONDS} -lt ${deadline} ]] || return 1
 		sleep 2
 	done
-	# Already marked (labels + taint): only the publish went missing (e.g.
-	# crash between init and publish) - skip the tail phases, they all ran.
-	# Otherwise this is a genuine late death and the tail runs its phases
-	# for the first time, so no idempotency question arises.
-	if ! kubectl get node "${NODE_NAME}" \
-		-o go-template='{{index .metadata.labels "node-role.kubernetes.io/control-plane"}}|{{range .spec.taints}}{{.key}}:{{.effect}};{{end}}' 2> /dev/null \
-		| grep -qF '|node-role.kubernetes.io/control-plane:NoSchedule;'; then
-		log "completing the interrupted init (tail phases only)"
-		tail_version="$(kubeadm version -o short)" || return 1
-		advertise_ip="$(node_ip)"
-		if ! kubeadm init \
-			--skip-phases=preflight,certs,kubeconfig,kubelet-start,control-plane,etcd,wait-control-plane,upload-config \
-			--kubernetes-version="${tail_version}" \
-			--apiserver-advertise-address="${advertise_ip}" \
-			--apiserver-bind-port=6443 \
-			--control-plane-endpoint="${API_ENDPOINT}" \
-			--node-name="${NODE_NAME}" \
-			--cri-socket=unix:///run/containerd/containerd.sock \
-			--pod-network-cidr="${POD_CIDR}" \
-			--ignore-preflight-errors=all > /var/log/kubeadm-tail.log 2>&1; then
-			tail -20 /var/log/kubeadm-tail.log >&2
-			return 1
-		fi
+	# The tail phases are all safe to re-run (verified: mark-control-plane,
+	# bootstrap-token, kubelet-finalize and addons succeed on an already
+	# initialized node), so there is no "already done" shortcut here - a
+	# partial run may have finished any subset of them, and skipping on a
+	# partial signal (e.g. node labels present but bootstrap RBAC missing)
+	# would leave joins broken. Any failure still falls back to reset.
+	log "completing the interrupted init (tail phases only)"
+	tail_version="$(kubeadm version -o short)" || return 1
+	advertise_ip="$(node_ip)"
+	if ! kubeadm init \
+		--skip-phases=preflight,certs,kubeconfig,kubelet-start,control-plane,etcd,wait-control-plane,upload-config \
+		--kubernetes-version="${tail_version}" \
+		--apiserver-advertise-address="${advertise_ip}" \
+		--apiserver-bind-port=6443 \
+		--control-plane-endpoint="${API_ENDPOINT}" \
+		--node-name="${NODE_NAME}" \
+		--cri-socket=unix:///run/containerd/containerd.sock \
+		--pod-network-cidr="${POD_CIDR}" \
+		--ignore-preflight-errors=all > /var/log/kubeadm-tail.log 2>&1; then
+		tail -20 /var/log/kubeadm-tail.log >&2
+		return 1
 	fi
 	patch_kube_proxy
 	# publish dies on failure (exit), which would loop this resume forever
