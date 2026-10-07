@@ -66,11 +66,12 @@
 #                  and coredns rolled out again after each cycle
 #   recovery       crash-recovery paths: a NO_HOST_MODULES node, an
 #                  interrupted worker join, lost master credentials (the
-#                  republish), a kubectl wait for the config, an interrupted
-#                  control-plane init/join plus an interrupted control-plane
-#                  setup (each wipes and re-inits; an interrupted
-#                  control-plane join on a second master is covered in
-#                  multi-master instead)
+#                  republish), a kubectl wait for the config, a late
+#                  interrupted init that completes without a wipe, an early
+#                  interrupted init/join that wipes and re-inits (with ctr
+#                  hidden), and an interrupted control-plane setup (same
+#                  wipe); an interrupted control-plane join on a second
+#                  master is covered in multi-master instead
 #
 # Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its own
 # cluster and pre-allocated subnet, but they share one scratch dir -
@@ -912,7 +913,7 @@ diag() {
 		# what state /etc/kubernetes was left in (kubeadm reset gaps show
 		# up as leftover files here).
 		docker inspect -f 'restart count: {{.RestartCount}}' "${container}" 2> /dev/null || true
-		docker exec "${container}" sh -c 'tail -40 /var/log/kubeadm-init.log /var/log/kubeadm-join.log 2>/dev/null' || true
+		docker exec "${container}" sh -c 'tail -40 /var/log/kubeadm-init.log /var/log/kubeadm-join.log /var/log/kubeadm-tail.log 2>/dev/null' || true
 		docker exec "${container}" ls -la /etc/kubernetes/ /etc/kubernetes/pki/ /etc/cluster/ 2> /dev/null || true
 	done <<< "${container_list}"
 	log "=============== end diagnostics for ${cluster} ================"
@@ -2197,7 +2198,7 @@ EOF
 }
 
 test_recovery() {
-	local cluster=$1 join_token join_ca_hash join_api_endpoint restore_pid out
+	local cluster=$1 join_token join_ca_hash join_api_endpoint restore_pid out uids_before
 	up "${cluster}" 1 1
 
 	# A node started with NO_HOST_MODULES=1 must still join: the host
@@ -2266,14 +2267,33 @@ test_recovery() {
 	wait "${restore_pid}" 2> /dev/null || true
 	assert_cmd "${cluster}: nodes listed after the wait" 2 node_count "${cluster}"
 
-	# Interrupted control-plane init: kubelet.conf present, completion
-	# markers gone. The entrypoint must wipe and re-init. With ctr hidden
-	# the image import must warn and skip (the images are already in the
-	# store from the first init).
+	# Interrupted late init: kubelet.conf present, completion markers gone,
+	# but the manifests (and the serving control plane behind them) remain -
+	# the mark-control-plane death under load. The entrypoint must complete
+	# the tail and republish WITHOUT wiping etcd: the worker stays
+	# registered with the same identity (node UIDs unchanged proves no
+	# wipe happened).
+	log "${cluster}: interrupted late init completes without a wipe"
+	uids_before=$(node_uids "${cluster}")
+	docker exec "${cluster}-master-1" rm -f /etc/cluster/init-complete \
+		/etc/cluster/admin.conf /etc/cluster/token
+	docker restart "${cluster}-master-1" > /dev/null
+	wait_for "${cluster}: completing the interrupted init" 60 log_has "${cluster}-master-1" \
+		"resuming to complete the init"
+	wait_for "${cluster}: credentials republished after complete" 180 creds_published "${cluster}"
+	wait_for "${cluster}: control plane readyz after complete" 300 readyz_ok "${cluster}"
+	assert_cmd "${cluster}: node UIDs unchanged (no wipe)" "${uids_before}" node_uids "${cluster}"
+	assert_cmd "${cluster}: both nodes still registered" 2 node_count "${cluster}"
+
+	# Interrupted early init: kubelet.conf present, completion markers gone
+	# AND manifests removed (nothing servable left). The entrypoint must
+	# wipe and re-init. With ctr hidden the image import must warn and skip
+	# (the images are already in the store from the first init).
 	log "${cluster}: interrupted control-plane init recovers (ctr hidden)"
 	docker exec "${cluster}-master-1" sh -c 'mv "$(command -v ctr)" /ctr.hidden'
 	docker exec "${cluster}-master-1" rm -f /etc/cluster/init-complete \
 		/etc/cluster/admin.conf /etc/cluster/token
+	docker exec "${cluster}-master-1" rm -rf /etc/kubernetes/manifests
 	docker restart "${cluster}-master-1" > /dev/null
 	wait_for "${cluster}: interrupted init detected" 60 log_has "${cluster}-master-1" \
 		"interrupted control-plane init/join detected; resetting partial state"

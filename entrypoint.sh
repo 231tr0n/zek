@@ -549,6 +549,60 @@ join_control_plane() {
 	touch "${CLUSTER_DIR}/init-complete"
 }
 
+# Complete a first-master init that died after the control plane was up
+# (static-pod manifests written, API serving) but before it published its
+# credentials - typically a late phase like mark-control-plane losing a
+# race under load. Wiping that with a reset would throw away a working
+# cluster and re-roll the same lottery, so run only the tail phases with
+# the same flags instead, then publish. Returns 1 when there is nothing
+# completable (or the tail fails) so the caller falls back to reset and a
+# full re-init - which is always safe, just slower.
+complete_interrupted_init() {
+	[[ -f /etc/kubernetes/admin.conf ]] || return 1
+	[[ -n "$(ls -A /etc/kubernetes/manifests 2> /dev/null || true)" ]] || return 1
+	export KUBECONFIG=/etc/kubernetes/admin.conf
+	log "published credentials incomplete; republishing"
+	# WAIT_TIMEOUT rides in from zek.sh (--timeout); default like the
+	# kubectl role's wait below when running outside it.
+	local tail_version advertise_ip deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
+	until curl -skf https://127.0.0.1:6443/readyz 2> /dev/null | grep -qx ok; do
+		[[ ${SECONDS} -lt ${deadline} ]] || return 1
+		sleep 2
+	done
+	# Already marked (labels + taint): only the publish went missing (e.g.
+	# crash between init and publish) - skip the tail phases, they all ran.
+	# Otherwise this is a genuine late death and the tail runs its phases
+	# for the first time, so no idempotency question arises.
+	if ! kubectl get node "${NODE_NAME}" \
+		-o go-template='{{index .metadata.labels "node-role.kubernetes.io/control-plane"}}|{{range .spec.taints}}{{.key}}:{{.effect}};{{end}}' 2> /dev/null \
+		| grep -qF '|node-role.kubernetes.io/control-plane:NoSchedule;'; then
+		log "completing the interrupted init (tail phases only)"
+		tail_version="$(kubeadm version -o short)" || return 1
+		advertise_ip="$(node_ip)"
+		if ! kubeadm init \
+			--skip-phases=preflight,certs,kubeconfig,kubelet-start,control-plane,etcd,wait-control-plane,upload-config \
+			--kubernetes-version="${tail_version}" \
+			--apiserver-advertise-address="${advertise_ip}" \
+			--apiserver-bind-port=6443 \
+			--control-plane-endpoint="${API_ENDPOINT}" \
+			--node-name="${NODE_NAME}" \
+			--cri-socket=unix:///run/containerd/containerd.sock \
+			--pod-network-cidr="${POD_CIDR}" \
+			--ignore-preflight-errors=all > /var/log/kubeadm-tail.log 2>&1; then
+			tail -20 /var/log/kubeadm-tail.log >&2
+			return 1
+		fi
+	fi
+	patch_kube_proxy
+	# publish dies on failure (exit), which would loop this resume forever
+	# without ever resetting; run it in a subshell so a failure returns 1
+	# and the caller falls back to reset + full re-init instead (the || is
+	# the handling, hence the directive).
+	# shellcheck disable=SC2310
+	(publish_cluster_credentials) || return 1
+	touch "${CLUSTER_DIR}/init-complete"
+}
+
 run_master() {
 	node_setup
 
@@ -577,8 +631,20 @@ run_master() {
 		&& [[ ! -f "${CLUSTER_DIR}/init-complete" ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/admin.conf" ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/token" ]]; then
-		log "interrupted control-plane init/join detected; resetting partial state"
-		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
+		# An init that reached the static-pod manifests may have a serving
+		# control plane behind it (it died late, e.g. in mark-control-plane
+		# under load): resetting would wipe a working cluster, so hand that
+		# state to the resume path to complete instead. A joining master
+		# never completes (it would rotate credentials others already use),
+		# and without manifests or kubeconfigs there is nothing servable to
+		# complete - those reset exactly as before.
+		if [[ ${MASTER_JOIN:-0} -eq 1 || ! -f /etc/kubernetes/admin.conf ]] \
+			|| [[ -z "$(ls -A /etc/kubernetes/manifests 2> /dev/null || true)" ]]; then
+			log "interrupted control-plane init/join detected; resetting partial state"
+			kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
+		else
+			log "control plane manifests present without published credentials; resuming to complete the init"
+		fi
 	fi
 
 	# kubelet.conf exists after either kubeadm init or a control-plane join,
@@ -586,16 +652,19 @@ run_master() {
 	# to come back up.
 	if [[ -f /etc/kubernetes/kubelet.conf ]]; then
 		log "control plane already set up, resuming"
-		# Complete a publish that was interrupted by a crash/restart -
-		# admin.conf is written last and marks the set as complete.
-		# Only the first master publishes: a joining master never has
-		# admin.conf on its own layer, and republishing would rotate the
-		# bootstrap token and certificate key the stored credentials
-		# still point at (kubeadm's upload-certs secret), breaking the
-		# next control-plane join.
+		# Complete a first-master init that died after the control plane
+		# was up but before it published (see above): anything the tail
+		# cannot finish falls back to reset + full re-init. A joining
+		# master is excluded - republishing would rotate the bootstrap
+		# token and certificate key the stored credentials still point
+		# at (kubeadm's upload-certs secret), breaking the next join.
 		if [[ ${MASTER_JOIN:-0} -ne 1 && ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
-			log "published credentials incomplete; republishing"
-			publish_cluster_credentials
+			# shellcheck disable=SC2310
+			if ! complete_interrupted_init; then
+				log "completion failed; resetting and re-initializing"
+				kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
+				init_control_plane
+			fi
 		fi
 	elif [[ ${MASTER_JOIN:-0} -eq 1 ]]; then
 		join_control_plane
