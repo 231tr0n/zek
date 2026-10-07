@@ -56,9 +56,10 @@
         id: "latest",
         run: "\
            set -euo pipefail\n\
+           command -v yq >/dev/null 2>&1 || { echo \"yq is required (preinstalled on ubuntu-latest runners)\" >&2; exit 1; }\n\
            alpine=$(curl -fsSL --retry 5 --retry-all-errors \\\n\
           \  https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml |\n\
-          \  awk '/^  version: /{print $2; exit}')\n\
+          \  yq -r '.[0].version')\n\
            k8s=$(curl -fsSL --retry 5 --retry-all-errors https://dl.k8s.io/release/stable.txt)\n\
            echo \"$alpine\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected alpine version: $alpine\"; exit 1; }\n\
            echo \"$k8s\" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo \"unexpected kubernetes version: $k8s\"; exit 1; }\n\

@@ -71,7 +71,7 @@ declare -A SYSCTL_BEFORE=()
 # cleanup only unloads the ones NOT in this list. Set at the end of
 # preflight_host, so cleanup can tell "we never set the host up" (an early
 # die) from "we loaded something" - an empty list must never trigger rmmod.
-HOST_SETUP_DONE=""
+HOST_SETUP_DONE=0
 HOST_MODULES_PREEXISTING=""
 
 log() { echo "[zek] $*" >&2; }
@@ -153,9 +153,9 @@ preflight_host() {
 	# for the whole host (best effort, kept on purpose after exit: the
 	# other zek containers still need it).
 	if [[ -w /proc/sys/fs/inotify/max_user_instances ]]; then
-		local limit
-		limit="$(cat /proc/sys/fs/inotify/max_user_instances 2> /dev/null || echo 0)"
-		{ [[ ${limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 > /dev/null; } 2> /dev/null || true
+		local inotify_limit
+		inotify_limit="$(cat /proc/sys/fs/inotify/max_user_instances 2> /dev/null || echo 0)"
+		{ [[ ${inotify_limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 > /dev/null; } 2> /dev/null || true
 	fi
 	# Marked only on the fall-through path: with NO_HOST_MODULES=1 the
 	# early return above leaves it unset, and cleanup then keeps its hands
@@ -172,11 +172,12 @@ ensure_resolv_conf() {
 	local upstreams
 	# NODE_DNS is an optional override for manual `docker run -e
 	# NODE_DNS="..."` usage; normally the docker --dns resolv.conf parsed
-	# below provides the upstreams.
+	# below provides the upstreams. awk reads the nameserver field only:
+	# a flat grep would also pick up IPs from comments and options.
 	upstreams="${NODE_DNS:-}"
 	if [[ -z ${upstreams} ]]; then
-		upstreams="$(grep -oE '([0-9]+\.){3}[0-9]+' /etc/resolv.conf \
-			| grep -vE '^127\.|^169\.254\.' | sort -u | tr '\n' ' ')" || true
+		upstreams="$(awk '$1 == "nameserver" && $2 !~ /^127\.|^169\.254\./ { print $2 }' /etc/resolv.conf \
+			| sort -u | tr '\n' ' ')" || true
 	fi
 	[[ -n ${upstreams} ]] || upstreams="1.1.1.1 8.8.8.8"
 	{
@@ -197,7 +198,8 @@ ensure_etc_kubernetes() {
 start_containerd() {
 	[[ -f /etc/containerd/config.toml ]] || containerd config default > /etc/containerd/config.toml
 	# Search both the Alpine-provided and user-installed CNI binaries.
-	sed -i "s|bin_dirs = \[.*\]|bin_dirs = ['/opt/cni/bin', '/usr/libexec/cni']|" /etc/containerd/config.toml
+	# Anchored to the key so a reordered config cannot mis-substitute.
+	sed -i "s|^\([[:space:]]*bin_dirs = \)\[.*\]|\1['/opt/cni/bin', '/usr/libexec/cni']|" /etc/containerd/config.toml
 	# /var/lib lives on the container's overlay rootfs (no volume), and overlay
 	# cannot be nested on overlay, so use the native snapshotter instead.
 	sed -i "s|^\([[:space:]]*snapshotter = \).*|\1'native'|" /etc/containerd/config.toml
@@ -262,27 +264,29 @@ node_ip() {
 }
 
 # sha256 of the CA public key - the exact format kubeadm expects for the
-# caCertHashes join-discovery field ("sha256:<hash>").
+# caCertHashes join-discovery field ("sha256:<hash>"). awk takes the last
+# field instead of stripping on "=" with sed: openssl prints
+# "SHA2-256(stdin)= <hash>".
 get_ca_hash() {
 	openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt \
 		| openssl pkey -pubin -outform der 2> /dev/null \
-		| openssl dgst -sha256 -hex | sed 's/^.*= //'
+		| openssl dgst -sha256 -hex | awk '{ print $NF }'
 }
 
 patch_kube_proxy() {
 	# In a container netns kube-proxy cannot grow the global conntrack table
 	# (EACCES); disable its auto-tuning via the ConfigMap.
 	log "disabling kube-proxy conntrack tuning"
-	local dir=/etc/zek/kube-proxy
-	mkdir -p "${dir}"
+	local proxy_dir=/etc/zek/kube-proxy
+	mkdir -p "${proxy_dir}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' > "${dir}/config.conf"
-	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' > "${dir}/kubeconfig.conf"
-	[[ -s "${dir}/config.conf" ]] || return 0
-	sed -i -e 's/^\(  maxPerCore: \)null/\10/' -e 's/^\(  min: \)null/\10/' "${dir}/config.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' > "${proxy_dir}/config.conf"
+	kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.kubeconfig\.conf}' > "${proxy_dir}/kubeconfig.conf"
+	[[ -s "${proxy_dir}/config.conf" ]] || return 0
+	sed -i -e 's/^\(  maxPerCore: \)null/\10/' -e 's/^\(  min: \)null/\10/' "${proxy_dir}/config.conf"
 	kubectl -n kube-system create configmap kube-proxy \
-		--from-file=config.conf="${dir}/config.conf" \
-		--from-file=kubeconfig.conf="${dir}/kubeconfig.conf" \
+		--from-file=config.conf="${proxy_dir}/config.conf" \
+		--from-file=kubeconfig.conf="${proxy_dir}/kubeconfig.conf" \
 		--dry-run=client -o yaml | kubectl apply -f - > /dev/null 2>&1 || true
 	kubectl -n kube-system rollout restart daemonset kube-proxy > /dev/null 2>&1 || true
 }
@@ -307,7 +311,7 @@ kubelet_supervisor() {
 	while :; do
 		if [[ -f ${KUBELET_CONFIG} ]]; then
 			ensure_kubelet_config
-			local -a args=()
+			local -a kubelet_args=()
 			if [[ -f ${KUBEADM_FLAGS} ]]; then
 				# kubeadm generates this file at runtime, so shellcheck
 				# cannot read it here.
@@ -315,19 +319,20 @@ kubelet_supervisor() {
 				source "${KUBEADM_FLAGS}"
 				# Drop any deprecated CLI copy kubeadm may still ship
 				# in KUBELET_KUBEADM_ARGS; the config file carries
-				# the setting now.
-				local flag
-				for flag in ${KUBELET_KUBEADM_ARGS:-}; do
-					case "${flag}" in
+				# the setting now. Intentional word-splitting: the file
+				# holds a flat space-separated flag string, not an array.
+				local kubeadm_flag
+				for kubeadm_flag in ${KUBELET_KUBEADM_ARGS:-}; do
+					case "${kubeadm_flag}" in
 						--fail-swap-on | --fail-swap-on=*) ;;
-						*) args+=("${flag}") ;;
+						*) kubelet_args+=("${kubeadm_flag}") ;;
 					esac
 				done
 			fi
 			if [[ -f /etc/kubernetes/bootstrap-kubelet.conf ]]; then
-				args+=(--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf)
+				kubelet_args+=(--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf)
 			elif [[ -f /etc/kubernetes/kubelet.conf ]]; then
-				args+=(--kubeconfig=/etc/kubernetes/kubelet.conf)
+				kubelet_args+=(--kubeconfig=/etc/kubernetes/kubelet.conf)
 			fi
 			# Full kubelet log goes to /var/log/kubelet.log; docker logs
 			# only gets warnings/errors/fatals and non-klog lines
@@ -349,7 +354,7 @@ kubelet_supervisor() {
 			# config, or every container fails to start. Last on the line so
 			# it beats kubeadm's generated config.yaml (flags > config file).
 			kubelet --config "${KUBELET_CONFIG}" --hostname-override "${NODE_NAME}" \
-				--v=2 "${args[@]}" --cgroup-driver=cgroupfs 2>&1 \
+				--v=2 "${kubelet_args[@]}" --cgroup-driver=cgroupfs 2>&1 \
 				| tee -a /var/log/kubelet.log \
 				| awk '
 					inval {
@@ -420,7 +425,7 @@ node_setup() {
 # it is missing). The token and upload-certs both need a serving API, so
 # they are retried briefly.
 publish_cluster_credentials() {
-	local token="" cert_key="" ca_hash uploaded i
+	local token="" cert_key="" ca_hash="" certs_uploaded=""
 	API_ENDPOINT="${API_ENDPOINT:-$(node_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -435,15 +440,17 @@ publish_cluster_credentials() {
 	# line) and would break extraction again. The key is a hex-encoded
 	# 32-byte AES key, so 64 hex characters.
 	cert_key="$(openssl rand -hex 32)"
-	for i in $(seq 1 60); do
-		token="$(kubeadm token create --ttl 0 2> /dev/null | tr -d '\n')" || token=""
-		uploaded=""
+	for _ in $(seq 1 60); do
+		# No tr needed: command substitution already strips the
+		# trailing newline kubeadm prints.
+		token="$(kubeadm token create --ttl 0 2> /dev/null)" || token=""
+		certs_uploaded=""
 		kubeadm init phase upload-certs --upload-certs \
-			--certificate-key "${cert_key}" > /dev/null 2>&1 && uploaded=1
-		[[ -n ${token} ]] && [[ -n ${uploaded} ]] && break
+			--certificate-key "${cert_key}" > /dev/null 2>&1 && certs_uploaded=1
+		[[ -n ${token} ]] && [[ -n ${certs_uploaded} ]] && break
 		sleep 2
 	done
-	[[ -n ${token} ]] && [[ -n ${uploaded} ]] && [[ -n ${ca_hash} ]] \
+	[[ -n ${token} ]] && [[ -n ${certs_uploaded} ]] && [[ -n ${ca_hash} ]] \
 		|| die "could not extract the join credentials (token/certificate key/CA hash)"
 	printf '%s' "${token}" > "${CLUSTER_DIR}/token"
 	printf '%s' "${cert_key}" > "${CLUSTER_DIR}/cert-key"
@@ -498,13 +505,13 @@ join_control_plane() {
 	[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
 		&& [[ -n ${JOIN_CERT_KEY:-} ]] \
 		|| die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY"
-	local token="${JOIN_TOKEN}" ca_hash="${JOIN_CA_HASH}" endpoint="${JOIN_API_ENDPOINT}"
-	log "joining ${NODE_NAME} as a control-plane node via ${endpoint}"
+	local join_token="${JOIN_TOKEN}" join_hash="${JOIN_CA_HASH}" join_endpoint="${JOIN_API_ENDPOINT}"
+	log "joining ${NODE_NAME} as a control-plane node via ${join_endpoint}"
 	import_k8s_images
 	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
-		kubeadm join "${endpoint}" \
-		--token "${token}" \
-		--discovery-token-ca-cert-hash "sha256:${ca_hash}" \
+		kubeadm join "${join_endpoint}" \
+		--token "${join_token}" \
+		--discovery-token-ca-cert-hash "sha256:${join_hash}" \
 		--certificate-key "${JOIN_CERT_KEY}" \
 		--control-plane \
 		--node-name "${NODE_NAME}" \
@@ -586,13 +593,13 @@ run_worker() {
 		fi
 		[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
 			|| die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT"
-		local token="${JOIN_TOKEN}" ca_hash="${JOIN_CA_HASH}" endpoint="${JOIN_API_ENDPOINT}"
-		log "joining ${NODE_NAME} to ${endpoint}"
+		local join_token="${JOIN_TOKEN}" join_hash="${JOIN_CA_HASH}" join_endpoint="${JOIN_API_ENDPOINT}"
+		log "joining ${NODE_NAME} to ${join_endpoint}"
 		import_k8s_images
 		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
-			kubeadm join "${endpoint}" \
-			--token "${token}" \
-			--discovery-token-ca-cert-hash "sha256:${ca_hash}" \
+			kubeadm join "${join_endpoint}" \
+			--token "${join_token}" \
+			--discovery-token-ca-cert-hash "sha256:${join_hash}" \
 			--node-name "${NODE_NAME}" \
 			--cri-socket=unix:///run/containerd/containerd.sock \
 			--ignore-preflight-errors=all
@@ -607,7 +614,7 @@ run_worker() {
 # taken out of rotation. The stats page on :8404 shows backend state.
 run_lb() {
 	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs"
-	local cfg=/etc/haproxy/haproxy.cfg i=1 backend_ip
+	local haproxy_cfg=/etc/haproxy/haproxy.cfg backend_idx=1 backend_ip
 	mkdir -p /etc/haproxy
 	{
 		# HAPROXY instead of EOF marks this as config: lint.sh checks
@@ -635,8 +642,8 @@ backend apiservers
 	option tcp-check
 HAPROXY
 		for backend_ip in ${LB_BACKENDS}; do
-			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${i}" "${backend_ip}"
-			i=$((i + 1))
+			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${backend_idx}" "${backend_ip}"
+			backend_idx=$((backend_idx + 1))
 		done
 		cat << 'HAPROXY'
 
@@ -647,9 +654,9 @@ frontend stats
 	stats enable
 	stats uri /
 HAPROXY
-	} > "${cfg}"
+	} > "${haproxy_cfg}"
 	log "load balancer for: ${LB_BACKENDS}"
-	exec haproxy -f "${cfg}"
+	exec haproxy -f "${haproxy_cfg}"
 }
 
 run_kubectl() {

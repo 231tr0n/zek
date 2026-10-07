@@ -224,10 +224,10 @@ NODE_ARGS=(
 # dies before any container is created.
 mount_entries=()
 [[ -n ${MOUNTS} ]] && read -r -a mount_entries <<< "${MOUNTS}"
-for mount in "${mount_entries[@]}"; do
-	[[ ${mount} =~ ^[^:]+:/[^:]+(:[^:]*)?$ ]] \
-		|| die "invalid mount '${mount}' (expected host-path:container-path[:options]; check --mounts/ZEK_MOUNTS)"
-	NODE_ARGS+=(-v "${mount}")
+for mount_spec in "${mount_entries[@]}"; do
+	[[ ${mount_spec} =~ ^[^:]+:/[^:]+(:[^:]*)?$ ]] \
+		|| die "invalid mount '${mount_spec}' (expected host-path:container-path[:options]; check --mounts/ZEK_MOUNTS)"
+	NODE_ARGS+=(-v "${mount_spec}")
 done
 
 net_exists() { docker network inspect "${NET_NAME}" > /dev/null 2>&1; }
@@ -247,10 +247,10 @@ ensure_net() {
 		# makes a retry after a failed create work. An explicit --subnet
 		# that disagrees would silently derive wrong container IPs later,
 		# so refuse it instead.
-		local have
-		have=$(net_subnet_of)
-		[[ -z ${SUBNET} || ${SUBNET} == "${have}" ]] \
-			|| die "cluster ${CLUSTER} uses subnet ${have}, not --subnet ${SUBNET}; pass --subnet ${have} or destroy the cluster"
+		local existing_subnet
+		existing_subnet=$(net_subnet_of)
+		[[ -z ${SUBNET} || ${SUBNET} == "${existing_subnet}" ]] \
+			|| die "cluster ${CLUSTER} uses subnet ${existing_subnet}, not --subnet ${SUBNET}; pass --subnet ${existing_subnet} or destroy the cluster"
 		return 0
 	fi
 	docker network create --driver bridge --subnet "$1" "${NET_NAME}" > /dev/null \
@@ -483,7 +483,7 @@ require_host_ip() { # <ip> <cidr> <label>
 
 create_cluster() {
 	local workers="$1" masters="$2"
-	local net_subnet subnet_prefix lb_ip endpoint master_addr i backends=""
+	local net_subnet subnet_base lb_ip api_endpoint master_addr i backends=""
 	local have_net=0
 
 	# Reuse this cluster's own network when it exists (retry after a
@@ -499,12 +499,12 @@ create_cluster() {
 	else
 		net_subnet="$(pick_subnet)"
 	fi
-	subnet_prefix="${net_subnet%.*}"
-	MASTER_IP="${MASTER_IP:-${subnet_prefix}.2}"
-	lb_ip="${subnet_prefix}.10"
-	endpoint="${MASTER_IP}:6443"
+	subnet_base="${net_subnet%.*}"
+	MASTER_IP="${MASTER_IP:-${subnet_base}.2}"
+	lb_ip="${subnet_base}.10"
+	api_endpoint="${MASTER_IP}:6443"
 	if [[ ${masters} -gt 1 ]]; then
-		endpoint="${lb_ip}:6443"
+		api_endpoint="${lb_ip}:6443"
 	fi
 	# Every address docker will be asked to allocate is validated against
 	# the subnet before the network exists: docker only rejects
@@ -543,15 +543,15 @@ create_cluster() {
 	fi
 
 	log "creating ${MASTER_NAME} (${MASTER_IP})"
-	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" --env "API_ENDPOINT=${endpoint}"
+	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" --env "API_ENDPOINT=${api_endpoint}"
 	wait_for_api
 	read_join_credentials
 
-	local master_ip
+	local extra_master_ip
 	for i in $(seq 2 "${masters}"); do
-		master_ip=$(master_node_ip "${i}")
-		log "creating ${CLUSTER}-master-${i} (${master_ip}) as control-plane"
-		run_node "${CLUSTER}-master-${i}" master --ip "${master_ip}" \
+		extra_master_ip=$(master_node_ip "${i}")
+		log "creating ${CLUSTER}-master-${i} (${extra_master_ip}) as control-plane"
+		run_node "${CLUSTER}-master-${i}" master --ip "${extra_master_ip}" \
 			--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
 		wait_for_master_ready "${CLUSTER}-master-${i}"
 		wait_for_nodes "${i}"

@@ -69,8 +69,10 @@ fi
 status=0
 
 # Every check runs in the background with its own output buffer so the
-# report keeps launch order while the tools still run in parallel.
+# report keeps launch order while the tools still run in parallel. The
+# EXIT trap owns the buffers: an early errexit death still removes them.
 check_pids=() check_bufs=()
+trap 'rm -f "${check_bufs[@]}"' EXIT
 run_check() { # desc cmd...
 	local desc=$1 buf
 	shift
@@ -90,7 +92,9 @@ wait_checks() {
 	local i
 	for i in "${!check_pids[@]}"; do
 		wait "${check_pids[i]}" || status=1
-		cat "${check_bufs[i]}"
+		# A failed cat must not abort the report loop (hiding later
+		# checks) under errexit; the status is already recorded above.
+		cat "${check_bufs[i]}" || status=1
 		rm -f "${check_bufs[i]}"
 	done
 	check_pids=() check_bufs=()
@@ -108,20 +112,21 @@ done
 # against, and another yamlfmt on PATH (e.g. mvdan.cc/yamlfmt) would
 # silently format differently from CI. The probe exercises that exact
 # profile the way the checks below call it.
-if ! yprobe=$(printf 'a: 1\n' | yamlfmt -o=kyaml 2>&1) || [[ ${yprobe} != *'{'* ]]; then
-	ybin=$(command -v yamlfmt)
+if ! yamlfmt_probe=$(printf 'a: 1\n' | yamlfmt -o=kyaml 2>&1) || [[ ${yamlfmt_probe} != *'{'* ]]; then
+	yamlfmt_bin=$(command -v yamlfmt)
 	printf '[lint] yamlfmt is not sigs.k8s.io/yaml/yamlfmt (k8s tool with -o=kyaml):\n' >&2
-	printf '[lint]   %s: %s\n' "${ybin}" "${yprobe}" >&2
+	printf '[lint]   %s: %s\n' "${yamlfmt_bin}" "${yamlfmt_probe}" >&2
 	printf '[lint]   install: go install sigs.k8s.io/yaml/yamlfmt@latest\n' >&2
 	exit 1
 fi
 
-# prettier: local binary if present, otherwise the latest version via npx
-# (CI relies on this npx fallback, so no global npm install is needed).
+# prettier: local binary if present, otherwise a pinned version via npx
+# (CI relies on this npx fallback, so no global npm install is needed;
+# floating latest could reformat README.md overnight with zero diff).
 if command -v prettier > /dev/null 2>&1; then
 	prettier_cmd=(prettier)
 elif command -v npx > /dev/null 2>&1; then
-	prettier_cmd=(npx --yes prettier)
+	prettier_cmd=(npx --yes prettier@3.9.6)
 else
 	printf '[lint] missing tool: prettier (install prettier or node/npx)\n' >&2
 	exit 1
@@ -157,10 +162,11 @@ sh_files=() md_files=() yaml_files=() docker_files=()
 [[ -n ${yaml_list} ]] && mapfile -t yaml_files <<< "${yaml_list}"
 [[ -n ${docker_list} ]] && mapfile -t docker_files <<< "${docker_list}"
 
-# awk program printing one heredoc body to stdout: -s is the opener line,
-# -d the delimiter line, -u=1 for quoted openers (no shell escaping to
-# strip; an unquoted heredoc's \$ is a literal dollar for the shell, so
-# the YAML parser must see plain $).
+# awk program printing one heredoc body to stdout. -s is the opener line
+# number, -d the delimiter line, -u=1 for quoted openers (no shell
+# escaping to strip; in an unquoted heredoc the shell turns `\$` into a
+# literal dollar, so the YAML parser must see plain $ - the only shell
+# expansion emulated here, which is all the YAML bodies need).
 body_awk=$(
 	cat << 'AWK'
 	NR > s && $0 == d { exit }
@@ -173,13 +179,17 @@ AWK
 # for every heredoc. Mirrors the shell: comment lines are never openers
 # (bash ignores them), a trailing "# ..." comment after code is stripped
 # before matching (so `echo hi # << EOF` is not an opener), a here-string
-# (<<<) can never match, and the terminator line must equal the delimiter
-# exactly - `<<-` (tab-indented terminators) is not supported and fails
-# loudly as an unterminated heredoc, as do `<< -EOF` (spaced dash) and two
-# openers on one line. A backslash before the delimiter (`<<\EOF`,
-# `<< \EOF`) quotes it like a quoted opener and is accepted. Callers must
-# check the status: an unterminated heredoc exits 1 and must not degrade
-# into an empty marker stream that the checks below would pass vacuously.
+# (`<<<`, which consumes the rest of its line) is cut off before matching
+# so `cat <<< "hello"` is never an opener, and the terminator line must
+# equal the delimiter exactly - `<<-` (tab-indented terminators) is not
+# supported and fails loudly as an unterminated heredoc, as do
+# `<< -EOF` (spaced dash) and two openers on one line. A backslash before
+# the delimiter (`<<\EOF`, `<< \EOF`) quotes it like a quoted opener and
+# is accepted. Limitation, by design: `<< NAME` inside a quoted string
+# literal (e.g. `echo "<< EOF"`) still reads as an opener - keep such
+# text out of shell strings. Callers must check the status: an
+# unterminated heredoc exits 1 and must not degrade into an empty marker
+# stream that the checks below would pass vacuously.
 list_heredocs() {
 	local delim=$1 src
 	shift
@@ -188,6 +198,7 @@ list_heredocs() {
 			/^[ \t]*#/ && !inbody { next }
 			!inbody {
 				line = $0
+				sub(/<<<.*$/, "", line)
 				if (match(line, /[ \t]#/)) {
 					pre = substr(line, 1, RSTART)
 					if (pre ~ /<</) {
@@ -198,6 +209,13 @@ list_heredocs() {
 				}
 				if (line ~ /<<[ \t]+-/) {
 					printf "spaced-dash heredoc not supported: %s:%d\n", src, FNR > "/dev/stderr"
+					exit 1
+				}
+				# Opener-shaped only: a bare `<<-` inside a regex
+				# literal or prose (like the opener pattern of this
+				# very awk program below) is not a heredoc.
+				if (line ~ /<<-[ \t]*[\047"]?[A-Za-z_]/) {
+					printf "heredoc with a leading dash is not supported, use plain delimiter: %s:%d\n", src, FNR > "/dev/stderr"
 					exit 1
 				}
 				if (match(line, /<<-?[ \t]*\\?[\047"]?[A-Za-z_][A-Za-z0-9_]*/)) {
@@ -245,26 +263,33 @@ lint_heredocs_yaml() {
 	fi
 	while IFS=: read -r src start quoted _name; do
 		[[ -n ${src} ]] || continue
-		if ! body=$(awk -v s="${start}" -v d=EOF -v u="${quoted}" "${body_awk}" "${src}"); then
+		# The trailing `&& printf x` keeps command substitution from eating
+		# significant trailing blank lines: without the sentinel a body
+		# with a stray blank line before its terminator would compare
+		# equal to canonical output and pass vacuously.
+		if ! body=$(awk -v s="${start}" -v d=EOF -v u="${quoted}" "${body_awk}" "${src}" && printf x); then
 			printf '%s:%s: cannot read heredoc body\n' "${src}" "${start}" >&2
 			rc=1
 			continue
 		fi
+		body=${body%x}
 		if [[ -z ${body} ]]; then
 			printf '%s:%s: empty EOF heredoc (no YAML body to lint)\n' "${src}" "${start}" >&2
 			rc=1
 			continue
 		fi
-		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1); then
+		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1 && printf x); then
+			canon=${canon%x}
 			printf '%s:%s: not parseable as YAML for formatting:\n%s\n' \
 				"${src}" "${start}" "${canon}" >&2
 			rc=1
 			continue
 		fi
-		if [[ ${body} != "${canon}" ]]; then
-			printf '%s:%s: heredoc is not canonical yamlfmt kyaml output (diff: - source, + yamlfmt -o=kyaml):\n' \
+		canon=${canon%x}
+		if ! cmp -s <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}"); then
+			printf '%s:%s: heredoc is not canonical yamlfmt kyaml output (diff -u: - source, + yamlfmt -o=kyaml):\n' \
 				"${src}" "${start}" >&2
-			diff <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}") | sed 's/^/  /' >&2 || true
+			diff -u --label=source --label='yamlfmt -o=kyaml' <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}") | sed 's/^/  /' >&2 || true
 			rc=1
 		fi
 	done <<< "${markers}"
@@ -300,7 +325,10 @@ lint_heredoc_coverage() {
 
 # Every AWK heredoc body must parse as an awk program. The body_awk program
 # in this file is what every check above reads heredoc bodies with, so a
-# typo in it would otherwise corrupt the marker stream itself.
+# typo in it would otherwise corrupt the marker stream itself. Note this
+# executes the body with empty stdin to do it: a program that is only
+# meaningful with input (or one that exits nonzero from a BEGIN block)
+# would be misreported - the only AWK heredoc here is side-effect-free.
 lint_heredoc_awk() {
 	local src start quoted _name body err markers rc=0
 	# shellcheck disable=SC2310
@@ -331,14 +359,17 @@ lint_heredoc_awk() {
 # disk. Only disable= directives are checked here; source= directives
 # (e.g. for runtime-generated files) are out of scope.
 lint_shellcheck_directives() {
-	local file lineno rc=0
+	local file lineno directive_line rc=0 codes
 	for file in "$@"; do
 		while IFS=: read -r lineno _; do
 			[[ -n ${lineno} ]] || continue
+			directive_line=$(sed -n "${lineno}p" "${file}") || continue
+			codes=$(grep -oE 'SC[0-9]+' <<< "${directive_line}" | paste -sd, - || true)
+			[[ -n ${codes} ]] || continue
 			# shellcheck disable=SC2310
-			if ! required_shellcheck_codes "${file}" "${lineno}"; then
-				printf '%s:%s: unnecessary shellcheck disable (none of its codes fire without it)\n' \
-					"${file}" "${lineno}" >&2
+			if ! required_shellcheck_codes "${file}" "${lineno}" "${codes}"; then
+				printf '%s:%s: unnecessary shellcheck disable (%s never fires without it)\n' \
+					"${file}" "${lineno}" "${codes}" >&2
 				rc=1
 			fi
 		done < <(grep -nE '^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]+disable=' "${file}" || true)
@@ -346,14 +377,12 @@ lint_shellcheck_directives() {
 	return "${rc}"
 }
 
-# required_shellcheck_codes FILE LINENO - true when removing the disable
-# directive on LINENO makes shellcheck report one of its listed codes.
+# required_shellcheck_codes FILE LINENO CODES - true when removing the
+# disable directive on LINENO makes shellcheck report one of CODES
+# (comma-separated).
 required_shellcheck_codes() {
-	local file=$1 lineno=$2 line codes pattern output
-	line=$(sed -n "${lineno}p" "${file}")
-	codes=$(printf '%s\n' "${line}" | sed -nE 's/.*disable=([A-Za-z0-9, ]+).*/\1/p' | tr -d ' ')
-	[[ -n ${codes} ]] || return 0
-	pattern=$(printf '%s\n' "${codes}" | sed 's/,/|/g')
+	local file=$1 lineno=$2 codes=$3 pattern output
+	pattern=${codes//,/|}
 	if ! output=$(sed "${lineno}d" "${file}" | shellcheck -o all -x -f gcc - 2>&1); then
 		printf '%s\n' "${output}" | grep -qE "\[(${pattern})\]"
 	else
@@ -414,7 +443,7 @@ lint_haproxy_style() { # src... - whitespace rules for the assembled config
 	if ! printf '%s\n' "${cfg}" | awk '
 		/^\t* +/ { printf "%d: space indentation (tabs only)\n", NR; bad = 1 }
 		/[ \t]+$/ { printf "%d: trailing whitespace\n", NR; bad = 1 }
-		END { exit bad }
+		END { exit (bad ? 1 : 0) }
 	'; then
 		printf 'haproxy style: fix the lines above (run_lb in entrypoint.sh)\n' >&2
 		return 1
@@ -471,16 +500,16 @@ lint_dockerfile_heredocs() { # src...
 # yamlfmt -d always exits 0, even on a diff, so compare its stdout to
 # the file byte for byte instead.
 lint_yamlfmt() { # files...
-	local f out rc=0
-	for f in "$@"; do
-		if ! out=$(yamlfmt -o=kyaml "${f}" 2>&1); then
-			printf '%s: not parseable as YAML:\n%s\n' "${f}" "${out}" >&2
+	local yaml_file out rc=0
+	for yaml_file in "$@"; do
+		if ! out=$(yamlfmt -o=kyaml "${yaml_file}" 2>&1); then
+			printf '%s: not parseable as YAML:\n%s\n' "${yaml_file}" "${out}" >&2
 			rc=1
 			continue
 		fi
-		if ! cmp -s <(printf '%s\n' "${out}") "${f}"; then
-			printf '%s: not canonical yamlfmt output (diff: < yamlfmt, > file):\n' "${f}" >&2
-			diff <(printf '%s\n' "${out}") "${f}" | sed 's/^/  /' >&2 || true
+		if ! cmp -s <(printf '%s\n' "${out}") "${yaml_file}"; then
+			printf '%s: not canonical yamlfmt output (diff: < yamlfmt, > file):\n' "${yaml_file}" >&2
+			diff <(printf '%s\n' "${out}") "${yaml_file}" | sed 's/^/  /' >&2 || true
 			rc=1
 		fi
 	done
@@ -507,8 +536,8 @@ if [[ ${#yaml_files[@]} -gt 0 ]]; then
 	run_check "yamlfmt (${#yaml_files[@]} yml/yaml)" lint_yamlfmt "${yaml_files[@]}"
 fi
 if [[ ${#docker_files[@]} -gt 0 ]]; then
-	for f in "${docker_files[@]}"; do
-		run_check "dockerfmt -s -n (${f})" dockerfmt -s -n --check "${f}"
+	for dockerfile in "${docker_files[@]}"; do
+		run_check "dockerfmt -s -n (${dockerfile})" dockerfmt -s -n --check "${dockerfile}"
 	done
 	run_check "RUN heredoc shell (${#docker_files[@]} Dockerfile)" lint_dockerfile_heredocs "${docker_files[@]}"
 fi
