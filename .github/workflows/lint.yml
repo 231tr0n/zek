@@ -20,22 +20,23 @@
   jobs: {
     lint: {
       runs-on: "ubuntu-latest",
-      # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
-      # so CI and local runs agree. Pinned by major (not :latest) so the
-      # toolchain cannot drift overnight; bump via Dependabot. The go tools
-      # below float latest (Dependabot cannot see them, so a toolchain
-      # breakage is fixed here by hand). prettier resolves via npx (latest
-      # in lint.sh); yamlfmt
+      # Fedora container for the dnf packages (shellcheck, golang, ...) so CI
+      # and local runs agree. shfmt rides go install like the other floaters:
+      # its Fedora package is orphaned with no F45 build. Everything floats
+      # :latest on purpose (Dependabot sees none of the go tools, nor the
+      # workflow `container:` image), so a toolchain breakage is fixed here
+      # by hand. prettier resolves via npx (latest in lint.sh); yamlfmt
       # (sigs.k8s.io/yaml) formats the repo YAML files and lints the
       # inline heredoc configs; actionlint checks this workflow plus the
       # shell of every run: block.
-      container: "fedora:45",
+      container: "fedora:latest",
       timeout-minutes: 15,
       steps: [{
         name: "Install lint tools",
         run: "\
            set -euo pipefail\n\
-           dnf install -y git shellcheck shfmt nodejs npm golang haproxy\n\
+           dnf install -y git shellcheck nodejs npm golang haproxy\n\
+           go install mvdan.cc/sh/v3/cmd/shfmt@latest\n\
            go install github.com/reteps/dockerfmt@latest\n\
            go install sigs.k8s.io/yaml/yamlfmt@latest\n\
            go install github.com/rhysd/actionlint/cmd/actionlint@latest\n\

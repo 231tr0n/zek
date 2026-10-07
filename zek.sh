@@ -575,7 +575,8 @@ create_cluster() {
 
 # The topology is fixed at creation time: restart exactly the containers
 # that exist (load balancer first, then masters, then workers), warning
-# when the requested sizes differ from what was created.
+# when the requested sizes differ from what was created. e2e asserts this
+# start order (multi-master, persistence).
 restart_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
 	local existing_masters existing_workers

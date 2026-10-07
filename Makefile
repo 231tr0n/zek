@@ -34,12 +34,13 @@ build-nocache: ## Build, forcing the image preload step to re-run
 	$(call build_image,--no-cache)
 
 # Keep in sync with .github/workflows/lint.yml (same image, packages and go installs).
-lint: ## Run ./lint.sh in a fedora:45 container, exactly like CI
+lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	$(DOCKER) run --rm \
 		-v "$(CURDIR):/repo:z" -w /repo \
-		fedora:45 bash -c ' \
+		fedora:latest bash -c ' \
 			set -euo pipefail; \
-			dnf install -y git shellcheck shfmt nodejs npm golang haproxy; \
+			dnf install -y git shellcheck nodejs npm golang haproxy; \
+			go install mvdan.cc/sh/v3/cmd/shfmt@latest; \
 			go install github.com/reteps/dockerfmt@latest; \
 			go install sigs.k8s.io/yaml/yamlfmt@latest; \
 			go install github.com/rhysd/actionlint/cmd/actionlint@latest; \

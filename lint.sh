@@ -204,8 +204,8 @@ list_heredocs() {
 				line = $0
 				# A here-string later in the line would swallow a real
 				# heredoc opener in the cut below, so fail loudly
-				# instead (index() keeps this check itself from
-				# matching its own source line).
+				# instead (self-proving: lint.sh lints itself here, so
+				# a self-match would fail the coverage check loudly).
 				hs_at = index(line, "<<<")
 				if (hs_at && index(substr(line, hs_at + 3), "<<")) {
 					printf "here-string and heredoc on one line not supported: %s:%d\n", src, FNR > "/dev/stderr"

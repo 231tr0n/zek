@@ -18,18 +18,5 @@
       prefix: "chore",
       include: "scope",
     },
-  }, {
-    # Owns the fedora major pin used by the lint container (lint.yml) and
-    # `make lint` (Makefile); the Makefile's ALPINE_VERSION is owned by
-    # update-versions.yml instead (an ARG-substituted FROM is invisible here).
-    package-ecosystem: "docker",
-    directory: "/",
-    schedule: {
-      interval: "weekly",
-    },
-    commit-message: {
-      prefix: "chore",
-      include: "scope",
-    },
   }],
 }

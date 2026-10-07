@@ -54,7 +54,8 @@
 #                  incl. node `--` and the kubectl wait timeout),
 #                  --subnet/--master-ip/--pod-cidr functional, up
 #                  shorthand vs fixed topology (workers and masters),
-#                  --timeout failing fast, clean recreating the worker
+#                  --timeout failing fast (a dead API and a node that never
+#                  registers), clean recreating the worker
 #                  (new Node UID) with --image/--dns/--pod-cidr/--mounts,
 #                  and destroy removing the containers and network
 #   persistence    flannel + a workload pinned to the single worker, then
@@ -65,10 +66,11 @@
 #                  and coredns rolled out again after each cycle
 #   recovery       crash-recovery paths: a NO_HOST_MODULES node, an
 #                  interrupted worker join, lost master credentials (the
-#                  republish), a kubectl wait for the config, and two
-#                  interrupted control-plane inits (each wipes and
-#                  re-inits; an interrupted control-plane join is covered
-#                  in multi-master)
+#                  republish), a kubectl wait for the config, an interrupted
+#                  control-plane init/join plus an interrupted control-plane
+#                  setup (each wipes and re-inits; an interrupted
+#                  control-plane join on a second master is covered in
+#                  multi-master instead)
 #
 # Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its own
 # cluster and pre-allocated subnet, but they share one scratch dir -
@@ -325,6 +327,14 @@ assert_die() { # desc want-substring cmd args...
 		|| fail "${desc}: want an error mentioning '${want}', got: ${got}"
 }
 
+# Assert restart_cluster's dependency-safe start order from an `up` run's
+# log: load balancer first, then masters in index order, then workers.
+assert_restart_order() { # cluster want-order up-output
+	local cluster=$1 want=$2 up_out=$3 got
+	got=$(printf '%s\n' "${up_out}" | grep -oE "starting ${cluster}-[a-z0-9-]+" | paste -sd' ' - || true)
+	assert_eq "${cluster}: restart order" "${want}" "${got}"
+}
+
 wait_for() { # desc timeout-secs func args...
 	local desc=$1 timeout=$2 deadline
 	shift 2
@@ -536,6 +546,16 @@ kubelet_failswapon() { # container
 # fails the check even though the marker was there.
 log_has() { # container text
 	docker logs "$1" 2>&1 | grep -cF "$2" > /dev/null
+}
+
+# More occurrences of fixed TEXT in the container log than MIN-COUNT:
+# docker logs is cumulative across restarts, so log_has would also match
+# a line from the initial start. Use this when the restart itself must
+# have logged again.
+log_count_grew() { # container text min-count
+	local count
+	count=$(docker logs "$1" 2>&1 | grep -cF "$2" || true)
+	[[ ${count} -gt $3 ]]
 }
 
 # The master published a complete credential set (admin.conf is last).
@@ -887,6 +907,13 @@ diag() {
 		[[ -n ${container} ]] || continue
 		log "----- last 30 log lines of ${container} -----"
 		docker logs --tail 30 "${container}" 2>&1 | tail -30 || true
+		# Post-mortem for a node that never initialized: how many times it
+		# restarted (crash-loop vs one slow attempt), what kubeadm did, and
+		# what state /etc/kubernetes was left in (kubeadm reset gaps show
+		# up as leftover files here).
+		docker inspect -f 'restart count: {{.RestartCount}}' "${container}" 2> /dev/null || true
+		docker exec "${container}" sh -c 'tail -40 /var/log/kubeadm-init.log /var/log/kubeadm-join.log 2>/dev/null' || true
+		docker exec "${container}" ls -la /etc/kubernetes/ /etc/kubernetes/pki/ /etc/cluster/ 2> /dev/null || true
 	done <<< "${container_list}"
 	log "=============== end diagnostics for ${cluster} ================"
 }
@@ -1007,9 +1034,9 @@ EOF
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 2>&1) \
 		|| fail "${cluster}: up after down failed: ${out}"
-	assert_eq "${cluster}: restart order" \
+	assert_restart_order "${cluster}" \
 		"starting ${cluster}-lb starting ${cluster}-master-1 starting ${cluster}-master-2 starting ${cluster}-master-3 starting ${cluster}-worker-1" \
-		"$(printf '%s\n' "${out}" | grep -oE "starting ${cluster}-[a-z0-9-]+" | paste -sd' ' - || true)"
+		"${out}"
 	wait_for "${cluster}: control plane readyz after down/up" 120 readyz_ok "${cluster}"
 	assert_cmd "${cluster}: node count after down/up" 4 node_count "${cluster}"
 	# shellcheck disable=SC2310
@@ -1022,7 +1049,7 @@ EOF
 		|| fail "${cluster}: haproxy.cfg misses option tcp-check"
 	# One backend server line per master, on 6443 with health checks.
 	assert_cmd "${cluster}: haproxy backend servers" 3 \
-		docker exec "${cluster}-lb" sh -c 'grep -cE "^[[:space:]]*server cp[0-9]+ " /etc/haproxy/haproxy.cfg'
+		docker exec "${cluster}-lb" sh -c 'grep -cE "^[[:space:]]*server cp[0-9]+ " /etc/haproxy/haproxy.cfg || true'
 	# The stats page the image HEALTHCHECK probes must serve, and the live
 	# file must pass the same `haproxy -c` lint.sh runs on the heredoc.
 	docker exec "${cluster}-lb" wget -qO- --timeout=10 http://127.0.0.1:8404/ 2> /dev/null \
@@ -1210,7 +1237,7 @@ test_cilium() {
 # and `zek down`/`up` cycles below exercise. No test reboots the host
 # (it would kill the parallel jobs).
 test_persistence() {
-	local cluster=$1 start_uids start_web out
+	local cluster=$1 start_uids start_web out purges_before
 	up "${cluster}" 1 1
 	log "${cluster}: installing flannel + workload"
 	apply_flannel "${cluster}"
@@ -1316,11 +1343,14 @@ EOF
 	assert_state "worker restart"
 
 	log "${cluster}: docker restart the master"
+	# Count first: the purge line is also logged on the initial start, so
+	# matching its mere existence would pass without the restart purging.
+	purges_before=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "purging stale containers" || true)
 	docker restart "${cluster}-master-1" > /dev/null
 	# node_setup purges dead CRI sandboxes on every start so the new
 	# kubelet never reattaches to them (cleanup_stale_cri).
-	wait_for "${cluster}: stale CRI purged on restart" 60 log_has "${cluster}-master-1" \
-		"purging stale containers from previous node instance"
+	wait_for "${cluster}: stale CRI purged on restart" 60 log_count_grew "${cluster}-master-1" \
+		"purging stale containers from previous node instance" "${purges_before}"
 	# The credentials were complete, so the resume path must not rotate
 	# them - the master-1 twin of the join-master guard in multi-master.
 	# shellcheck disable=SC2310
@@ -1343,9 +1373,9 @@ EOF
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 2>&1) \
 		|| fail "${cluster}: up after down failed: ${out}"
-	assert_eq "${cluster}: restart order" \
+	assert_restart_order "${cluster}" \
 		"starting ${cluster}-master-1 starting ${cluster}-worker-1" \
-		"$(printf '%s\n' "${out}" | grep -oE "starting ${cluster}-[a-z0-9-]+" | paste -sd' ' - || true)"
+		"${out}"
 	assert_state "zek down/up"
 
 	log "${cluster}: kubelet crash on worker-1 - the supervisor restarts it"
@@ -1412,7 +1442,7 @@ test_single_node() {
 	# The unpack entry must name this host's arch (start_containerd writes
 	# it from uname -m); a wrong arch fails every CRI pull with
 	# "no unpack platforms defined".
-	docker exec "${cluster}-master-1" grep -q "platform = \"linux/${ARCH}\"" /etc/containerd/config.toml \
+	docker exec "${cluster}-master-1" grep -qF "platform = \"linux/${ARCH}\"" /etc/containerd/config.toml \
 		|| fail "${cluster}: containerd unpack_config misses linux/${ARCH}"
 	docker exec "${cluster}-master-1" grep -q "bin_dirs" /etc/containerd/config.toml \
 		|| fail "${cluster}: containerd bin_dirs missing (CNI search path)"
@@ -1547,6 +1577,24 @@ test_single_node() {
 	wait_for "${cluster}: kubelet supervised back" 60 kubelet_running "${cluster}-master-1"
 	wait_for "${cluster}: still healthy after the kubelet restart" 120 \
 		health_is "${cluster}-master-1" healthy
+	# ...but a kubelet that stays down must flip the verdict: STOP freezes
+	# it in place (a kill would just be supervised back, as proven above),
+	# the 3-strike probe window turns unhealthy, and CONT resumes it. This
+	# is the persistent branch of "health tracks daemons, not the cluster".
+	log "${cluster}: a stopped kubelet turns the HEALTHCHECK unhealthy"
+	docker exec "${cluster}-master-1" sh -c 'kill -STOP $(pgrep -f "[/]usr/local/bin/kubelet")'
+	wait_for "${cluster}: master unhealthy with kubelet stopped" 180 \
+		health_is "${cluster}-master-1" unhealthy
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" status 2>&1) || fail "${cluster}: status failed: ${out}"
+	grep -E "^${cluster}-master-1[[:space:]]+running[[:space:]]+unhealthy$" \
+		<<< "${out}" > /dev/null \
+		|| fail "${cluster}: status misses the unhealthy verdict for a stopped kubelet: ${out}"
+	log "${cluster}: resuming the kubelet turns the HEALTHCHECK healthy"
+	docker exec "${cluster}-master-1" sh -c 'kill -CONT $(pgrep -f "[/]usr/local/bin/kubelet")'
+	wait_for "${cluster}: kubelet resumed" 60 kubelet_running "${cluster}-master-1"
+	wait_for "${cluster}: master healthy after the resume" 120 \
+		health_is "${cluster}-master-1" healthy
 }
 
 # The zek.sh surface no other test reaches: kubectl exec's `--`, flag
@@ -1554,7 +1602,7 @@ test_single_node() {
 # --timeout bound, clean's docker wiring, and a destroy that is asserted
 # instead of merely invoked (the per-job destroy swallows its exit).
 test_smoke() {
-	local cluster=$1 uids_before uids_after out role apiserver_cmd master_ip start_wait
+	local cluster=$1 uids_before uids_after out role master_ip start_wait
 	up "${cluster}" 1 1
 	# status prints the HEALTHCHECK verdict as its own column, so the
 	# master's first successful probe has to land before the read.
@@ -2046,6 +2094,25 @@ EOF
 	zk "${cluster}" up
 	wait_for "${cluster}: control plane readyz after the IP hold" 120 readyz_ok "${cluster}"
 	assert_cmd "${cluster}: node count after the IP hold" 2 node_count "${cluster}"
+
+	# wait_for_nodes must die bounded when a node never registers instead
+	# of hanging: freeze the worker kubelet and delete its Node object, so
+	# the count stays short and a doomed `up` fails fast. The bracket hides
+	# pgrep from itself: a bare pattern also matches the querying shell and
+	# would stop it too.
+	log "${cluster}: up dies when a node never registers"
+	docker exec "${cluster}-worker-1" sh -c 'kill -STOP $(pgrep -f "[/]usr/local/bin/kubelet")'
+	zk "${cluster}" kubectl delete node "${cluster}-worker-1" > /dev/null
+	wait_for "${cluster}: worker-1 unregistered" 60 node_count_is "${cluster}" 1
+	# shellcheck disable=SC2310
+	if out=$(zk "${cluster}" --timeout 5 up 2>&1); then
+		fail "${cluster}: up should have failed with a node missing: ${out}"
+	fi
+	[[ ${out} == *"expected 2 nodes after 5s, saw 1"* ]] \
+		|| fail "${cluster}: wrong error for the missing node: ${out}"
+	docker exec "${cluster}-worker-1" sh -c 'kill -CONT $(pgrep -f "[/]usr/local/bin/kubelet")'
+	wait_for "${cluster}: worker-1 re-registered" "${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 2
+	wait_for "${cluster}: control plane readyz after re-register" 120 readyz_ok "${cluster}"
 
 	# clean on a stopped cluster: evict tolerates the dead control plane
 	# (drain/delete fail open), and the credential read - which needs a

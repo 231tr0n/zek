@@ -159,8 +159,8 @@ preflight_host() {
 		{ [[ ${inotify_limit} -ge 1024 ]] || sysctl -w fs.inotify.max_user_instances=1024 > /dev/null; } 2> /dev/null || true
 	fi
 	# Marked only on the fall-through path: with NO_HOST_MODULES=1 the
-	# early return above leaves it unset, and cleanup then keeps its hands
-	# off the host's modules.
+	# early return above leaves it 0 (the default), and cleanup then keeps
+	# its hands off the host's modules.
 	HOST_SETUP_DONE=1
 }
 
@@ -175,6 +175,8 @@ ensure_resolv_conf() {
 	# NODE_DNS="..."` usage; normally the docker --dns resolv.conf parsed
 	# below provides the upstreams. awk reads the nameserver field only:
 	# a flat grep would also pick up IPs from comments and options.
+	# The loop splits on whitespace on purpose: upstreams is a
+	# space-separated IP list (single env value), never paths.
 	upstream_ips="${NODE_DNS:-}"
 	if [[ -z ${upstream_ips} ]]; then
 		upstream_ips="$(awk '$1 == "nameserver" && $2 !~ /^127\.|^169\.254\./ { print $2 }' /etc/resolv.conf \
@@ -478,8 +480,10 @@ init_control_plane() {
 	# which would dodge the preloaded store and force a live registry pull
 	# on every init - minutes lost on a slow day, fatal under parallel e2e
 	# load. The Dockerfile preloads exactly the binary version, so pinning
-	# here keeps init on the preloaded images.
-	k8s_version="$(kubeadm version -o short)"
+	# here keeps init on the preloaded images. kubeadm must exist (it ships
+	# in the image next to this script); without it nothing below can run,
+	# so die loudly instead of exiting bare under `set -e`.
+	k8s_version="$(kubeadm version -o short)" || die "cannot determine the kubeadm version"
 	# kubeadm runs on CLI flags only, no --config document: its decoder
 	# sniffs each document and parses flow-style YAML as strict JSON,
 	# which fails. kubeadm's own defaults fill everything else (its
@@ -686,7 +690,7 @@ run_kubectl() {
 				sleep 2
 			done
 		fi
-		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found; is the master running?"
+		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found in ${CLUSTER_DIR}; is the master running?"
 		KUBECONFIG="${CLUSTER_DIR}/admin.conf"
 	fi
 	export KUBECONFIG

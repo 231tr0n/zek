@@ -55,6 +55,8 @@ for _ in $(seq 1 60); do
 done
 [ -S /run/containerd/containerd.sock ]
 images=$(kubeadm config images list --kubernetes-version "${KUBERNETES_VERSION}") || exit 1
+# Unquoted split on purpose: the image list is machine-generated refs
+# without spaces, one per line.
 for image in ${images}; do
 	ctr --namespace k8s.io content fetch --platform "linux/${TARGETARCH}" "${image}"
 	ctr --namespace k8s.io images export --platform "linux/${TARGETARCH}" "/opt/zek/images/$(basename "${image}").tar" "${image}"
