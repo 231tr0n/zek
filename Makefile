@@ -15,11 +15,10 @@ TAG       := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-$(BUILD_ID)
 # scripts can pin the combo without tracking the git-based BUILD_ID.
 COMBO_TAG := $(ALPINE_VERSION)-$(KUBERNETES_VERSION)-latest
 
+.PHONY: build build-nocache lint help
+
 # Shared build+tag recipe; $(1) is extra docker build flags (build-nocache
 # passes --no-cache to force the image preload step to re-run).
-
-.PHONY: build build-nocache help
-
 define build_image
 	$(DOCKER) build $(1) -t $(IMAGE):$(TAG) \
 	--build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
@@ -29,10 +28,32 @@ define build_image
 endef
 
 build: ## Build + tag $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
-	$(call build_image,)
+	$(call build_image)
 
 build-nocache: ## Build, forcing the image preload step to re-run
 	$(call build_image,--no-cache)
+
+# Keep in sync with .github/workflows/lint.yml (same image, packages and go installs).
+lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
+	$(DOCKER) run --rm \
+		-v "$(CURDIR):/repo:z" -w /repo \
+		fedora:latest bash -c ' \
+			set -euo pipefail; \
+			dnf install -y git shellcheck nodejs npm golang haproxy; \
+			go install mvdan.cc/sh/v3/cmd/shfmt@latest; \
+			go install github.com/reteps/dockerfmt@latest; \
+			go install sigs.k8s.io/yaml/yamlfmt@latest; \
+			go install github.com/rhysd/actionlint/cmd/actionlint@latest; \
+			export PATH="$$(go env GOPATH)/bin:$$PATH"; \
+			git config --global --add safe.directory "*"; \
+			shellcheck --version | sed -n "2p"; \
+			npx --yes prettier --version; \
+			dockerfmt version; \
+			shfmt --version | sed -n "1p"; \
+			yamlfmt -h | sed -n "1p"; \
+			actionlint --version | sed -n "1p"; \
+			haproxy -v | sed -n "1p"; \
+			./lint.sh'
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'

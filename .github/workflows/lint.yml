@@ -1,32 +1,68 @@
 ---
-name: Lint
-on:
-  workflow_dispatch:
-  workflow_call:
-jobs:
-  lint:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
-    # so CI and local runs agree. dockerfmt/prettier fetch latest on demand.
-    container: fedora:latest
-    timeout-minutes: 15
-    steps:
-      - name: Install lint tools
-        run: |
-          set -euo pipefail
-          dnf install -y git shellcheck shfmt nodejs npm golang
-          go install github.com/reteps/dockerfmt@latest
-          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
-      - name: Allow git in container
-        run: git config --global --add safe.directory '*'
-      - uses: actions/checkout@v7
-      - name: Print tool versions
-        run: |
-          shellcheck --version | sed -n '2p'
-          npx --yes prettier --version
-          dockerfmt version
-          command -v shfmt
-      - name: Lint
-        run: ./lint.sh
+{
+  name: "Lint",
+  "on": {
+    workflow_dispatch: ,
+    workflow_call: ,
+  },
+  # Workflow-level defaults: pin bash for every run: block (the fedora
+  # container below would otherwise use `sh -e`; on ubuntu GitHub already
+  # runs `bash -eo pipefail`) and keep the default token scope read-only
+  # for jobs that do not ask for more.
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
+  jobs: {
+    lint: {
+      runs-on: "ubuntu-latest",
+      # Fedora container for the dnf packages (shellcheck, golang, ...) so CI
+      # and local runs agree. shfmt rides go install like the other floaters:
+      # its Fedora package is orphaned with no F45 build. Everything floats
+      # :latest on purpose (Dependabot sees none of the go tools, nor the
+      # workflow `container:` image), so a toolchain breakage is fixed here
+      # by hand. prettier resolves via npx (latest in lint.sh); yamlfmt
+      # (sigs.k8s.io/yaml) formats the repo YAML files and lints the
+      # inline heredoc configs; actionlint checks this workflow plus the
+      # shell of every run: block.
+      container: "fedora:latest",
+      timeout-minutes: 15,
+      steps: [{
+        name: "Install lint tools",
+        run: "\
+           set -euo pipefail\n\
+           dnf install -y git shellcheck nodejs npm golang haproxy\n\
+           go install mvdan.cc/sh/v3/cmd/shfmt@latest\n\
+           go install github.com/reteps/dockerfmt@latest\n\
+           go install sigs.k8s.io/yaml/yamlfmt@latest\n\
+           go install github.com/rhysd/actionlint/cmd/actionlint@latest\n\
+           echo \"$(go env GOPATH)/bin\" >>\"$GITHUB_PATH\"\n\
+          ",
+      }, {
+        name: "Allow git in container",
+        run: "git config --global --add safe.directory '*'",
+      }, {
+        uses: "actions/checkout@v7",
+      }, {
+        name: "Print tool versions",
+        run: "\
+           set -euo pipefail\n\
+           shellcheck --version | sed -n '2p'\n\
+           npx --yes prettier --version\n\
+           dockerfmt version\n\
+           shfmt --version | sed -n '1p'\n\
+           yamlfmt -h | sed -n '1p'\n\
+           actionlint --version | sed -n '1p'\n\
+           haproxy -v | sed -n '1p'\n\
+          ",
+      }, {
+        name: "Lint",
+        run: "./lint.sh",
+      }],
+    },
+  },
+}
