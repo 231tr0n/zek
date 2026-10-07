@@ -40,9 +40,9 @@ lint: ## Run ./lint.sh in a fedora:45 container, exactly like CI
 		fedora:45 bash -c ' \
 			set -euo pipefail; \
 			dnf install -y git shellcheck shfmt nodejs npm golang haproxy; \
-			go install github.com/reteps/dockerfmt@v0.5.4; \
-			go install sigs.k8s.io/yaml/yamlfmt@v1.6.0; \
-			go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12; \
+			go install github.com/reteps/dockerfmt@latest; \
+			go install sigs.k8s.io/yaml/yamlfmt@latest; \
+			go install github.com/rhysd/actionlint/cmd/actionlint@latest; \
 			export PATH="$$(go env GOPATH)/bin:$$PATH"; \
 			git config --global --add safe.directory "*"; \
 			shellcheck --version | sed -n "2p"; \

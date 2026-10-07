@@ -23,8 +23,9 @@
       # Fedora container: same shellcheck/shfmt packages as Fedora dev systems,
       # so CI and local runs agree. Pinned by major (not :latest) so the
       # toolchain cannot drift overnight; bump via Dependabot. The go tools
-      # below are pinned for the same reason (Dependabot cannot see them).
-      # prettier resolves via npx (pinned in lint.sh); yamlfmt
+      # below float latest (Dependabot cannot see them, so a toolchain
+      # breakage is fixed here by hand). prettier resolves via npx (latest
+      # in lint.sh); yamlfmt
       # (sigs.k8s.io/yaml) formats the repo YAML files and lints the
       # inline heredoc configs; actionlint checks this workflow plus the
       # shell of every run: block.
@@ -35,9 +36,9 @@
         run: "\
            set -euo pipefail\n\
            dnf install -y git shellcheck shfmt nodejs npm golang haproxy\n\
-           go install github.com/reteps/dockerfmt@v0.5.4\n\
-           go install sigs.k8s.io/yaml/yamlfmt@v1.6.0\n\
-           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12\n\
+           go install github.com/reteps/dockerfmt@latest\n\
+           go install sigs.k8s.io/yaml/yamlfmt@latest\n\
+           go install github.com/rhysd/actionlint/cmd/actionlint@latest\n\
            echo \"$(go env GOPATH)/bin\" >>\"$GITHUB_PATH\"\n\
           ",
       }, {
@@ -52,7 +53,7 @@
            shellcheck --version | sed -n '2p'\n\
            npx --yes prettier --version\n\
            dockerfmt version\n\
-           command -v shfmt\n\
+           shfmt --version | sed -n '1p'\n\
            yamlfmt -h | sed -n '1p'\n\
            actionlint --version | sed -n '1p'\n\
            haproxy -v | sed -n '1p'\n\

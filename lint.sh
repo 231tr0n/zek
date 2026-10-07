@@ -120,13 +120,12 @@ if ! yamlfmt_probe=$(printf 'a: 1\n' | yamlfmt -o=kyaml 2>&1) || [[ ${yamlfmt_pr
 	exit 1
 fi
 
-# prettier: local binary if present, otherwise a pinned version via npx
-# (CI relies on this npx fallback, so no global npm install is needed;
-# floating latest could reformat README.md overnight with zero diff).
+# prettier: local binary if present, otherwise the latest via npx (CI
+# relies on this npx fallback, so no global npm install is needed).
 if command -v prettier > /dev/null 2>&1; then
 	prettier_cmd=(prettier)
 elif command -v npx > /dev/null 2>&1; then
-	prettier_cmd=(npx --yes prettier@3.9.6)
+	prettier_cmd=(npx --yes prettier@latest)
 else
 	printf '[lint] missing tool: prettier (install prettier or node/npx)\n' >&2
 	exit 1
@@ -155,7 +154,7 @@ git_list() { # pathspec...
 sh_list=$(git_list '*.sh')
 md_list=$(git_list '*.md')
 yaml_list=$(git_list '*.yml' '*.yaml')
-docker_list=$(git_list 'Dockerfile*' '*Dockerfile*')
+docker_list=$(git_list '*Dockerfile*')
 sh_files=() md_files=() yaml_files=() docker_files=()
 [[ -n ${sh_list} ]] && mapfile -t sh_files <<< "${sh_list}"
 [[ -n ${md_list} ]] && mapfile -t md_files <<< "${md_list}"
@@ -165,8 +164,9 @@ sh_files=() md_files=() yaml_files=() docker_files=()
 # awk program printing one heredoc body to stdout. -s is the opener line
 # number, -d the delimiter line, -u=1 for quoted openers (no shell
 # escaping to strip; in an unquoted heredoc the shell turns `\$` into a
-# literal dollar, so the YAML parser must see plain $ - the only shell
-# expansion emulated here, which is all the YAML bodies need).
+# literal dollar, so the YAML parser must see plain $ - that unescape is
+# the only shell transformation emulated here, other expansions such as
+# ${...} are linted as written, which is all the YAML bodies need).
 body_awk=$(
 	cat << 'AWK'
 	NR > s && $0 == d { exit }
@@ -178,16 +178,20 @@ AWK
 # per closed heredoc. DELIM selects the markers: a delimiter name, or "all"
 # for every heredoc. Mirrors the shell: comment lines are never openers
 # (bash ignores them), a trailing "# ..." comment after code is stripped
-# before matching (so `echo hi # << EOF` is not an opener), a here-string
-# (`<<<`, which consumes the rest of its line) is cut off before matching
-# so `cat <<< "hello"` is never an opener, and the terminator line must
+# before matching (so `echo hi # << EOF` is not an opener), a lone
+# here-string (`<<<`, which consumes the rest of its line) is cut off
+# before matching so `cat <<< "hello"` is never an opener, while a
+# here-string and a heredoc on the same line fail loudly (the cut would
+# otherwise swallow a real opener), and the terminator line must
 # equal the delimiter exactly - `<<-` (tab-indented terminators) is not
 # supported and fails loudly as an unterminated heredoc, as do
 # `<< -EOF` (spaced dash) and two openers on one line. A backslash before
 # the delimiter (`<<\EOF`, `<< \EOF`) quotes it like a quoted opener and
-# is accepted. Limitation, by design: `<< NAME` inside a quoted string
-# literal (e.g. `echo "<< EOF"`) still reads as an opener - keep such
-# text out of shell strings. Callers must check the status: an
+# is accepted. Limitations, by design: `<< NAME` inside a quoted string
+# literal (e.g. `echo "<< EOF"`) still reads as an opener, a `#` inside a
+# quoted string still starts a comment strip, and a numeric delimiter
+# (e.g. `<< 123`) is silently ignored - keep such text out of shell
+# strings. Callers must check the status: an
 # unterminated heredoc exits 1 and must not degrade into an empty marker
 # stream that the checks below would pass vacuously.
 list_heredocs() {
@@ -198,6 +202,15 @@ list_heredocs() {
 			/^[ \t]*#/ && !inbody { next }
 			!inbody {
 				line = $0
+				# A here-string later in the line would swallow a real
+				# heredoc opener in the cut below, so fail loudly
+				# instead (index() keeps this check itself from
+				# matching its own source line).
+				hs_at = index(line, "<<<")
+				if (hs_at && index(substr(line, hs_at + 3), "<<")) {
+					printf "here-string and heredoc on one line not supported: %s:%d\n", src, FNR > "/dev/stderr"
+					exit 1
+				}
 				sub(/<<<.*$/, "", line)
 				if (match(line, /[ \t]#/)) {
 					pre = substr(line, 1, RSTART)
@@ -263,29 +276,31 @@ lint_heredocs_yaml() {
 	fi
 	while IFS=: read -r src start quoted _name; do
 		[[ -n ${src} ]] || continue
-		# The trailing `&& printf x` keeps command substitution from eating
-		# significant trailing blank lines: without the sentinel a body
+		# The trailing sentinel keeps command substitution from eating
+		# significant trailing blank lines: without it a body
 		# with a stray blank line before its terminator would compare
-		# equal to canonical output and pass vacuously.
-		if ! body=$(awk -v s="${start}" -v d=EOF -v u="${quoted}" "${body_awk}" "${src}" && printf x); then
+		# equal to canonical output and pass vacuously. A full marker
+		# line (not a single char) so an error message that happens to
+		# end in the same letter can never be truncated by the strip.
+		if ! body=$(awk -v s="${start}" -v d=EOF -v u="${quoted}" "${body_awk}" "${src}" && printf '\nSENTINEL'); then
 			printf '%s:%s: cannot read heredoc body\n' "${src}" "${start}" >&2
 			rc=1
 			continue
 		fi
-		body=${body%x}
+		body=${body%$'\nSENTINEL'}
 		if [[ -z ${body} ]]; then
 			printf '%s:%s: empty EOF heredoc (no YAML body to lint)\n' "${src}" "${start}" >&2
 			rc=1
 			continue
 		fi
-		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1 && printf x); then
-			canon=${canon%x}
+		if ! canon=$(printf '%s\n' "${body}" | yamlfmt -o=kyaml 2>&1 && printf '\nSENTINEL'); then
+			canon=${canon%$'\nSENTINEL'}
 			printf '%s:%s: not parseable as YAML for formatting:\n%s\n' \
 				"${src}" "${start}" "${canon}" >&2
 			rc=1
 			continue
 		fi
-		canon=${canon%x}
+		canon=${canon%$'\nSENTINEL'}
 		if ! cmp -s <(printf '%s\n' "${body}") <(printf '%s\n' "${canon}"); then
 			printf '%s:%s: heredoc is not canonical yamlfmt kyaml output (diff -u: - source, + yamlfmt -o=kyaml):\n' \
 				"${src}" "${start}" >&2

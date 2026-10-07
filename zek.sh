@@ -86,7 +86,7 @@ require_ipv4() { # <value> cidr|addr <label>
 			hint="expected an IPv4 address like 10.0.0.1"
 			[[ ${value} != */* ]] || die "invalid ${label} '${value}' (${hint})"
 			;;
-		*) die "require_ipv4: unknown kind '${kind}'" ;;
+		*) die "internal error in require_ipv4: unknown kind '${kind}'" ;;
 	esac
 	[[ ${value} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
 		|| die "invalid ${label} '${value}' (${hint})"
@@ -130,56 +130,56 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--cluster)
 			shift
-			[[ $# -gt 0 ]] || die "--cluster needs a cluster name"
+			[[ $# -gt 0 ]] || die "--cluster needs a cluster name (check --cluster/ZEK_CLUSTER)"
 			CLUSTER="$1"
 			shift
 			;;
 		--cluster=*) CLUSTER="${1#*=}" && shift ;;
 		--timeout)
 			shift
-			[[ $# -gt 0 ]] || die "--timeout needs a number of seconds"
+			[[ $# -gt 0 ]] || die "--timeout needs a number of seconds (check --timeout/ZEK_TIMEOUT)"
 			WAIT_TIMEOUT="$1"
 			shift
 			;;
 		--timeout=*) WAIT_TIMEOUT="${1#*=}" && shift ;;
 		--image)
 			shift
-			[[ $# -gt 0 ]] || die "--image needs a value"
+			[[ $# -gt 0 ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
 			IMAGE="$1"
 			shift
 			;;
 		--image=*) IMAGE="${1#*=}" && shift ;;
 		--subnet)
 			shift
-			[[ $# -gt 0 ]] || die "--subnet needs a value"
+			[[ $# -gt 0 ]] || die "--subnet needs a value (check --subnet/ZEK_SUBNET)"
 			SUBNET="$1"
 			shift
 			;;
 		--subnet=*) SUBNET="${1#*=}" && shift ;;
 		--master-ip)
 			shift
-			[[ $# -gt 0 ]] || die "--master-ip needs a value"
+			[[ $# -gt 0 ]] || die "--master-ip needs a value (check --master-ip/ZEK_MASTER_IP)"
 			MASTER_IP="$1"
 			shift
 			;;
 		--master-ip=*) MASTER_IP="${1#*=}" && shift ;;
 		--dns)
 			shift
-			[[ $# -gt 0 ]] || die "--dns needs a value"
+			[[ $# -gt 0 ]] || die "--dns needs a value (check --dns/ZEK_DNS)"
 			DNS="$1"
 			shift
 			;;
 		--dns=*) DNS="${1#*=}" && shift ;;
 		--pod-cidr)
 			shift
-			[[ $# -gt 0 ]] || die "--pod-cidr needs a value"
+			[[ $# -gt 0 ]] || die "--pod-cidr needs a value (check --pod-cidr/ZEK_POD_CIDR)"
 			POD_CIDR="$1"
 			shift
 			;;
 		--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
 		--mounts)
 			shift
-			[[ $# -gt 0 ]] || die "--mounts needs a value"
+			[[ $# -gt 0 ]] || die "--mounts needs a value (check --mounts/ZEK_MOUNTS)"
 			MOUNTS="$1"
 			shift
 			;;
@@ -221,7 +221,9 @@ NODE_ARGS=(
 [[ -n ${POD_CIDR} ]] && NODE_ARGS+=(--env "POD_CIDR=${POD_CIDR}")
 # Extra host bind mounts (ZEK_MOUNTS/--mounts): a space-separated list of
 # host-path:container-path[:options] entries, each validated here so a typo
-# dies before any container is created.
+# dies before any container is created. Space-separated on purpose (it
+# rides a single env var/flag value); paths containing spaces are not
+# supported - use a symlink without spaces instead.
 mount_entries=()
 [[ -n ${MOUNTS} ]] && read -r -a mount_entries <<< "${MOUNTS}"
 for mount_spec in "${mount_entries[@]}"; do
@@ -236,6 +238,7 @@ net_subnet_of() {
 		"${NET_NAME}" 2> /dev/null
 }
 ensure_net() {
+	local new_subnet=$1
 	# First of the many disabled warnings in this file: this call sits on
 	# the left of `if`, where errexit does not propagate, and the tool
 	# flags every such call as a possibly-hidden failure. net_exists is a
@@ -253,8 +256,8 @@ ensure_net() {
 			|| die "cluster ${CLUSTER} uses subnet ${existing_subnet}, not --subnet ${SUBNET}; pass --subnet ${existing_subnet} or destroy the cluster"
 		return 0
 	fi
-	docker network create --driver bridge --subnet "$1" "${NET_NAME}" > /dev/null \
-		|| die "cannot create network ${NET_NAME} with subnet $1 (address space overlapping another network? pass --subnet)"
+	docker network create --driver bridge --subnet "${new_subnet}" "${NET_NAME}" > /dev/null \
+		|| die "cannot create network ${NET_NAME} with subnet ${new_subnet} (address space overlapping another network? pass --subnet/ZEK_SUBNET)"
 }
 
 # First free 172.20.X.0/24 (or --subnet/ZEK_SUBNET when set) so parallel
@@ -288,7 +291,7 @@ pick_subnet() {
 				;;
 		esac
 	done
-	die "no free 172.20.X.0/24 subnet left for cluster ${CLUSTER}"
+	die "no free 172.20.X.0/24 subnet left for cluster ${CLUSTER} (pass --subnet/ZEK_SUBNET explicitly)"
 }
 
 node_exists() { docker inspect --type container "$1" > /dev/null 2>&1; }
@@ -326,16 +329,18 @@ run_node() {
 }
 
 # A static-IP start can race the previous endpoint's cleanup and fail
-# with "Address already in use"; retry before giving up.
+# with "Address already in use"; retry 10 times with a 2s gap (a fixed
+# budget outside --timeout: the containers exist already, so this only
+# waits out docker's own cleanup) before giving up.
 start_node() { # name
-	local out
+	local name=$1 out
 	for _ in {1..10}; do
-		if out=$(docker start "$1" 2>&1); then
+		if out=$(docker start "${name}" 2>&1); then
 			return 0
 		fi
 		sleep 2
 	done
-	printf '%s\n' "${out}" >&2
+	log "failed to start ${name} after 10 tries: ${out}"
 	return 1
 }
 
@@ -382,7 +387,7 @@ wait_for_master_ready() {
 		fi
 		sleep 2
 	done
-	die "control plane on ${name} not ready after ${WAIT_TIMEOUT}s"
+	die "control plane on ${name} not ready after ${WAIT_TIMEOUT}s (see: ./zek.sh --cluster ${CLUSTER} logs ${name}; check --timeout/ZEK_TIMEOUT)"
 }
 
 wait_for_nodes() {
@@ -394,7 +399,7 @@ wait_for_nodes() {
 		[[ ${have} -ge ${want} ]] && return 0
 		sleep 2
 	done
-	die "expected ${want} nodes after ${WAIT_TIMEOUT}s, saw ${have}"
+	die "expected ${want} nodes after ${WAIT_TIMEOUT}s, saw ${have} (check --timeout/ZEK_TIMEOUT)"
 }
 
 # The first master publishes the join credentials (token, CA hash, API
@@ -403,38 +408,39 @@ wait_for_nodes() {
 # API starts answering, so wait for them - joiners then start immediately,
 # while kubeadm's uploaded control-plane certificates are still fresh.
 read_join_credentials() {
-	local token="" ca_hash="" endpoint="" cert_key="" deadline=$((SECONDS + WAIT_TIMEOUT))
+	local join_token="" join_ca_hash="" join_api_endpoint="" join_cert_key=""
+	local deadline=$((SECONDS + WAIT_TIMEOUT))
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
-		token="$(docker exec "${MASTER_NAME}" cat /etc/cluster/token 2> /dev/null)" \
-			&& ca_hash="$(docker exec "${MASTER_NAME}" cat /etc/cluster/ca-hash 2> /dev/null)" \
-			&& endpoint="$(docker exec "${MASTER_NAME}" cat /etc/cluster/api-endpoint 2> /dev/null)" \
-			&& cert_key="$(docker exec "${MASTER_NAME}" cat /etc/cluster/cert-key 2> /dev/null)" \
+		join_token="$(docker exec "${MASTER_NAME}" cat /etc/cluster/token 2> /dev/null)" \
+			&& join_ca_hash="$(docker exec "${MASTER_NAME}" cat /etc/cluster/ca-hash 2> /dev/null)" \
+			&& join_api_endpoint="$(docker exec "${MASTER_NAME}" cat /etc/cluster/api-endpoint 2> /dev/null)" \
+			&& join_cert_key="$(docker exec "${MASTER_NAME}" cat /etc/cluster/cert-key 2> /dev/null)" \
 			&& break
 		sleep 2
 	done
-	[[ -n ${token} ]] && [[ -n ${ca_hash} ]] && [[ -n ${endpoint} ]] && [[ -n ${cert_key} ]] \
-		|| die "join credentials not published by ${MASTER_NAME} after ${WAIT_TIMEOUT}s"
+	[[ -n ${join_token} ]] && [[ -n ${join_ca_hash} ]] && [[ -n ${join_api_endpoint} ]] && [[ -n ${join_cert_key} ]] \
+		|| die "join credentials not published by ${MASTER_NAME} after ${WAIT_TIMEOUT}s (is the master running? check --timeout/ZEK_TIMEOUT)"
 	CRED_ARGS=(
-		--env "JOIN_TOKEN=${token}"
-		--env "JOIN_CA_HASH=${ca_hash}"
-		--env "JOIN_API_ENDPOINT=${endpoint}"
-		--env "JOIN_CERT_KEY=${cert_key}"
+		--env "JOIN_TOKEN=${join_token}"
+		--env "JOIN_CA_HASH=${join_ca_hash}"
+		--env "JOIN_API_ENDPOINT=${join_api_endpoint}"
+		--env "JOIN_CERT_KEY=${join_cert_key}"
 	)
 }
 
 # Static IP of master $1 (1-based): the first sits at --master-ip
 # (ZEK_MASTER_IP, default <subnet>.2), following ones increment the last
 # octet.
-master_node_ip() {
-	local base="${MASTER_IP%.*}" last_octet="${MASTER_IP##*.}"
-	echo "${base}.$((last_octet + $1 - 1))"
+master_node_ip() { # 1-based master index
+	local master_idx=$1 subnet_prefix="${MASTER_IP%.*}" base_octet="${MASTER_IP##*.}"
+	echo "${subnet_prefix}.$((base_octet + master_idx - 1))"
 }
 
 # Decimal 32-bit form of a dotted-quad IPv4 address.
-ip_to_int() {
-	local octet ipn=0
+ip_to_int() { # <ip>
+	local addr=$1 octet ipn=0
 	local -a octets=()
-	IFS=. read -r -a octets <<< "$1"
+	IFS=. read -r -a octets <<< "${addr}"
 	for octet in "${octets[@]}"; do
 		ipn=$((ipn << 8 | 10#${octet}))
 	done
@@ -443,10 +449,10 @@ ip_to_int() {
 
 # True when IPv4 $1 sits inside CIDR $2 (both dotted-quad IPv4).
 ip_in_cidr() { # <ip> <cidr>
-	local cidr=$2
+	local ip=$1 cidr=$2
 	local prefix=${cidr##*/}
 	local ipn netn mask
-	ipn=$(ip_to_int "$1")
+	ipn=$(ip_to_int "${ip}")
 	netn=$(ip_to_int "${cidr%/*}")
 	mask=$(((0xFFFFFFFF << (32 - 10#${prefix})) & 0xFFFFFFFF))
 	(((ipn & mask) == (netn & mask)))
@@ -501,6 +507,9 @@ create_cluster() {
 	fi
 	subnet_base="${net_subnet%.*}"
 	MASTER_IP="${MASTER_IP:-${subnet_base}.2}"
+	# The load balancer's own address on the cluster network; masters are
+	# refused this IP below (a master landing on it dies before anything
+	# is created).
 	lb_ip="${subnet_base}.10"
 	api_endpoint="${MASTER_IP}:6443"
 	if [[ ${masters} -gt 1 ]]; then
@@ -547,11 +556,10 @@ create_cluster() {
 	wait_for_api
 	read_join_credentials
 
-	local extra_master_ip
 	for i in $(seq 2 "${masters}"); do
-		extra_master_ip=$(master_node_ip "${i}")
-		log "creating ${CLUSTER}-master-${i} (${extra_master_ip}) as control-plane"
-		run_node "${CLUSTER}-master-${i}" master --ip "${extra_master_ip}" \
+		master_addr=$(master_node_ip "${i}")
+		log "creating ${CLUSTER}-master-${i} (${master_addr}) as control-plane"
+		run_node "${CLUSTER}-master-${i}" master --ip "${master_addr}" \
 			--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
 		wait_for_master_ready "${CLUSTER}-master-${i}"
 		wait_for_nodes "${i}"
@@ -570,12 +578,12 @@ create_cluster() {
 # when the requested sizes differ from what was created.
 restart_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
-	local have_masters have_workers
-	have_masters="$(count_masters)"
-	have_workers="$(count_workers)"
-	if { [[ ${workers_set} -eq 1 ]] && [[ ${workers} -ne ${have_workers} ]]; } \
-		|| { [[ ${masters_set} -eq 1 ]] && [[ ${masters} -ne ${have_masters} ]]; }; then
-		warn "cluster ${CLUSTER} already exists with ${have_masters} master(s) and ${have_workers} worker(s); topology is fixed, ignoring --masters/--workers"
+	local existing_masters existing_workers
+	existing_masters="$(count_masters)"
+	existing_workers="$(count_workers)"
+	if { [[ ${workers_set} -eq 1 ]] && [[ ${workers} -ne ${existing_workers} ]]; } \
+		|| { [[ ${masters_set} -eq 1 ]] && [[ ${masters} -ne ${existing_masters} ]]; }; then
+		warn "cluster ${CLUSTER} already exists with ${existing_masters} master(s) and ${existing_workers} worker(s); topology is fixed, ignoring --masters/--workers"
 	fi
 
 	log "restarting cluster ${CLUSTER}"
@@ -601,8 +609,8 @@ restart_cluster() {
 	done <<< "${worker_list}"
 
 	wait_for_api
-	wait_for_nodes "$((have_masters + have_workers))"
-	log "cluster ${CLUSTER} up: ${have_masters} master(s) + ${have_workers} worker(s). Nodes report NotReady until you install a CNI."
+	wait_for_nodes "$((existing_masters + existing_workers))"
+	log "cluster ${CLUSTER} up: ${existing_masters} master(s) + ${existing_workers} worker(s). Nodes report NotReady until you install a CNI."
 }
 
 cmd_up() {
@@ -610,13 +618,13 @@ cmd_up() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 			--workers)
-				[[ $# -ge 2 ]] || die "--workers needs a value"
+				[[ $# -ge 2 ]] || die "--workers needs a value (check --workers/ZEK_WORKERS)"
 				workers="$2"
 				workers_set=1
 				shift 2
 				;;
 			--masters)
-				[[ $# -ge 2 ]] || die "--masters needs a value"
+				[[ $# -ge 2 ]] || die "--masters needs a value (check --masters/ZEK_MASTERS)"
 				masters="$2"
 				masters_set=1
 				shift 2
@@ -642,10 +650,10 @@ cmd_up() {
 		esac
 	done
 	if [[ ${workers_set} -eq 1 && -z ${workers} ]]; then
-		die "--workers needs a value"
+		die "--workers needs a value (check --workers/ZEK_WORKERS)"
 	fi
 	if [[ ${masters_set} -eq 1 && -z ${masters} ]]; then
-		die "--masters needs a value"
+		die "--masters needs a value (check --masters/ZEK_MASTERS)"
 	fi
 	workers="${workers:-${ENV_WORKERS}}"
 	masters="${masters:-${ENV_MASTERS}}"
@@ -673,9 +681,9 @@ cmd_up() {
 
 cmd_down() {
 	local -a names=()
-	local name list
-	list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}") || list=""
-	[[ -n ${list} ]] && mapfile -t names <<< "${list}"
+	local name container_list
+	container_list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}") || container_list=""
+	[[ -n ${container_list} ]] && mapfile -t names <<< "${container_list}"
 	if [[ ${#names[@]} -eq 0 ]]; then
 		log "cluster ${CLUSTER} is not running"
 		return 0
@@ -722,10 +730,10 @@ cmd_clean() {
 cmd_status() {
 	# shellcheck disable=SC2310
 	net_exists || die "no cluster named ${CLUSTER} (create it with: $0 --cluster ${CLUSTER} up)"
-	local running=0 name state status health rows
-	rows=$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' -f network="${NET_NAME}") || rows=""
-	while IFS=$'\t' read -r name state status; do
-		[[ -n ${name} ]] || continue
+	local running_total=0 container_name container_state container_status health container_rows
+	container_rows=$(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' -f network="${NET_NAME}") || container_rows=""
+	while IFS=$'\t' read -r container_name container_state container_status; do
+		[[ -n ${container_name} ]] || continue
 		# docker ps cannot format .State.Health (State is a plain string
 		# there), but the HEALTHCHECK verdict rides the end of .Status
 		# for a running container - and only the starting one carries a
@@ -733,15 +741,15 @@ cmd_status() {
 		# `Up 25 seconds (unhealthy)`). `-` marks a container docker is
 		# not probing (stopped/created) or one without a healthcheck.
 		health=-
-		if [[ ${status} =~ \((healthy|unhealthy)\)$ ]]; then
+		if [[ ${container_status} =~ \((healthy|unhealthy)\)$ ]]; then
 			health=${BASH_REMATCH[1]}
-		elif [[ ${status} =~ \(health:[[:space:]]starting\)$ ]]; then
+		elif [[ ${container_status} =~ \(health:[[:space:]]starting\)$ ]]; then
 			health=starting
 		fi
-		printf '%-25s %-8s %s\n' "${name}" "${state}" "${health}"
-		[[ ${state} == running ]] && running=$((running + 1))
-	done <<< "${rows}"
-	if [[ ${running} -eq 0 ]]; then
+		printf '%-25s %-8s %s\n' "${container_name}" "${container_state}" "${health}"
+		[[ ${container_state} == running ]] && running_total=$((running_total + 1))
+	done <<< "${container_rows}"
+	if [[ ${running_total} -eq 0 ]]; then
 		log "cluster ${CLUSTER} is stopped"
 		return 0
 	fi
@@ -752,9 +760,9 @@ cmd_status() {
 
 cmd_destroy() {
 	local -a names=()
-	local list removed=0
-	list=$(cluster_names)
-	[[ -n ${list} ]] && mapfile -t names <<< "${list}"
+	local container_list removed=0
+	container_list=$(cluster_names)
+	[[ -n ${container_list} ]] && mapfile -t names <<< "${container_list}"
 	if [[ ${#names[@]} -gt 0 ]]; then
 		docker rm -f "${names[@]}" > /dev/null
 		removed=1

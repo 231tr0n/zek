@@ -75,6 +75,7 @@ HOST_SETUP_DONE=0
 HOST_MODULES_PREEXISTING=""
 
 log() { echo "[zek] $*" >&2; }
+warn() { echo "[zek] WARNING: $*" >&2; }
 die() {
 	log "ERROR: $*"
 	exit 1
@@ -104,21 +105,21 @@ cleanup() {
 	# otherwise an idle host module could be pulled out from under the host).
 	# Unloading may fail while other processes still use them, which is fine.
 	log "shutting down"
-	local key module
+	local sysctl_key kernel_module
 	[[ -n ${CONTAINERD_PID} ]] && kill "${CONTAINERD_PID}" 2> /dev/null || true
 	[[ -n ${SUPERVISOR_PID} ]] && kill "${SUPERVISOR_PID}" 2> /dev/null || true
-	for key in "${!SYSCTL_BEFORE[@]}"; do
-		[[ -n ${SYSCTL_BEFORE[${key}]} ]] && sysctl -w "${key}=${SYSCTL_BEFORE[${key}]}" > /dev/null 2>&1 || true
+	for sysctl_key in "${!SYSCTL_BEFORE[@]}"; do
+		[[ -n ${SYSCTL_BEFORE[${sysctl_key}]} ]] && sysctl -w "${sysctl_key}=${SYSCTL_BEFORE[${sysctl_key}]}" > /dev/null 2>&1 || true
 	done
 	# Only touch host modules when preflight_host actually ran: die() can
 	# fire before that (flag parsing, kubeadm failures on a first start),
 	# and an empty "loaded by us" list would otherwise rmmod modules the
 	# host itself was using.
 	if [[ ${HOST_SETUP_DONE:-0} -eq 1 ]]; then
-		for module in br_netfilter vxlan; do
+		for kernel_module in br_netfilter vxlan; do
 			case " ${HOST_MODULES_PREEXISTING} " in
-				*" ${module} "*) ;;
-				*) rmmod "${module}" 2> /dev/null || true ;;
+				*" ${kernel_module} "*) ;;
+				*) rmmod "${kernel_module}" 2> /dev/null || true ;;
 			esac
 		done
 	fi
@@ -142,9 +143,9 @@ preflight_host() {
 			modprobe "${module}" 2> /dev/null || true
 		fi
 	done
-	for key in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
-		SYSCTL_BEFORE[${key}]="$(sysctl -n "${key}" 2> /dev/null || true)"
-		sysctl -w "${key}=1" > /dev/null 2>&1 || true
+	for sysctl_key in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
+		SYSCTL_BEFORE[${sysctl_key}]="$(sysctl -n "${sysctl_key}" 2> /dev/null || true)"
+		sysctl -w "${sysctl_key}=1" > /dev/null 2>&1 || true
 	done
 	# Every node container runs as uid 0 in the init namespace, so they all
 	# share the host's per-uid inotify instance quota (default 128). A
@@ -169,20 +170,20 @@ ensure_resolv_conf() {
 	# the real upstream IPs, skipping loopback/link-local stubs (e.g. a host
 	# systemd-resolved 127.0.0.53 is not routable from our netns), and fall
 	# back to public resolvers when nothing usable remains.
-	local upstreams
+	local upstream_ips upstream_ip
 	# NODE_DNS is an optional override for manual `docker run -e
 	# NODE_DNS="..."` usage; normally the docker --dns resolv.conf parsed
 	# below provides the upstreams. awk reads the nameserver field only:
 	# a flat grep would also pick up IPs from comments and options.
-	upstreams="${NODE_DNS:-}"
-	if [[ -z ${upstreams} ]]; then
-		upstreams="$(awk '$1 == "nameserver" && $2 !~ /^127\.|^169\.254\./ { print $2 }' /etc/resolv.conf \
+	upstream_ips="${NODE_DNS:-}"
+	if [[ -z ${upstream_ips} ]]; then
+		upstream_ips="$(awk '$1 == "nameserver" && $2 !~ /^127\.|^169\.254\./ { print $2 }' /etc/resolv.conf \
 			| sort -u | tr '\n' ' ')" || true
 	fi
-	[[ -n ${upstreams} ]] || upstreams="1.1.1.1 8.8.8.8"
+	[[ -n ${upstream_ips} ]] || upstream_ips="1.1.1.1 8.8.8.8"
 	{
 		echo "search ."
-		for nameserver in ${upstreams}; do echo "nameserver ${nameserver}"; done
+		for upstream_ip in ${upstream_ips}; do echo "nameserver ${upstream_ip}"; done
 	} > /etc/resolv.conf
 }
 
@@ -244,7 +245,7 @@ import_k8s_images() {
 	# --no-unpack: no mounts needed, unpacking happens lazily when the kubelet
 	# first pulls them). Only runs on a fresh node, once.
 	if ! command -v ctr > /dev/null 2>&1; then
-		log "WARNING: ctr not installed; skipping kubeadm image preload"
+		warn "ctr not installed; skipping kubeadm image preload"
 		return 0
 	fi
 	log "importing preloaded kubeadm images"
@@ -252,7 +253,7 @@ import_k8s_images() {
 	for tarball in /opt/zek/images/*.tar; do
 		[[ -e ${tarball} ]] || continue
 		ctr --namespace k8s.io images import --no-unpack "${tarball}" > /dev/null 2>&1 \
-			|| log "WARNING: failed to import ${tarball}"
+			|| warn "failed to import ${tarball}"
 	done
 }
 
@@ -366,9 +367,9 @@ kubelet_supervisor() {
 					/^I[0-9]{4} / { next }
 					{ print; fflush() }
 				' &
-			local pid=$!
+			local filter_pid=$!
 			log "kubelet running (full log: /var/log/kubelet.log)"
-			wait "${pid}" 2> /dev/null || true
+			wait "${filter_pid}" 2> /dev/null || true
 			log "kubelet exited, restarting"
 		fi
 		sleep 2
@@ -382,8 +383,8 @@ ensure_cni_dirs() {
 	# /usr/libexec/cni is where Alpine's packages put plugins, /opt/cni/bin
 	# is where the CNI providers' installers drop theirs (containerd's
 	# bin_dirs above searches both).
-	local dir
-	for dir in /etc/cni/net.d /opt/cni/bin; do mkdir -p "${dir}" && chmod 0777 "${dir}"; done
+	local cni_dir
+	for cni_dir in /etc/cni/net.d /opt/cni/bin; do mkdir -p "${cni_dir}" && chmod 0777 "${cni_dir}"; done
 }
 
 ensure_shared_mounts() {
@@ -402,7 +403,7 @@ ensure_bpffs() {
 	grep -q " /sys/fs/bpf " /proc/mounts 2> /dev/null && return 0
 	mkdir -p /sys/fs/bpf
 	mount -t bpf bpf /sys/fs/bpf 2> /dev/null \
-		|| log "WARNING: bpffs not mounted at /sys/fs/bpf (BPF-based CNIs may need it)"
+		|| warn "bpffs not mounted at /sys/fs/bpf (BPF-based CNIs may need it)"
 }
 
 node_setup() {
@@ -425,7 +426,7 @@ node_setup() {
 # it is missing). The token and upload-certs both need a serving API, so
 # they are retried briefly.
 publish_cluster_credentials() {
-	local token="" cert_key="" ca_hash="" certs_uploaded=""
+	local join_token="" join_cert_key="" join_ca_hash="" upload_ok=""
 	API_ENDPOINT="${API_ENDPOINT:-$(node_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
 	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -433,29 +434,29 @@ publish_cluster_credentials() {
 	# errexit is off, and a failed hash would only surface later as a
 	# confusing "could not extract the join credentials".
 	# shellcheck disable=SC2310  # failure is handled by the || die
-	ca_hash="$(get_ca_hash)" || die "cannot hash the cluster CA (/etc/kubernetes/pki/ca.crt missing?)"
+	join_ca_hash="$(get_ca_hash)" || die "cannot hash the cluster CA (/etc/kubernetes/pki/ca.crt missing?)"
 	# Generate the certificate key ourselves and pass it to upload-certs
 	# instead of scraping it from kubeadm's human-readable output - that
 	# wording changed between releases before (v1.37 moved it to its own
 	# line) and would break extraction again. The key is a hex-encoded
 	# 32-byte AES key, so 64 hex characters.
-	cert_key="$(openssl rand -hex 32)"
+	join_cert_key="$(openssl rand -hex 32)"
 	for _ in $(seq 1 60); do
 		# No tr needed: command substitution already strips the
 		# trailing newline kubeadm prints.
-		token="$(kubeadm token create --ttl 0 2> /dev/null)" || token=""
-		certs_uploaded=""
+		join_token="$(kubeadm token create --ttl 0 2> /dev/null)" || join_token=""
+		upload_ok=""
 		kubeadm init phase upload-certs --upload-certs \
-			--certificate-key "${cert_key}" > /dev/null 2>&1 && certs_uploaded=1
-		[[ -n ${token} ]] && [[ -n ${certs_uploaded} ]] && break
+			--certificate-key "${join_cert_key}" > /dev/null 2>&1 && upload_ok=1
+		[[ -n ${join_token} ]] && [[ -n ${upload_ok} ]] && break
 		sleep 2
 	done
-	[[ -n ${token} ]] && [[ -n ${certs_uploaded} ]] && [[ -n ${ca_hash} ]] \
+	[[ -n ${join_token} ]] && [[ -n ${upload_ok} ]] && [[ -n ${join_ca_hash} ]] \
 		|| die "could not extract the join credentials (token/certificate key/CA hash)"
-	printf '%s' "${token}" > "${CLUSTER_DIR}/token"
-	printf '%s' "${cert_key}" > "${CLUSTER_DIR}/cert-key"
+	printf '%s' "${join_token}" > "${CLUSTER_DIR}/token"
+	printf '%s' "${join_cert_key}" > "${CLUSTER_DIR}/cert-key"
 	echo "${API_ENDPOINT}" > "${CLUSTER_DIR}/api-endpoint"
-	printf '%s' "${ca_hash}" > "${CLUSTER_DIR}/ca-hash"
+	printf '%s' "${join_ca_hash}" > "${CLUSTER_DIR}/ca-hash"
 	cp /etc/kubernetes/admin.conf "${CLUSTER_DIR}/admin.conf"
 	log "published join credentials to ${CLUSTER_DIR} (endpoint: ${API_ENDPOINT})"
 }
@@ -466,19 +467,27 @@ publish_cluster_credentials() {
 # multi-master clusters, the first master's own address otherwise; zek.sh
 # passes it as API_ENDPOINT, the :- default covers runs without it.
 init_control_plane() {
-	local api_ip
-	api_ip="$(node_ip)"
-	API_ENDPOINT="${API_ENDPOINT:-${api_ip}:6443}"
-	log "initializing control plane on ${NODE_NAME} (${api_ip})"
+	local advertise_ip k8s_version
+	advertise_ip="$(node_ip)"
+	API_ENDPOINT="${API_ENDPOINT:-${advertise_ip}:6443}"
+	log "initializing control plane on ${NODE_NAME} (${advertise_ip})"
 	mkdir -p "${CLUSTER_DIR}"
 	import_k8s_images
+	# Pin the version the binaries report: kubeadm's compiled default can
+	# skew ahead of them (v1.37.0 binaries defaulting to v1.37.1 images),
+	# which would dodge the preloaded store and force a live registry pull
+	# on every init - minutes lost on a slow day, fatal under parallel e2e
+	# load. The Dockerfile preloads exactly the binary version, so pinning
+	# here keeps init on the preloaded images.
+	k8s_version="$(kubeadm version -o short)"
 	# kubeadm runs on CLI flags only, no --config document: its decoder
 	# sniffs each document and parses flow-style YAML as strict JSON,
 	# which fails. kubeadm's own defaults fill everything else (its
 	# KubeletConfiguration generation replaces the cgroupDriver input).
 	run_logged /var/log/kubeadm-init.log "kubeadm init failed" \
 		kubeadm init \
-		--apiserver-advertise-address="${api_ip}" \
+		--kubernetes-version="${k8s_version}" \
+		--apiserver-advertise-address="${advertise_ip}" \
 		--apiserver-bind-port=6443 \
 		--control-plane-endpoint="${API_ENDPOINT}" \
 		--node-name="${NODE_NAME}" \
@@ -504,14 +513,14 @@ init_control_plane() {
 join_control_plane() {
 	[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
 		&& [[ -n ${JOIN_CERT_KEY:-} ]] \
-		|| die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY"
-	local join_token="${JOIN_TOKEN}" join_hash="${JOIN_CA_HASH}" join_endpoint="${JOIN_API_ENDPOINT}"
-	log "joining ${NODE_NAME} as a control-plane node via ${join_endpoint}"
+		|| die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY (check --join-token/--join-ca-hash/--join-api-endpoint/--join-cert-key)"
+	local join_token="${JOIN_TOKEN}" join_ca_hash="${JOIN_CA_HASH}" join_api_endpoint="${JOIN_API_ENDPOINT}"
+	log "joining ${NODE_NAME} as a control-plane node via ${join_api_endpoint}"
 	import_k8s_images
 	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
-		kubeadm join "${join_endpoint}" \
+		kubeadm join "${join_api_endpoint}" \
 		--token "${join_token}" \
-		--discovery-token-ca-cert-hash "sha256:${join_hash}" \
+		--discovery-token-ca-cert-hash "sha256:${join_ca_hash}" \
 		--certificate-key "${JOIN_CERT_KEY}" \
 		--control-plane \
 		--node-name "${NODE_NAME}" \
@@ -592,14 +601,14 @@ run_worker() {
 			kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
 		fi
 		[[ -n ${JOIN_TOKEN:-} ]] && [[ -n ${JOIN_CA_HASH:-} ]] && [[ -n ${JOIN_API_ENDPOINT:-} ]] \
-			|| die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT"
-		local join_token="${JOIN_TOKEN}" join_hash="${JOIN_CA_HASH}" join_endpoint="${JOIN_API_ENDPOINT}"
-		log "joining ${NODE_NAME} to ${join_endpoint}"
+			|| die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT (check --join-token/--join-ca-hash/--join-api-endpoint)"
+		local join_token="${JOIN_TOKEN}" join_ca_hash="${JOIN_CA_HASH}" join_api_endpoint="${JOIN_API_ENDPOINT}"
+		log "joining ${NODE_NAME} to ${join_api_endpoint}"
 		import_k8s_images
 		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
-			kubeadm join "${join_endpoint}" \
+			kubeadm join "${join_api_endpoint}" \
 			--token "${join_token}" \
-			--discovery-token-ca-cert-hash "sha256:${join_hash}" \
+			--discovery-token-ca-cert-hash "sha256:${join_ca_hash}" \
 			--node-name "${NODE_NAME}" \
 			--cri-socket=unix:///run/containerd/containerd.sock \
 			--ignore-preflight-errors=all
@@ -613,8 +622,8 @@ run_worker() {
 # (space-separated IPs); haproxy health-checks them so a dead master is
 # taken out of rotation. The stats page on :8404 shows backend state.
 run_lb() {
-	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs"
-	local haproxy_cfg=/etc/haproxy/haproxy.cfg backend_idx=1 backend_ip
+	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs (check --lb-backends)"
+	local haproxy_cfg=/etc/haproxy/haproxy.cfg backend_index=1 backend_ip
 	mkdir -p /etc/haproxy
 	{
 		# HAPROXY instead of EOF marks this as config: lint.sh checks
@@ -642,8 +651,8 @@ backend apiservers
 	option tcp-check
 HAPROXY
 		for backend_ip in ${LB_BACKENDS}; do
-			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${backend_idx}" "${backend_ip}"
-			backend_idx=$((backend_idx + 1))
+			printf '\tserver cp%d %s:6443 check inter 2s fall 3 rise 2\n' "${backend_index}" "${backend_ip}"
+			backend_index=$((backend_index + 1))
 		done
 		cat << 'HAPROXY'
 
@@ -667,7 +676,7 @@ run_kubectl() {
 	# "config already there".
 	if [[ -z ${KUBECONFIG:-} ]]; then
 		if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
-			log "waiting for cluster config on master (${CLUSTER_DIR})"
+			log "waiting for the published cluster config (${CLUSTER_DIR}/admin.conf)"
 			# Bounded by WAIT_TIMEOUT (zek.sh passes --timeout through,
 			# default 600s) so a dead master fails this call instead of
 			# hanging every `zek kubectl` poll for ten minutes.
@@ -702,31 +711,31 @@ parse_role_flags() {
 				break
 				;;
 			--cluster-dir)
-				[[ $# -ge 2 ]] || die "--cluster-dir needs a value"
+				[[ $# -ge 2 ]] || die "--cluster-dir needs a value (check --cluster-dir/CLUSTER_DIR)"
 				CLUSTER_DIR="$2"
 				shift 2
 				;;
 			--cluster-dir=*) CLUSTER_DIR="${1#*=}" && shift ;;
 			--node-name)
-				[[ $# -ge 2 ]] || die "--node-name needs a value"
+				[[ $# -ge 2 ]] || die "--node-name needs a value (check --node-name/NODE_NAME)"
 				NODE_NAME="$2"
 				shift 2
 				;;
 			--node-name=*) NODE_NAME="${1#*=}" && shift ;;
 			--pod-cidr)
-				[[ $# -ge 2 ]] || die "--pod-cidr needs a value"
+				[[ $# -ge 2 ]] || die "--pod-cidr needs a value (check --pod-cidr/POD_CIDR)"
 				POD_CIDR="$2"
 				shift 2
 				;;
 			--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
 			--node-dns)
-				[[ $# -ge 2 ]] || die "--node-dns needs a value"
+				[[ $# -ge 2 ]] || die "--node-dns needs a value (check --node-dns/NODE_DNS)"
 				NODE_DNS="$2"
 				shift 2
 				;;
 			--node-dns=*) NODE_DNS="${1#*=}" && shift ;;
 			--api-endpoint)
-				[[ $# -ge 2 ]] || die "--api-endpoint needs a value"
+				[[ $# -ge 2 ]] || die "--api-endpoint needs a value (check --api-endpoint/API_ENDPOINT)"
 				API_ENDPOINT="$2"
 				shift 2
 				;;
@@ -737,37 +746,37 @@ parse_role_flags() {
 				;;
 			--master-join=*) die "--master-join is a boolean; use --master-join (or --master-join=1)" ;;
 			--join-token)
-				[[ $# -ge 2 ]] || die "--join-token needs a value"
+				[[ $# -ge 2 ]] || die "--join-token needs a value (check --join-token/JOIN_TOKEN)"
 				JOIN_TOKEN="$2"
 				shift 2
 				;;
 			--join-token=*) JOIN_TOKEN="${1#*=}" && shift ;;
 			--join-ca-hash)
-				[[ $# -ge 2 ]] || die "--join-ca-hash needs a value"
+				[[ $# -ge 2 ]] || die "--join-ca-hash needs a value (check --join-ca-hash/JOIN_CA_HASH)"
 				JOIN_CA_HASH="$2"
 				shift 2
 				;;
 			--join-ca-hash=*) JOIN_CA_HASH="${1#*=}" && shift ;;
 			--join-api-endpoint)
-				[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value"
+				[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value (check --join-api-endpoint/JOIN_API_ENDPOINT)"
 				JOIN_API_ENDPOINT="$2"
 				shift 2
 				;;
 			--join-api-endpoint=*) JOIN_API_ENDPOINT="${1#*=}" && shift ;;
 			--join-cert-key)
-				[[ $# -ge 2 ]] || die "--join-cert-key needs a value"
+				[[ $# -ge 2 ]] || die "--join-cert-key needs a value (check --join-cert-key/JOIN_CERT_KEY)"
 				JOIN_CERT_KEY="$2"
 				shift 2
 				;;
 			--join-cert-key=*) JOIN_CERT_KEY="${1#*=}" && shift ;;
 			--lb-backends)
-				[[ $# -ge 2 ]] || die "--lb-backends needs a value"
+				[[ $# -ge 2 ]] || die "--lb-backends needs a value (check --lb-backends/LB_BACKENDS)"
 				LB_BACKENDS="$2"
 				shift 2
 				;;
 			--lb-backends=*) LB_BACKENDS="${1#*=}" && shift ;;
 			--kubeconfig)
-				[[ $# -ge 2 ]] || die "--kubeconfig needs a value"
+				[[ $# -ge 2 ]] || die "--kubeconfig needs a value (check --kubeconfig/KUBECONFIG)"
 				KUBECONFIG="$2"
 				shift 2
 				;;
@@ -782,8 +791,8 @@ parse_role_flags() {
 				# argument on a node role would otherwise vanish
 				# silently - e.g. `master --master-join=1` used to
 				# quietly run kubeadm init instead of a join.
-				[[ ${ROLE} == kubectl ]] \
-					|| die "unknown argument '${1}' for role ${ROLE} (only the kubectl role takes passthrough arguments)"
+				[[ ${ENTRYPOINT_ROLE} == kubectl ]] \
+					|| die "unknown argument '${1}' for role ${ENTRYPOINT_ROLE} (only the kubectl role takes passthrough arguments)"
 				ROLE_ARGS+=("$1")
 				shift
 				;;
@@ -795,7 +804,7 @@ parse_role_flags() {
 # remains is what the role receives.
 case "${1:-}" in
 	master | worker | lb | kubectl)
-		ROLE="$1"
+		ENTRYPOINT_ROLE="$1"
 		shift
 		;;
 	*)
@@ -806,7 +815,7 @@ parse_role_flags "$@"
 # `--` bypasses the unknown-argument die above by design (kubectl needs the
 # delimiter itself for `exec POD -- CMD`), so a node role that received one
 # must still die here instead of silently ignoring the trailing args.
-if [[ ${ROLE} != kubectl && ${#ROLE_ARGS[@]} -gt 0 ]]; then
-	die "unknown argument '${ROLE_ARGS[0]}' for role ${ROLE} (only the kubectl role takes passthrough arguments)"
+if [[ ${ENTRYPOINT_ROLE} != kubectl && ${#ROLE_ARGS[@]} -gt 0 ]]; then
+	die "unknown argument '${ROLE_ARGS[0]}' for role ${ENTRYPOINT_ROLE} (only the kubectl role takes passthrough arguments)"
 fi
-"run_${ROLE}" "${ROLE_ARGS[@]}"
+"run_${ENTRYPOINT_ROLE}" "${ROLE_ARGS[@]}"
