@@ -94,7 +94,7 @@
         # (build-and-test.yml), so a conditional upload would break the
         # no-op run. The name must stay "updated-makefile" on both sides.
         name: "Share updated Makefile",
-        uses: "actions/upload-artifact@v8",
+        uses: "actions/upload-artifact@v7",
         with: {
           name: "updated-makefile",
           path: "Makefile",
