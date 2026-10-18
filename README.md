@@ -106,6 +106,15 @@ docker networks so concurrent clusters running with defaults don't collide. A
 race or an explicit `--subnet`/`ZEK_SUBNET` that is already in use fails the
 network create loudly instead of overlapping.
 
+Every node gets a **static** address on the cluster network: the masters walk
+up from `--master-ip` (default `<subnet>.2`) and the workers follow the last
+master, so `<subnet>.3` and `<subnet>.4` for the default one-master cluster.
+Without that, docker's dynamic pool would pick the addresses — and it hands
+them out in its own order after a host reboot, which moves a node out from
+under its kubelet certificate and its `Node` object. With more than one master
+the load balancer owns `<subnet>.10` (see below), and a worker that would land
+on it is refused before anything is created.
+
 ### Flags and environment
 
 Every setting exists twice: as a flag and as an environment variable. The
@@ -160,7 +169,9 @@ default `/24` subnet and default `--master-ip` at most **8 masters** fit,
 since master 9 would land on `<subnet>.10` — the load balancer's own IP —
 and zek refuses that combination before creating anything. A custom
 `--subnet`/`--master-ip` moves the limit, and the network, gateway and
-broadcast addresses are always refused.
+broadcast addresses are always refused. The workers follow the masters, so
+they hit the same wall: with the default subnet, 2 masters plus 7 workers
+would put worker 7 on `<subnet>.10` and `up` refuses that combination too.
 
 Use **odd** master counts: etcd needs a majority to stay writable. 1 master
 has no redundancy, 2 masters lose quorum if either fails, 3 masters survive
@@ -227,8 +238,10 @@ join token, CA hash, API endpoint, certificate key) live under
 or restarted, and the whole machine can be rebooted, and everything comes
 back with the same identity: the cluster survives `down`/`up`,
 `docker stop`/`docker start`, `docker restart`, a Docker daemon restart and
-host reboots. It is gone once the containers are removed (`destroy`,
-`docker rm`).
+host reboots. That identity includes the node's cluster-network address,
+which is pinned at creation time (see "Multiple clusters") — including for a
+worker that `clean` recreates. It is gone once the containers are removed
+(`destroy`, `docker rm`).
 
 A creation that is interrupted before kubeadm finished (crash or power loss
 during `up`) is detected on the next start: the partial state is reset and
@@ -238,6 +251,8 @@ reset.
 ## Notes
 
 - **`--cgroupns=host` is mandatory.** With the private cgroup namespace the kubelet fails to move itself into the right cgroup (`cgroup.procs` write returns `ENOENT`).
+- The kubelet config file keeps `InPlacePodLevelResourcesVerticalScaling` off (`ensure_kubelet_config`), because that shared cgroup namespace also makes the kubelet's cgroup _reads_ non-isolated: with the gate on (its default) it publishes the shared cgroup's `cpu` as each pod's pod-level actuated resource — the same constant for every pod, not the pod's own value — and counts it in the node's admission accounting, where the total grows past the node's capacity and every new pod is rejected `OutOfcpu` on a node that reports itself nearly idle.
+- Node addresses are static (masters walk up from `--master-ip`, workers follow the last master, the HA load balancer owns `<subnet>.10`), which is what keeps a node at the same address across a Docker daemon restart or a host reboot. `clean` recreates a worker on the address it already had.
 - **`--privileged`** is required for containerd's mounts and the CNI networking.
 - The nodes are prepared so CNI daemonsets "just work": `/etc/cni/net.d` and the CNI bin dir are pre-created world-writable (some installers run as non-root), `/`, `/sys`, `/run` are made shared mounts so eBPF setups can mount fs types into pods, and `bpffs` is pre-mounted at `/sys/fs/bpf`.
 - The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on shutdown. Nothing is written to disk. Set `NO_HOST_MODULES=1` (or pass `--no-host-modules`) on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); life is fully host-neutral then.

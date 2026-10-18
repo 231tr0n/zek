@@ -16,7 +16,11 @@
 #                  CNI dirs, bpffs, cgroupns/cgroup-driver, resolv,
 #                  credentials), the preloaded kubeadm images are
 #                  actually in the containerd store (import ran on first
-#                  init), and the image HEALTHCHECK reads the local
+#                  init), the kubelet config keeps the pod-level in-place
+#                  vertical scaling gate off (the effective gate in the
+#                  running kubelet, no pod-level actuated resources, and
+#                  admission accounting that stays within the node's own
+#                  requests), and the image HEALTHCHECK reads the local
 #                  daemons: healthy at rest (while NotReady without a
 #                  CNI), unhealthy when containerd dies (docker keeps
 #                  the container running) and healthy again after the
@@ -38,7 +42,10 @@
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
 #                  node's InternalIP is its docker IP on the cluster
-#                  network, and no pressure conditions are raised
+#                  network, the node addresses are pinned at creation (the
+#                  workers follow the master, .2/.3/.4, and the requested
+#                  address is what docker hands back), and no pressure
+#                  conditions are raised
 #   flannel        install flannel, nodes go Ready, coredns rolls out,
 #                  cross-node pod-to-pod ping, ClusterIP service routing,
 #                  cluster DNS and external DNS forwarding
@@ -49,20 +56,23 @@
 #                  control plane), logs, kubectl exec (the `--` delimiter
 #                  and stdin with -i), every flag in both spellings + env
 #                  precedence + loud error paths (host/network/gateway/
-#                  broadcast/outside IPs, subnet reuse, size bounds, trailing
-#                  args, e2e selection incl. ZEK_TIMEOUT, entrypoint flags
-#                  incl. node `--` and the kubectl wait timeout),
-#                  --subnet/--master-ip/--pod-cidr functional, up
+#                  broadcast/outside IPs for masters and workers, a worker
+#                  landing on the HA load balancer, subnet reuse, size
+#                  bounds, trailing args, e2e selection incl. ZEK_TIMEOUT,
+#                  entrypoint flags incl. node `--` and the kubectl wait
+#                  timeout), --subnet/--master-ip/--pod-cidr functional, up
 #                  shorthand vs fixed topology (workers and masters),
 #                  --timeout failing fast (a dead API and a node that never
 #                  registers), clean recreating the worker
-#                  (new Node UID) with --image/--dns/--pod-cidr/--mounts,
+#                  (new Node UID, same pinned address) with
+#                  --image/--dns/--pod-cidr/--mounts,
 #                  and destroy removing the containers and network
 #   persistence    flannel + a workload pinned to the single worker, then
 #                  recovery from: docker stop/start of every node at once,
-#                  a stopped worker, a restarted master, `zek down`/`up`,
-#                  a kubelet crash (supervisor restart) and a missing or
-#                  wrong failSwapOn key - same nodes (UIDs), workload Ready
+#                  a stopped worker, a restarted master, `zek down`/`up`
+#                  (both nodes keep their pinned address), a kubelet crash
+#                  (supervisor restart) and a missing or wrong failSwapOn or
+#                  pod-level gate key - same nodes (UIDs), workload Ready
 #                  and coredns rolled out again after each cycle
 #   recovery       crash-recovery paths: a NO_HOST_MODULES node, an
 #                  interrupted worker join, lost master credentials (the
@@ -302,6 +312,18 @@ start_containers() { # name...
 running_count() { docker ps --format '{{.Names}}' -f "network=$1-net" | wc -l; }
 
 cluster_containers() { docker ps -a --format '{{.Names}}' -f "network=$1-net"; }
+
+# A container's address on its cluster network, and the address it was
+# created with: a container docker allocated from its dynamic pool carries
+# no IPAMConfig (this reads back empty), a static one holds the requested
+# address (the `--ip` zek.sh passes for every node) - the one that survives
+# a docker daemon restart or a host reboot.
+container_ip() { # container
+	docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"
+}
+container_ip_requested() { # container
+	docker inspect -f '{{range .NetworkSettings.Networks}}{{with .IPAMConfig}}{{.IPv4Address}}{{end}}{{end}}' "$1"
+}
 
 assert_eq() { # desc want got
 	local desc=$1 want=$2 got=$3
@@ -559,6 +581,92 @@ kubelet_running() { # container
 # before every kubelet start (ensure_kubelet_config).
 kubelet_failswapon() { # container
 	docker exec "$1" grep -q '^failSwapOn:[[:space:]]*false' /var/lib/kubelet/config.yaml
+}
+
+# Same, for the pod-level in-place vertical scaling gate: with the gate on
+# the kubelet publishes a cgroup read it cannot isolate (the node shares the
+# host cgroup hierarchy) as every pod's pod-level actuated cpu, and counts it
+# into the node's admission accounting until new pods are rejected OutOfcpu.
+kubelet_podlevel_gate_off() { # container
+	docker exec "$1" grep -q '^  InPlacePodLevelResourcesVerticalScaling:[[:space:]]*false' \
+		/var/lib/kubelet/config.yaml
+}
+
+# The gate the *running* kubelet reports through its own /configz (over the
+# API proxy): the config file is only what the kubelet was handed, and this
+# is what it actually applied. Prints nothing when the gate is unset (the
+# feature gate's default), which is a failure for the gate we keep off.
+kubelet_gate() { # cluster node gate
+	# shellcheck disable=SC2310
+	zk "$1" kubectl get --raw "/api/v1/nodes/$2/proxy/configz" \
+		| grep -o "\"$3\":[a-z]*" | cut -d: -f2 || true
+}
+kubelet_gate_is() { # cluster node gate want
+	local cluster=$1 node=$2 gate=$3 want=$4 got
+	got=$(kubelet_gate "${cluster}" "${node}" "${gate}")
+	[[ ${got} == "${want}" ]]
+}
+
+# How many pods carry a pod-level actuated cpu (status.resources) - the value
+# the kubelet writes and then counts into admission only while the gate above
+# is on, so it must stay 0. A pod with no value writes an empty line, which
+# the grep drops (and `|| true` keeps grep's "no match" exit status out of
+# assert_cmd's way).
+pods_with_podlevel_status() { # cluster
+	# shellcheck disable=SC2310
+	zk "$1" kubectl get pods -A \
+		-o jsonpath='{range .items[*]}{.status.resources.requests.cpu}{"\n"}{end}' \
+		| grep -c '[0-9]' || true
+}
+
+# The reason the kubelet rejected a pod (OutOfcpu, OutOfmemory, ...): a phase
+# of Failed cannot tell a rejection from a container that merely failed to
+# start, and a *pending* pod does not carry a reason at all.
+pod_reason() { # cluster pod-name
+	zk "$1" kubectl -n kube-system get pod "$2" -o jsonpath='{.status.reason}'
+}
+pod_reason_is() { # cluster pod-name want
+	local cluster=$1 pod=$2 want=$3 got
+	got=$(pod_reason "${cluster}" "${pod}")
+	[[ ${got} == "${want}" ]]
+}
+
+# Cpu requests (millicores) of every pod placed on a node that the kubelet
+# still accounts for - Failed pods were never admitted and are not part of
+# it. This is the sum the kubelet's own admission accounting must stay
+# within: it counts the same requests, tracked separately.
+node_cpu_requests_m() { # cluster node
+	zk "$1" kubectl get pods -A \
+		--field-selector "spec.nodeName=$2,status.phase!=Failed" \
+		-o jsonpath='{range .items[*].spec.containers[*]}{.resources.requests.cpu}{"\n"}{end}' \
+		| awk '/[0-9]/ {
+			if ($0 ~ /m$/) { sub(/m$/, ""); total += $0 }
+			else { total += $0 * 1000 }
+		} END { print total + 0 }'
+}
+
+# The `used` (millicores) from the kubelet's last cpu admission rejection on
+# a node: it logs "Node didn't have enough resource: cpu, requested: N,
+# used: N, capacity: N", and `used` there is the kubelet's own view of what
+# the node already carries.
+node_admission_used_m() { # container
+	docker exec "$1" sh -c 'grep "resource: cpu" /var/log/kubelet.log | tail -1' \
+		| sed -n 's/.*used: \([0-9]*\).*/\1/p'
+}
+
+# ...which must not exceed what the node's pods ask for, plus slack for the
+# actuated bookkeeping being a coarser number than the sum of the specs.
+# The gate turned that accounting into an inflation that blew past the
+# node's capacity instead, and every pod created afterwards was rejected,
+# so this bound is what a regression breaks first.
+assert_admission_within_requests() { # cluster node
+	local cluster=$1 node=$2 used requests
+	used=$(node_admission_used_m "${node}")
+	requests=$(node_cpu_requests_m "${cluster}" "${node}")
+	[[ -n ${used} ]] \
+		|| fail "${cluster}: no cpu admission rejection in ${node}'s kubelet log"
+	[[ ${used} -le $((requests + 1000)) ]] \
+		|| fail "${cluster}: kubelet admission used ${used}m, over ${node}'s ${requests}m of pod requests + 1000m slack"
 }
 
 # Container log contains a fixed string (our [zek] markers). grep -c
@@ -1208,6 +1316,26 @@ EOF
 			-o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
 	done <<< "${nodes}"
 
+	# Those addresses are pinned at creation instead of coming from docker's
+	# dynamic pool, which reallocates in its own order after a host reboot
+	# and would move a node out from under its kubelet certificate and Node
+	# object: the masters walk up from --master-ip and the workers follow
+	# them (worker_node_ip), so this default one-master cluster sits at
+	# .2/.3/.4. The requested address (IPAMConfig) is what makes docker
+	# hand the same one back on every restart.
+	local master_ip subnet_base
+	master_ip=$(container_ip "${cluster}-master-1")
+	subnet_base=${master_ip%.*}
+	assert_eq "${cluster}: master-1 at the bottom of the subnet" "${subnet_base}.2" "${master_ip}"
+	assert_cmd "${cluster}: worker-1 address follows the master" "${subnet_base}.3" \
+		container_ip "${cluster}-worker-1"
+	assert_cmd "${cluster}: worker-2 address follows worker-1" "${subnet_base}.4" \
+		container_ip "${cluster}-worker-2"
+	assert_cmd "${cluster}: worker-1 address is pinned (not docker's pool)" "${subnet_base}.3" \
+		container_ip_requested "${cluster}-worker-1"
+	assert_cmd "${cluster}: worker-2 address is pinned (not docker's pool)" "${subnet_base}.4" \
+		container_ip_requested "${cluster}-worker-2"
+
 	wait_for "${cluster}: control plane readyz" 120 readyz_ok "${cluster}"
 }
 
@@ -1271,6 +1399,7 @@ test_cilium() {
 # (it would kill the parallel jobs).
 test_persistence() {
 	local cluster=$1 start_uids start_web out purges_before repubs_before repubs_after
+	local master_ip_before worker_ip_before
 	up "${cluster}" 1 1
 	log "${cluster}: installing flannel + workload"
 	apply_flannel "${cluster}"
@@ -1396,6 +1525,12 @@ EOF
 	assert_eq "${cluster}: no republish on resume" "${repubs_before}" "${repubs_after}"
 
 	log "${cluster}: zek down + zek up"
+	# Both nodes keep the static address they were created with: the restart
+	# path only starts containers again (restart_cluster), so nothing may be
+	# renumbered - a node whose address moved after a host reboot would no
+	# longer match its kubelet certificate or its Node object.
+	master_ip_before=$(container_ip "${cluster}-master-1")
+	worker_ip_before=$(container_ip "${cluster}-worker-1")
 	zk "${cluster}" down
 	assert_cmd "${cluster}: down stops everything" 0 running_count "${cluster}"
 	# The stop ran each container's cleanup trap; the log line is the only
@@ -1412,6 +1547,10 @@ EOF
 	assert_restart_order "${cluster}" \
 		"starting ${cluster}-master-1 starting ${cluster}-worker-1" \
 		"${out}"
+	assert_cmd "${cluster}: master-1 address across down/up" "${master_ip_before}" \
+		container_ip "${cluster}-master-1"
+	assert_cmd "${cluster}: worker-1 address across down/up" "${worker_ip_before}" \
+		container_ip "${cluster}-worker-1"
 	assert_state "zek down/up"
 
 	log "${cluster}: kubelet crash on worker-1 - the supervisor restarts it"
@@ -1447,6 +1586,33 @@ EOF
 	wait_for "${cluster}: failSwapOn rewritten" 60 kubelet_failswapon "${cluster}-worker-1"
 	wait_nodes_ready "${cluster}"
 	assert_state "failSwapOn rewrite"
+
+	# The same two paths for the pod-level vertical scaling gate, which
+	# ensure_kubelet_config writes into kubeadm's featureGates block
+	# instead of appending a second top-level key.
+	log "${cluster}: kubelet config without the pod-level gate - the supervisor re-adds it"
+	docker exec "${cluster}-worker-1" sed -i '/^  InPlacePodLevelResourcesVerticalScaling:/d' /var/lib/kubelet/config.yaml
+	docker exec "${cluster}-worker-1" pkill -f "/usr/local/bin/kubelet"
+	wait_for "${cluster}: kubelet running again after gate edit" 60 kubelet_running "${cluster}-worker-1"
+	wait_for "${cluster}: pod-level gate re-added" 60 kubelet_podlevel_gate_off "${cluster}-worker-1"
+	# The gate also has to be the one the running kubelet applied: a key the
+	# kubelet ignores (a duplicate block, a wrong indent) would satisfy the
+	# file check and leave the inflated accounting in place.
+	wait_for "${cluster}: re-added gate is the effective one" 60 \
+		kubelet_gate_is "${cluster}" "${cluster}-worker-1" InPlacePodLevelResourcesVerticalScaling false
+	wait_nodes_ready "${cluster}"
+	assert_state "pod-level gate re-add"
+
+	log "${cluster}: kubelet config with the pod-level gate on - the supervisor rewrites it"
+	docker exec "${cluster}-worker-1" sed -i 's/^  InPlacePodLevelResourcesVerticalScaling:.*/  InPlacePodLevelResourcesVerticalScaling: true/' \
+		/var/lib/kubelet/config.yaml
+	docker exec "${cluster}-worker-1" pkill -f "/usr/local/bin/kubelet"
+	wait_for "${cluster}: kubelet running again after gate flip" 60 kubelet_running "${cluster}-worker-1"
+	wait_for "${cluster}: pod-level gate rewritten" 60 kubelet_podlevel_gate_off "${cluster}-worker-1"
+	wait_for "${cluster}: rewritten gate is the effective one" 60 \
+		kubelet_gate_is "${cluster}" "${cluster}-worker-1" InPlacePodLevelResourcesVerticalScaling false
+	wait_nodes_ready "${cluster}"
+	assert_state "pod-level gate rewrite"
 }
 
 test_single_node() {
@@ -1513,6 +1679,58 @@ test_single_node() {
 	# kubelet start.
 	docker exec "${cluster}-master-1" sh -c '! ps -o args= | grep -q "[f]ail-swap-on"' \
 		|| fail "${cluster}: kubelet still carries a --fail-swap-on CLI flag"
+	# ensure_kubelet_config keeps the pod-level in-place vertical scaling
+	# gate off too: the node container shares the host cgroup hierarchy, so
+	# the kubelet's cgroup reads are not isolated to the pod it inspects -
+	# with the gate on it publishes the shared cgroup's cpu as every pod's
+	# pod-level actuated resource and counts it into the node's own
+	# admission accounting. Assert the gate the *running* kubelet applied
+	# (its /configz: the config file is only what it was handed) and both
+	# consequences of it being off: no pod carries a pod-level actuated
+	# cpu, and the accounting stays under the node's capacity.
+	assert_cmd "${cluster}: pod-level vertical scaling gate off in the running kubelet" "false" \
+		kubelet_gate "${cluster}" "${cluster}-master-1" InPlacePodLevelResourcesVerticalScaling
+	assert_cmd "${cluster}: no pod carries a pod-level actuated resource" "0" \
+		pods_with_podlevel_status "${cluster}"
+	# A pod asking for more cpu than any node has is always rejected, and
+	# the kubelet's denial message carries the `used` it computed for the
+	# node. On a control plane running a handful of pods that value is tiny
+	# - the gate inflated it past the node's capacity and then rejected
+	# every pod that followed, so the bound below is what a regression
+	# breaks first. kubectl already surfaces the rejection as the pod's
+	# reason (OutOfcpu), which is what the wait polls for.
+	zk "${cluster}" kubectl apply -f - > /dev/null << EOF
+---
+{
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: "cpucheck",
+    namespace: "kube-system",
+  },
+  spec: {
+    nodeName: "${cluster}-master-1",
+    restartPolicy: "Never",
+    containers: [{
+      name: "c",
+      image: "busybox:latest",
+      command: [
+        "sleep",
+        "3600",
+      ],
+      resources: {
+        requests: {
+          cpu: "100",
+          memory: "16Mi",
+        },
+      },
+    }],
+  },
+}
+EOF
+	wait_for "${cluster}: over-capacity pod rejected with OutOfcpu" 60 \
+		pod_reason_is "${cluster}" cpucheck OutOfcpu
+	assert_admission_within_requests "${cluster}" "${cluster}-master-1"
 	assert_cmd "${cluster}: restart policy" "unless-stopped" \
 		docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "${cluster}-master-1"
 	# resolv.conf must not point at docker's stub loopback (coredns uses
@@ -1638,7 +1856,7 @@ test_single_node() {
 # --timeout bound, clean's docker wiring, and a destroy that is asserted
 # instead of merely invoked (the per-job destroy swallows its exit).
 test_smoke() {
-	local cluster=$1 uids_before uids_after out role master_ip start_wait
+	local cluster=$1 uids_before uids_after out role master_ip start_wait worker_ip_before
 	up "${cluster}" 1 1
 	# status prints the HEALTHCHECK verdict as its own column, so the
 	# master's first successful probe has to land before the read.
@@ -1842,6 +2060,16 @@ EOF
 		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 --master-ip 172.20.250.255 up
 	assert_die "${cluster}: master outside the subnet" "is outside the cluster subnet" \
 		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 --master-ip 172.20.251.2 up
+	# Workers follow the masters, and their addresses go through the same
+	# validation before anything is created: one that would land on the
+	# broadcast address (the walk hits it after the last host) and one that
+	# would land on the HA load balancer's own IP (<subnet>.10).
+	assert_die "${cluster}: worker on the broadcast" "is the broadcast address" \
+		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 \
+		--master-ip 172.20.250.253 up --workers 3 --masters 1
+	assert_die "${cluster}: worker on the load balancer" "load balancer's IP" \
+		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 \
+		--master-ip 172.20.250.8 up --workers 1 --masters 2
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
 	# retry after a failed create (network exists, master does not).
@@ -2179,11 +2407,20 @@ EOF
 	# because they are the ones that reach docker run for the new
 	# container - assert the wiring, not just the exit status.
 	uids_before=$(node_uids "${cluster}")
+	# clean removes and recreates the container: the recreated worker must
+	# come back on the address it already had (worker_node_ip), not on a
+	# fresh dynamic one - that address is what its kubelet certificate and
+	# every reference to the node are built on.
+	worker_ip_before=$(container_ip "${cluster}-worker-1")
 	log "${cluster}: clean ${cluster}-worker-1 with --image/--dns/--pod-cidr/--mounts"
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" --image "${ZEK_IMAGE}" --dns 1.1.1.1 \
 		--pod-cidr 10.245.0.0/16 --mounts "${WORK_DIR}:/e2e-mount" \
 		clean "${cluster}-worker-1" 2>&1) || fail "${cluster}: clean failed: ${out}"
+	assert_cmd "${cluster}: address of the recreated worker" "${worker_ip_before}" \
+		container_ip "${cluster}-worker-1"
+	assert_cmd "${cluster}: address of the recreated worker is pinned" "${worker_ip_before}" \
+		container_ip_requested "${cluster}-worker-1"
 	# The recreated worker cannot be healthy this early - the fresh
 	# container runs no kubelet until kubeadm join has written its
 	# config - so its probes fail inside the health start period and

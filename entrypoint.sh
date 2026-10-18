@@ -269,7 +269,10 @@ import_k8s_images() {
 	local tarball
 	for tarball in /opt/zek/images/*.tar; do
 		[[ -e ${tarball} ]] || continue
-		ctr --namespace k8s.io images import --no-unpack "${tarball}" > /dev/null 2>&1 \
+		# Stdout is ctr's progress bar (drawn with ANSI escapes and
+		# carriage returns, which a log cannot render): drop it, keep
+		# stderr so a failed import is visible with its reason.
+		ctr --namespace k8s.io images import --no-unpack "${tarball}" > /dev/null \
 			|| warn "failed to import ${tarball}"
 	done
 }
@@ -310,14 +313,36 @@ patch_kube_proxy() {
 }
 
 # failSwapOn belongs in the kubelet config file: the --fail-swap-on CLI flag
-# is deprecated and will eventually disappear. kubeadm owns config.yaml, so
-# enforce the key here right before every kubelet start - that covers init,
-# resume and all join paths regardless of what kubeadm's defaults write.
+# is deprecated and will eventually disappear. The pod-level in-place
+# vertical scaling gate is turned off here for the same reason (the kubelet
+# only reads its feature gates from this file): zek hands every node
+# container the host's cgroup hierarchy (--cgroupns=host in zek.sh), so the
+# kubelet's cgroup reads are not isolated to the pod it is looking at. With
+# the gate on (its default since k8s 1.34) the kubelet publishes the pod
+# cgroup's bogus actuated `cpu` - a constant read from the shared cgroup, not
+# the pod's - in every pod's status and then counts it in the node's own
+# admission accounting, where it grows past the node's capacity until every
+# new pod is rejected OutOfcpu on a node that reports itself nearly idle.
+# kubeadm owns config.yaml, so enforce both keys here right before every
+# kubelet start - that covers init, resume and all join paths regardless of
+# what kubeadm's defaults write.
 ensure_kubelet_config() {
 	[[ -f ${KUBELET_CONFIG} ]] || return 0
 	sed -i 's/^failSwapOn:[[:space:]]*.*/failSwapOn: false/' "${KUBELET_CONFIG}"
-	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "${KUBELET_CONFIG}" && return 0
-	printf '\nfailSwapOn: false\n' >> "${KUBELET_CONFIG}"
+	grep -q '^failSwapOn:[[:space:]]*false[[:space:]]*$' "${KUBELET_CONFIG}" \
+		|| printf '\nfailSwapOn: false\n' >> "${KUBELET_CONFIG}"
+	# The gate goes next to whatever kubeadm wrote itself: kubeadm writes an
+	# empty featureGates as `{}` (its serializer uses block style only for a
+	# populated map), and an indented key cannot follow an inline value, so
+	# that shape is first normalized to a bare block key. An explicit `true`
+	# from an older config is rewritten by the sed below.
+	sed -i 's/^featureGates:[[:space:]]*\({}\|null\)[[:space:]]*$/featureGates:/' "${KUBELET_CONFIG}"
+	if ! grep -q '^featureGates:' "${KUBELET_CONFIG}"; then
+		printf '\nfeatureGates:\n  InPlacePodLevelResourcesVerticalScaling: false\n' >> "${KUBELET_CONFIG}"
+	elif ! grep -q '^  InPlacePodLevelResourcesVerticalScaling:' "${KUBELET_CONFIG}"; then
+		sed -i '/^featureGates:/s/$/\n  InPlacePodLevelResourcesVerticalScaling: false/' "${KUBELET_CONFIG}"
+	fi
+	sed -i 's/^\(  InPlacePodLevelResourcesVerticalScaling:\).*/\1 false/' "${KUBELET_CONFIG}"
 }
 
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config

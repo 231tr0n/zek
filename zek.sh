@@ -436,6 +436,37 @@ master_node_ip() { # 1-based master index
 	echo "${subnet_prefix}.$((base_octet + master_idx - 1))"
 }
 
+# Static IP of worker $1 (1-based) in a cluster with $2 masters: workers
+# follow the masters (the address right after the last one), so no worker
+# can land on a master and every node's address is fixed for the life of
+# the cluster. Without --ip a node would come from docker's dynamic pool -
+# and a dynamic address is not stable across a host reboot (docker
+# reallocates from the pool in its own order), which moves a node under its
+# kubelet/apiserver certificates and Node object. $3 is the cluster subnet
+# and $4 the load balancer's own address: the address is validated exactly
+# like a master's, and with more than one master ($2 > 1) a worker that
+# would take the LB's address dies before anything is created.
+worker_node_ip() { # <1-based worker index> <masters> <subnet> <lb-ip>
+	local worker_idx=$1 masters=$2 subnet=$3 lb_ip=$4
+	# $(( )) reads its operands as variable names, so a non-numeric base
+	# would die later as a bare unbound-variable error; shape-check it.
+	require_ipv4 "${MASTER_IP}" addr "master IP (--master-ip/ZEK_MASTER_IP)"
+	local subnet_prefix="${MASTER_IP%.*}" base_octet="${MASTER_IP##*.}"
+	local addr="${subnet_prefix}.$((base_octet + masters + worker_idx - 1))"
+	require_host_ip "${addr}" "${subnet}" "worker ${worker_idx}"
+	if [[ ${masters} -gt 1 && ${addr} == "${lb_ip}" ]]; then
+		die "worker ${worker_idx} would get IP ${addr}, which is the load balancer's IP (${lb_ip}); lower --workers/ZEK_WORKERS or change --master-ip/ZEK_MASTER_IP"
+	fi
+	echo "${addr}"
+}
+
+# The load balancer's own address on the cluster network (created with more
+# than one master): <subnet>.10. Masters (walking up from --master-ip) and
+# workers (following the masters) both have to stay off it.
+lb_node_ip() { # <subnet>
+	echo "${1%.*}.10"
+}
+
 # Decimal 32-bit form of a dotted-quad IPv4 address.
 ip_to_int() { # <ip>
 	local addr=$1 octet ipn=0
@@ -491,6 +522,7 @@ create_cluster() {
 	local workers="$1" masters="$2"
 	local net_subnet subnet_base lb_ip api_endpoint master_addr i backends=""
 	local have_net=0
+	local -a worker_addrs=()
 
 	# Reuse this cluster's own network when it exists (retry after a
 	# failed create): its subnet is authoritative for every container IP
@@ -507,10 +539,10 @@ create_cluster() {
 	fi
 	subnet_base="${net_subnet%.*}"
 	MASTER_IP="${MASTER_IP:-${subnet_base}.2}"
-	# The load balancer's own address on the cluster network; masters are
-	# refused this IP below (a master landing on it dies before anything
-	# is created).
-	lb_ip="${subnet_base}.10"
+	# The load balancer's own address on the cluster network; masters and
+	# workers are both refused this IP below (a node landing on it dies
+	# before anything is created).
+	lb_ip="$(lb_node_ip "${net_subnet}")"
 	api_endpoint="${MASTER_IP}:6443"
 	if [[ ${masters} -gt 1 ]]; then
 		api_endpoint="${lb_ip}:6443"
@@ -534,6 +566,14 @@ create_cluster() {
 	if [[ ${masters} -gt 1 ]]; then
 		require_host_ip "${lb_ip}" "${net_subnet}" "load balancer"
 	fi
+	# Workers follow the masters: their addresses are derived and validated
+	# here too, before the network exists. A worker that only fails its
+	# validation when its `docker run` comes up would leave the cluster
+	# half-created (master and LB exist, so the next `up` would take the
+	# restart path and never create the missing workers).
+	for i in $(seq 1 "${workers}"); do
+		worker_addrs+=("$(worker_node_ip "${i}" "${masters}" "${net_subnet}" "${lb_ip}")")
+	done
 	if [[ ${have_net} -eq 0 ]]; then
 		ensure_net "${net_subnet}"
 	fi
@@ -566,7 +606,8 @@ create_cluster() {
 	done
 
 	for i in $(seq 1 "${workers}"); do
-		run_node "${CLUSTER}-worker-${i}" worker "${CRED_ARGS[@]}"
+		log "creating ${CLUSTER}-worker-${i} (${worker_addrs[i - 1]})"
+		run_node "${CLUSTER}-worker-${i}" worker --ip "${worker_addrs[i - 1]}" "${CRED_ARGS[@]}"
 	done
 	wait_for_nodes "$((masters + workers))"
 
@@ -709,13 +750,32 @@ evict_worker() {
 }
 
 cmd_clean() {
-	local name="$1"
+	local name="$1" masters worker_addr requested_master_addr="" net_subnet lb_ip
 	[[ ${name} =~ ^${CLUSTER}-master-[0-9]+$ ]] \
 		&& die "cannot clean ${name} (control-plane node); use destroy"
 	[[ ${name} =~ ^${CLUSTER}-worker-[0-9]+$ ]] \
 		|| die "${name} is not a worker of cluster ${CLUSTER}"
 	# shellcheck disable=SC2310
 	node_exists "${name}" || die "no container named ${name}"
+
+	# The recreated worker gets the address the cluster was created with,
+	# not a fresh one from docker's dynamic pool: the address is what the
+	# kubelet registered with and what every certificate and EndpointSlice
+	# refers to. The worker addresses follow the first master's requested
+	# address (--master-ip is a creation-time default that clean does not
+	# repeat) - IPAMConfig survives stop/start, while the live IPAddress of
+	# a stopped container reads back docker's "invalid IP" sentinel. Only
+	# a master that never got a requested address falls back to the
+	# --master-ip argument or the <subnet>.2 default.
+	net_subnet=$(net_subnet_of)
+	# shellcheck disable=SC2310
+	if node_exists "${MASTER_NAME}"; then
+		requested_master_addr=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAMConfig.IPv4Address}}{{end}}' "${MASTER_NAME}")
+	fi
+	MASTER_IP="${requested_master_addr:-${MASTER_IP:-${net_subnet%.*}.2}}"
+	lb_ip=$(lb_node_ip "${net_subnet}")
+	masters=$(count_masters)
+	worker_addr=$(worker_node_ip "${name##*-}" "${masters}" "${net_subnet}" "${lb_ip}")
 
 	# A node's netns lives on its container; a fresh container is the only
 	# guaranteed way to drop CNI residue (iptables chains, ipsets, bpf pins,
@@ -724,8 +784,8 @@ cmd_clean() {
 	evict_worker "${name}"
 	docker rm -f "${name}" > /dev/null
 	read_join_credentials
-	run_node "${name}" worker "${CRED_ARGS[@]}"
-	log "${name} recreated; it is rejoining the cluster"
+	run_node "${name}" worker --ip "${worker_addr}" "${CRED_ARGS[@]}"
+	log "${name} recreated (${worker_addr}); it is rejoining the cluster"
 }
 
 cmd_status() {

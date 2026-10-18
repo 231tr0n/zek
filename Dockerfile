@@ -57,9 +57,12 @@ done
 images=$(kubeadm config images list --kubernetes-version "${KUBERNETES_VERSION}") || exit 1
 # Unquoted split on purpose: the image list is machine-generated refs
 # without spaces, one per line.
+# ctr draws its download/export progress on stdout (ANSI escapes and
+# carriage returns, unreadable in a log): drop it and keep stderr, which
+# is where a failed fetch publishes its reason.
 for image in ${images}; do
-	ctr --namespace k8s.io content fetch --platform "linux/${TARGETARCH}" "${image}"
-	ctr --namespace k8s.io images export --platform "linux/${TARGETARCH}" "/opt/zek/images/$(basename "${image}").tar" "${image}"
+	ctr --namespace k8s.io content fetch --platform "linux/${TARGETARCH}" "${image}" > /dev/null
+	ctr --namespace k8s.io images export --platform "linux/${TARGETARCH}" "/opt/zek/images/$(basename "${image}").tar" "${image}" > /dev/null
 done
 kill "${CONTAINERD_PID}"
 kubeadm version -o short
