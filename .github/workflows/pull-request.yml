@@ -14,7 +14,8 @@
   },
   # Workflow-level defaults: pin bash for every run: block (on ubuntu
   # GitHub already runs `bash -eo pipefail`) and keep the default token
-  # scope read-only (the shared CI workflow only checks out, lints and tests).
+  # scope read-only (the shared CI workflow only checks out, filters
+  # changed files, lints and tests).
   permissions: {
     contents: "read",
   },

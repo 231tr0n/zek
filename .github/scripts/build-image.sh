@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build-image - build the zek image under the GHCR name CI publishes and
-# export IMAGE for make and the later login/push steps.
+# set IMAGE for make and the later login/push steps.
 #
 # CI only: needs GITHUB_REPOSITORY and GITHUB_ENV from the runner. Shared
 # by build-and-test.yml and main.yml so tests and publishing build the

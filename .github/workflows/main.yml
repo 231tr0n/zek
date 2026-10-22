@@ -30,10 +30,10 @@
     },
     push: {
       # Publish only when the image content inputs changed (Dockerfile,
-      # entrypoint.sh or Makefile) and e2e was required; `needs: ci`
-      # ensures e2e passed. Rebuilds the same commit, so the pushed image
-      # is what the tests validated. Without an image change there is
-      # nothing new to publish.
+      # entrypoint.sh or Makefile) and e2e was required; image inputs are
+      # a subset of e2e inputs, and `needs: ci` ensures the tests passed.
+      # Rebuilds the same commit, so the pushed image is what the tests
+      # validated. Without an image change there is nothing new to publish.
       needs: "ci",
       if: "needs.ci.outputs.image == 'true' && needs.ci.outputs.e2e == 'true'",
       permissions: {

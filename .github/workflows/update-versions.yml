@@ -7,8 +7,8 @@
       cron: "0 0 * * *",
     }],
   },
-  # Static group serializes daily runs on purpose (no
-  # cancel-in-progress): a version bump must not supersede another.
+  # Static group serializes runs on purpose (no cancel-in-progress):
+  # a version bump must not supersede another.
   concurrency: {
     group: "update-versions",
   },
@@ -27,8 +27,8 @@
   },
   jobs: {
     lint: {
-      # Same linter as CI, run before spending any e2e compute on a change
-      # that would not pass lint anyway (e2e needs this job below).
+      # Same lint workflow as CI, run before spending any e2e compute on a
+      # change that would not pass lint anyway (e2e needs this job below).
       uses: "./.github/workflows/lint.yml",
     },
     prepare: {
@@ -97,8 +97,8 @@
       }, {
         # Only shared when the pins changed: e2e and create-pr below are
         # gated on the same output, so a no-op run spends no e2e compute
-        # and opens no pull request. The name must stay "updated-makefile"
-        # on both sides.
+        # and opens no pull request. The name must match the upload here and
+        # the consumers below (the e2e input and the create-pr download).
         name: "Share updated Makefile",
         if: "steps.changed.outputs.changed == 'true'",
         uses: "actions/upload-artifact@v7",
@@ -124,9 +124,9 @@
       },
     },
     create-pr: {
-      # Both needs are intentional: e2e implies prepare, but the PR body
-      # below reads needs.prepare.outputs.* directly. Without a pin change
-      # there is no PR to open, so skip this job along with e2e.
+      # Both needs are intentional: e2e already needs prepare, but the PR
+      # body below reads needs.prepare.outputs.* directly. Without a pin
+      # change there is no PR to open, so skip this job along with e2e.
       needs: [
         "prepare",
         "e2e",
@@ -147,7 +147,7 @@
           name: "updated-makefile",
         },
       }, {
-        name: "Count git status",
+        name: "Count changed files",
         id: "git-status",
         # set -euo pipefail: without it a failing `git status` (index
         # locked, shallow clone gone wrong) would be masked by wc -l's
@@ -177,8 +177,8 @@
            git add Makefile\n\
            git commit -m \"chore: update alpine/k8s versions\"\n\
            # Implicit --force-with-lease needs a remote-tracking ref, but\n\
-           # checkout only fetched main, so it always answers \"stale info\"\n\
-           # here. Pass the tip just read from origin explicitly instead\n\
+           # checkout only fetched the triggering branch, so it would answer\n\
+           # \"stale info\" here. Pass the tip just read from origin instead\n\
            # (empty output = branch does not exist yet, plain push creates\n\
            # it); if the branch moves between the query and the push the\n\
            # lease does not match and the push is rejected, not clobbered.\n\
@@ -208,17 +208,15 @@
            # the pin placeholders are substituted by the runner before this\n\
            # script runs and are version strings validated in prepare.\n\
            cat >pr-body.md <<'EOF'\n\
-           Daily version bump. `./lint.sh`, `make build` and `./e2e.sh` passed with the new pins.\n\
+           Automated version bump. `./lint.sh` and `make build` passed with the new pins.\n\
            \n\
            | Pin                | before                                   | after                               |\n\
            | ------------------ | ---------------------------------------- | ----------------------------------- |\n\
            | ALPINE_VERSION     | ${{ needs.prepare.outputs.alpine_prev }} | ${{ needs.prepare.outputs.alpine }} |\n\
            | KUBERNETES_VERSION | ${{ needs.prepare.outputs.k8s_prev }}    | ${{ needs.prepare.outputs.k8s }}    |\n\
            \n\
-           Before merging, check the release-coupled spots listed in README.md\n\
-           (\"Upgrading Kubernetes\"): the kubeadm init/join CLI flags and the\n\
-           kubelet `--cgroup-driver` flag in `entrypoint.sh`, plus the soft\n\
-           couplings (kube-proxy conntrack keys, containerd bin_dirs/unpack_config).\n\
+           The full e2e matrix passed, including the release-coupled spots\n\
+           listed in README.md (\"Upgrading Kubernetes\").\n\
            EOF\n\
            gh pr create --base main --head \"${branch}\" \\\n\
           \  --title \"chore: update alpine/k8s versions\" --body-file pr-body.md\n\

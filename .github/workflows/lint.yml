@@ -22,13 +22,13 @@
       runs-on: "ubuntu-latest",
       # Fedora container for the dnf packages (shellcheck, golang, ...) so CI
       # and local runs agree. shfmt rides go install like the other floaters:
-      # its Fedora package is orphaned with no F45 build. Everything floats
-      # :latest on purpose (Dependabot sees none of the go tools, nor the
-      # workflow `container:` image), so a toolchain breakage is fixed here
-      # by hand. prettier resolves via npx (latest in lint.sh); yamlfmt
-      # (sigs.k8s.io/yaml) formats the repo YAML files and lints the
-      # inline heredoc configs; actionlint checks the workflows plus the
-      # shell of every run: block.
+      # its Fedora package is orphaned. The toolchain floats :latest on
+      # purpose (Dependabot sees none of the go tools, nor the workflow
+      # `container:` image), so a toolchain breakage is fixed here by hand.
+      # prettier resolves via npx (latest in lint.sh); yamlfmt
+      # (sigs.k8s.io/yaml) formats the repo YAML files and lints the inline
+      # heredoc configs; actionlint checks the workflows plus the shell of
+      # every run: block.
       container: "fedora:latest",
       timeout-minutes: 15,
       steps: [{

@@ -5,15 +5,15 @@
     workflow_call: {
       # e2e: files whose changes can alter what the end-to-end suite
       # exercises (the image, the CLI it drives, the harness itself).
-      # image: image content inputs only; CI/build scripts are
-      # intentionally excluded so harness-only changes do not publish.
+      # image: image content inputs only; CI scripts are intentionally
+      # excluded so harness-only changes do not publish.
       outputs: {
         e2e: {
           description: "Whether an e2e-relevant file changed",
           value: "${{ jobs.changes.outputs.e2e }}",
         },
         image: {
-          description: "Whether the Docker image itself changed",
+          description: "Whether the Docker image content inputs changed",
           value: "${{ jobs.changes.outputs.image }}",
         },
       },
