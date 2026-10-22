@@ -27,7 +27,7 @@
       # workflow `container:` image), so a toolchain breakage is fixed here
       # by hand. prettier resolves via npx (latest in lint.sh); yamlfmt
       # (sigs.k8s.io/yaml) formats the repo YAML files and lints the
-      # inline heredoc configs; actionlint checks this workflow plus the
+      # inline heredoc configs; actionlint checks the workflows plus the
       # shell of every run: block.
       container: "fedora:latest",
       timeout-minutes: 15,

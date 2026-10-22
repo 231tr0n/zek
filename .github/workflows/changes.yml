@@ -1,0 +1,81 @@
+---
+{
+  name: "Changed files",
+  "on": {
+    workflow_call: {
+      # e2e: files whose changes can alter what the end-to-end suite
+      # exercises (the image, the CLI it drives, the harness itself).
+      # image: files that feed the published image build; changing any
+      # of them needs a rebuild and release.
+      outputs: {
+        e2e: {
+          description: "Whether an e2e-relevant file changed",
+          value: "${{ jobs.changes.outputs.e2e }}",
+        },
+        image: {
+          description: "Whether the Docker image itself changed",
+          value: "${{ jobs.changes.outputs.image }}",
+        },
+      },
+    },
+  },
+  permissions: {
+    contents: "read",
+  },
+  defaults: {
+    run: {
+      shell: "bash",
+    },
+  },
+  jobs: {
+    changes: {
+      runs-on: "ubuntu-latest",
+      timeout-minutes: 5,
+      outputs: {
+        e2e: "${{ steps.filter.outputs.e2e }}",
+        image: "${{ steps.filter.outputs.image }}",
+      },
+      steps: [{
+        # Full history: the diff below compares event SHAs that a
+        # shallow checkout does not contain (the first push of a new
+        # branch has an all-zero before SHA, handled as all files).
+        uses: "actions/checkout@v7",
+        with: {
+          fetch-depth: 0,
+        },
+      }, {
+        name: "Filter changed files",
+        id: "filter",
+        env: {
+          EVENT_NAME: "${{ github.event_name }}",
+          BEFORE: "${{ github.event.before }}",
+          AFTER: "${{ github.event.after }}",
+          BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+          HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+        },
+        run: "\
+           set -euo pipefail\n\
+           if [[ ${EVENT_NAME} == pull_request ]]; then\n\
+          \  files=$(git diff --name-only \"${BASE_SHA}\" \"${HEAD_SHA}\")\n\
+           elif [[ ${EVENT_NAME} == push && -n ${BEFORE} && ! ${BEFORE} =~ ^0+$ ]]; then\n\
+          \  files=$(git diff --name-only \"${BEFORE}\" \"${AFTER}\")\n\
+           else\n\
+           # Unknown event or new branch (no before SHA): be conservative.\n\
+          \  files=$(git ls-files)\n\
+           fi\n\
+           e2e=false\n\
+           image=false\n\
+           while IFS= read -r file; do\n\
+          \  case \"${file}\" in\n\
+          \    Dockerfile | entrypoint.sh | Makefile | .github/scripts/build-image.sh) e2e=true image=true ;;\n\
+          \    e2e.sh | zek.sh | .github/scripts/* | .github/workflows/*) e2e=true ;;\n\
+          \  esac\n\
+           done <<< \"${files}\"\n\
+           echo \"e2e=${e2e}\" >>\"$GITHUB_OUTPUT\"\n\
+           echo \"image=${image}\" >>\"$GITHUB_OUTPUT\"\n\
+           printf 'changed files:\\n%s\\n' \"${files}\"\n\
+          ",
+      }],
+    },
+  },
+}

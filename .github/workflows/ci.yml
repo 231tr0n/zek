@@ -1,0 +1,38 @@
+---
+{
+  name: "CI",
+  "on": {
+    workflow_call: {
+      # The shared pull-request/main pipeline: both callers must run the
+      # same lint, path filter and e2e jobs, so keeping the wiring here
+      # stops them from drifting apart.
+      outputs: {
+        image: {
+          description: "Whether the Docker image inputs changed (gates publishing)",
+          value: "${{ jobs.changes.outputs.image }}",
+        },
+      },
+    },
+  },
+  permissions: {
+    contents: "read",
+  },
+  jobs: {
+    lint: {
+      uses: "./.github/workflows/lint.yml",
+    },
+    changes: {
+      uses: "./.github/workflows/changes.yml",
+    },
+    build_and_test: {
+      # Only the files the suite exercises can break e2e; a README or
+      # lint-only change still runs lint above but skips this job.
+      needs: [
+        "lint",
+        "changes",
+      ],
+      if: "needs.changes.outputs.e2e == 'true'",
+      uses: "./.github/workflows/build-and-test.yml",
+    },
+  },
+}
