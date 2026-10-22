@@ -138,8 +138,53 @@
       },
       runs-on: "ubuntu-latest",
       timeout-minutes: 15,
+      # Checkout, push and `gh pr create` must act as a trusted app or
+      # user, not the workflow's GITHUB_TOKEN: pull_request runs created
+      # or updated by GITHUB_TOKEN wait in "action_required" until someone
+      # with write access clicks "Approve workflows to run". An app
+      # installation token (preferred) or a fine-grained PAT makes the PR
+      # actor trusted, so its CI starts without that gate. Without either
+      # credential the workflow still works, but falls back to
+      # GITHUB_TOKEN and the manual approval step.
+      # UPDATE_VERSIONS_APP_ID is a repository variable; the app private
+      # key and the optional PAT are repository secrets. The app needs
+      # Contents and Pull requests read/write and must be installed on
+      # this repository.
       steps: [{
+        name: "Check bot token configuration",
+        id: "bot-token",
+        env: {
+          APP_ID: "${{ vars.UPDATE_VERSIONS_APP_ID }}",
+          APP_PRIVATE_KEY: "${{ secrets.UPDATE_VERSIONS_APP_PRIVATE_KEY }}",
+          PAT: "${{ secrets.UPDATE_VERSIONS_TOKEN }}",
+        },
+        run: "\
+           set -euo pipefail\n\
+           if [[ -n ${APP_ID} && -n ${APP_PRIVATE_KEY} ]]; then\n\
+          \  echo \"mode=app\" >>\"$GITHUB_OUTPUT\"\n\
+           elif [[ -n ${PAT} ]]; then\n\
+          \  echo \"mode=pat\" >>\"$GITHUB_OUTPUT\"\n\
+           else\n\
+          \  echo \"mode=github\" >>\"$GITHUB_OUTPUT\"\n\
+          \  echo \"::warning::No bot token configured; using GITHUB_TOKEN, so the version-bump PR will wait for manual workflow approval. Set UPDATE_VERSIONS_APP_ID + UPDATE_VERSIONS_APP_PRIVATE_KEY (preferred) or UPDATE_VERSIONS_TOKEN.\"\n\
+           fi\n\
+          ",
+      }, {
+        name: "Create GitHub App token",
+        id: "app-token",
+        if: "steps.bot-token.outputs.mode == 'app'",
+        uses: "actions/create-github-app-token@v3",
+        with: {
+          app-id: "${{ vars.UPDATE_VERSIONS_APP_ID }}",
+          private-key: "${{ secrets.UPDATE_VERSIONS_APP_PRIVATE_KEY }}",
+          permission-contents: "write",
+          permission-pull-requests: "write",
+        },
+      }, {
         uses: "actions/checkout@v7",
+        with: {
+          token: "${{ steps.app-token.outputs.token || secrets.UPDATE_VERSIONS_TOKEN || github.token }}",
+        },
       }, {
         name: "Fetch updated Makefile",
         uses: "actions/download-artifact@v8",
@@ -161,7 +206,7 @@
         name: "Create pull request",
         if: "steps.git-status.outputs.files != '0'",
         env: {
-          GH_TOKEN: "${{ github.token }}",
+          GH_TOKEN: "${{ steps.app-token.outputs.token || secrets.UPDATE_VERSIONS_TOKEN || github.token }}",
         },
         run: "\
            set -euo pipefail\n\
