@@ -1,6 +1,6 @@
 IMAGE              ?= zek
 # Pin the latest versions explicitly; bump these to move to a newer release.
-ALPINE_VERSION     ?= 3.24.2
+ALPINE_VERSION     ?= 3.24.3
 KUBERNETES_VERSION ?= v1.37.1
 
 DOCKER ?= docker
