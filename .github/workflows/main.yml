@@ -29,13 +29,13 @@
       uses: "./.github/workflows/ci.yml",
     },
     push: {
-      # Publish only when the image inputs changed (Dockerfile,
-      # entrypoint.sh, Makefile or .github/scripts/build-image.sh) and
-      # CI passed; rebuilds the same commit, so the pushed image is what
-      # the tests validated. Without an image change there is nothing new
-      # to publish.
+      # Publish only when the image content inputs changed (Dockerfile,
+      # entrypoint.sh or Makefile) and e2e was required; `needs: ci`
+      # ensures e2e passed. Rebuilds the same commit, so the pushed image
+      # is what the tests validated. Without an image change there is
+      # nothing new to publish.
       needs: "ci",
-      if: "needs.ci.outputs.image == 'true'",
+      if: "needs.ci.outputs.image == 'true' && needs.ci.outputs.e2e == 'true'",
       permissions: {
         contents: "read",
         packages: "write",

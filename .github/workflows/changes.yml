@@ -5,8 +5,8 @@
     workflow_call: {
       # e2e: files whose changes can alter what the end-to-end suite
       # exercises (the image, the CLI it drives, the harness itself).
-      # image: files that feed the published image build; changing any
-      # of them needs a rebuild and release.
+      # image: image content inputs only; CI/build scripts are
+      # intentionally excluded so harness-only changes do not publish.
       outputs: {
         e2e: {
           description: "Whether an e2e-relevant file changed",
@@ -67,7 +67,7 @@
            image=false\n\
            while IFS= read -r file; do\n\
           \  case \"${file}\" in\n\
-          \    Dockerfile | entrypoint.sh | Makefile | .github/scripts/build-image.sh) e2e=true image=true ;;\n\
+          \    Dockerfile | entrypoint.sh | Makefile) e2e=true image=true ;;\n\
           \    e2e.sh | zek.sh | .github/scripts/* | .github/workflows/*) e2e=true ;;\n\
           \  esac\n\
            done <<< \"${files}\"\n\
