@@ -62,12 +62,7 @@
         },
       }, {
         name: "Build image",
-        run: "\
-           set -euo pipefail\n\
-           export IMAGE=\"ghcr.io/${GITHUB_REPOSITORY,,}\"\n\
-           echo \"IMAGE=${IMAGE}\" >>\"$GITHUB_ENV\"\n\
-           make build\n\
-          ",
+        run: "./.github/scripts/build-image.sh",
       }, {
         name: "Run e2e tests",
         run: "\

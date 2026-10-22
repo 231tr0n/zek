@@ -34,7 +34,7 @@
     prepare: {
       # Resolve the new pins once, apply them, and share the updated
       # Makefile with everything downstream: the e2e jobs test exactly
-      # these pins and the PR publishes exactly what was tested.
+      # these pins and the PR commits exactly the Makefile that was tested.
       runs-on: "ubuntu-latest",
       timeout-minutes: 15,
       outputs: {
@@ -42,15 +42,10 @@
         alpine_prev: "${{ steps.latest.outputs.alpine_prev }}",
         k8s: "${{ steps.latest.outputs.k8s }}",
         k8s_prev: "${{ steps.latest.outputs.k8s_prev }}",
+        changed: "${{ steps.changed.outputs.changed }}",
       },
       steps: [{
         uses: "actions/checkout@v7",
-      }, {
-        name: "Print versions",
-        run: "\
-           git --version\n\
-           docker --version\n\
-          ",
       }, {
         name: "Resolve latest versions",
         id: "latest",
@@ -89,11 +84,23 @@
            sed -i -E 's|^(KUBERNETES_VERSION[[:space:]]*\\?=[[:space:]]*).*|\\1'\"${K8S}\"'|' Makefile\n\
           ",
       }, {
-        # Always shared (even when the pins did not change): e2e always
-        # fetches this artifact via the makefile-artifact input
-        # (build-and-test.yml), so a conditional upload would break the
-        # no-op run. The name must stay "updated-makefile" on both sides.
+        name: "Detect changes",
+        id: "changed",
+        run: "\
+           set -euo pipefail\n\
+           if git diff --quiet -- Makefile; then\n\
+          \  echo \"changed=false\" >>\"$GITHUB_OUTPUT\"\n\
+           else\n\
+          \  echo \"changed=true\" >>\"$GITHUB_OUTPUT\"\n\
+           fi\n\
+          ",
+      }, {
+        # Only shared when the pins changed: e2e and create-pr below are
+        # gated on the same output, so a no-op run spends no e2e compute
+        # and opens no pull request. The name must stay "updated-makefile"
+        # on both sides.
         name: "Share updated Makefile",
+        if: "steps.changed.outputs.changed == 'true'",
         uses: "actions/upload-artifact@v7",
         with: {
           name: "updated-makefile",
@@ -103,10 +110,14 @@
       }],
     },
     e2e: {
+      # The update-versions workflow only changes Makefile, and only when
+      # a newer alpine/k8s pin exists; without that change there is
+      # nothing for e2e to validate and no PR to open.
       needs: [
         "lint",
         "prepare",
       ],
+      if: "needs.prepare.outputs.changed == 'true'",
       uses: "./.github/workflows/build-and-test.yml",
       with: {
         makefile-artifact: "updated-makefile",
@@ -114,11 +125,13 @@
     },
     create-pr: {
       # Both needs are intentional: e2e implies prepare, but the PR body
-      # below reads needs.prepare.outputs.* directly.
+      # below reads needs.prepare.outputs.* directly. Without a pin change
+      # there is no PR to open, so skip this job along with e2e.
       needs: [
         "prepare",
         "e2e",
       ],
+      if: "needs.prepare.outputs.changed == 'true'",
       permissions: {
         contents: "write",
         pull-requests: "write",
@@ -163,9 +176,22 @@
            git switch -C \"${branch}\"\n\
            git add Makefile\n\
            git commit -m \"chore: update alpine/k8s versions\"\n\
-           # --force-with-lease: refuse to clobber a branch tip that\n\
-           # moved since this run fetched it (plain --force would not).\n\
-           git push --force-with-lease -u origin \"${branch}\"\n\
+           # Implicit --force-with-lease needs a remote-tracking ref, but\n\
+           # checkout only fetched main, so it always answers \"stale info\"\n\
+           # here. Pass the tip just read from origin explicitly instead\n\
+           # (empty output = branch does not exist yet, plain push creates\n\
+           # it); if the branch moves between the query and the push the\n\
+           # lease does not match and the push is rejected, not clobbered.\n\
+           if ! refs=$(git ls-remote --heads origin \"${branch}\"); then\n\
+          \  echo \"could not query ${branch} on origin\" >&2\n\
+          \  exit 1\n\
+           fi\n\
+           tip=$(cut -f1 <<< \"${refs}\")\n\
+           if [[ -n ${tip} ]]; then\n\
+          \  git push --force-with-lease=\"refs/heads/${branch}:${tip}\" -u origin \"${branch}\"\n\
+           else\n\
+          \  git push -u origin \"${branch}\"\n\
+           fi\n\
            # Capture the query: an gh failure inside [[ -n $(...) ]]\n\
            # would be swallowed as an empty answer and create a\n\
            # duplicate PR on top of an existing one.\n\
