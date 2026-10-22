@@ -7,8 +7,12 @@
       # same lint, path filter and e2e jobs, so keeping the wiring here
       # stops them from drifting apart.
       outputs: {
+        e2e: {
+          description: "Whether an e2e-relevant file changed",
+          value: "${{ jobs.changes.outputs.e2e }}",
+        },
         image: {
-          description: "Whether the Docker image inputs changed (gates publishing)",
+          description: "Whether the Docker image content inputs changed (gates publishing)",
           value: "${{ jobs.changes.outputs.image }}",
         },
       },
