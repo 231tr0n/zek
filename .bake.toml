@@ -1,0 +1,33 @@
+# mbake configuration for ./lint.sh and CI. Pinned in the repo so local and
+# CI formatting agree; the tool defaults (no variable alignment, no .PHONY
+# insertion) do not match this Makefile's style. Every formatter rule is
+# enabled; space_before_colon = false is the canonical no-space style. The
+# global false values keep output quiet and unwrapped.
+debug = false
+verbose = false
+gnu_error_format = true
+wrap_error_messages = false
+
+[formatter]
+space_around_assignment = true
+space_before_colon = false
+space_after_colon = true
+
+normalize_line_continuations = true
+max_line_length = 120
+
+auto_insert_phony_declarations = true
+group_phony_declarations = true
+phony_at_top = true
+
+remove_trailing_whitespace = true
+ensure_final_newline = true
+normalize_empty_lines = true
+max_consecutive_empty_lines = 1
+fix_missing_recipe_tabs = true
+
+indent_nested_conditionals = true
+tab_width = 4
+
+align_variable_assignments = true
+align_across_comments = true

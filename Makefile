@@ -45,17 +45,18 @@ push: ## Push $(IMAGE):$(TAG), $(IMAGE):$(COMBO_TAG) and :latest
 	$(DOCKER) push $(IMAGE):$(COMBO_TAG)
 	$(DOCKER) push $(IMAGE):latest
 
-# Keep in sync with .github/workflows/lint.yml (same image, packages and go installs).
+# Keep in sync with .github/workflows/lint.yml (same image, packages and tool installs).
 lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	$(DOCKER) run --rm \
 	-v "$(CURDIR):/repo:z" -w /repo \
 	fedora:latest bash -c ' \
 	set -euo pipefail; \
-	dnf install -y git shellcheck nodejs npm golang haproxy; \
+	dnf install -y git shellcheck nodejs npm golang haproxy make python3-pip; \
 	go install mvdan.cc/sh/v3/cmd/shfmt@latest; \
 	go install github.com/reteps/dockerfmt@latest; \
 	go install sigs.k8s.io/yaml/yamlfmt@latest; \
 	go install github.com/rhysd/actionlint/cmd/actionlint@latest; \
+	python3 -m pip install --root-user-action=ignore mbake; \
 	export PATH="$$(go env GOPATH)/bin:$$PATH"; \
 	git config --global --add safe.directory "*"; \
 	shellcheck --version | sed -n "2p"; \
@@ -63,6 +64,7 @@ lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	dockerfmt version; \
 	shfmt --version | sed -n "1p"; \
 	yamlfmt -h | sed -n "1p"; \
+	mbake --version; \
 	actionlint --version | sed -n "1p"; \
 	haproxy -v | sed -n "1p"; \
 	./lint.sh'

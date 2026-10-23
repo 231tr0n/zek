@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# lint - format/lint checks for every sh, Dockerfile, markdown, YAML and
-# GitHub Actions file in the repo. CI runs this same script
+# lint - format/lint checks for every sh, Makefile, Dockerfile, markdown,
+# YAML and GitHub Actions file in the repo. CI runs this same script
 # (.github/workflows/lint.yml). All tools run in their strictest mode:
 #
 #   format sh:          shfmt -l -s -d -i 0 -bn -ci -sr
@@ -31,6 +31,10 @@
 #                       newline); every RUN heredoc body is a shell script,
 #                       so it is also checked with shellcheck (sh dialect,
 #                       the Dockerfile RUN default) and shfmt
+#   format Makefile:    mbake format --stdin --config .bake.toml, compared
+#                       byte for byte (the repo config pins every formatter
+#                       rule so local and CI runs agree)
+#   lint Makefile:      mbake validate --config .bake.toml (GNU make syntax)
 #   lint actions:       actionlint over .github/workflows (also runs the
 #                       sh checks over every run: block)
 #   format md:          prettier --check --end-of-line lf
@@ -38,14 +42,19 @@
 #
 # Checks run in parallel; every check reads its payload directly (file
 # paths on the command line, or the heredoc bodies piped over stdin) and
-# only writes the ordered per-check report buffers to disk (mktemp).
+# only writes the ordered per-check report buffers to disk (mktemp). Each
+# report label gets an automatic count of its input files, labeled by kind.
+# Checks that lint assembled heredoc bodies label those files as sources
+# (e.g. "from 5 sh files") so the body language stays unambiguous.
 #
 # Fix locally with:  shfmt -w -s -i 0 -bn -ci -sr <files>  |
 #                    prettier --write <files>  |
 #                    dockerfmt -s -n -w Dockerfile  |  yamlfmt -w -o=kyaml <files>  |
-#                    dnf install haproxy  |
+#                    mbake format --config .bake.toml <files>  |
+#                    dnf install haproxy make python3-pip  |
 #                    go install sigs.k8s.io/yaml/yamlfmt@latest  |
-#                    go install github.com/rhysd/actionlint/cmd/actionlint@latest
+#                    go install github.com/rhysd/actionlint/cmd/actionlint@latest  |
+#                    python3 -m pip install mbake
 #
 # The check functions only ever run through run_check's dynamic dispatch
 # (their names are passed as arguments), so SC2329 - the unused-function
@@ -68,21 +77,77 @@ fi
 
 status=0
 
+# file_summary FROM_FILES ARG... - "(5 sh)" or "(1 Makefile)" for the
+# regular files among ARG..., or "(from 5 sh files)" when FROM_FILES=1
+# describes them as the sources of an assembled artifact. Every check
+# passes files of one kind; tool names and flags are not regular files.
+file_summary() { # from_files args...
+	local from_files=$1 file kind='' count=0
+	shift
+	for file in "$@"; do
+		[[ -f ${file} ]] || continue
+		if [[ -z ${kind} ]]; then
+			case ${file} in
+				*.sh) kind='sh' ;;
+				*.md) kind='md' ;;
+				*.yml | *.yaml) kind='yml/yaml' ;;
+				Makefile | */Makefile) kind='Makefile' ;;
+				*Dockerfile*) kind='Dockerfile' ;;
+				*) kind='file' ;;
+			esac
+		fi
+		count=$((count + 1))
+	done
+	[[ ${count} -eq 0 ]] && return 0
+	local label=${kind}
+	if [[ ${kind} == file && ${count} -ne 1 ]]; then
+		label='files'
+	fi
+	if [[ ${from_files} -eq 0 ]]; then
+		printf '(%d %s)' "${count}" "${label}"
+	elif [[ ${kind} == sh || ${kind} == md || ${kind} == yml/yaml ]]; then
+		local file_word='files'
+		[[ ${count} -eq 1 ]] && file_word='file'
+		printf '(from %d %s %s)' "${count}" "${label}" "${file_word}"
+	else
+		printf '(from %d %s)' "${count}" "${label}"
+	fi
+}
+
 # Every check runs in the background with its own output buffer so the
 # report keeps launch order while the tools still run in parallel. The
-# EXIT trap owns the buffers: an early errexit death still removes them.
+# label is suffixed with a count of the regular-file arguments (see
+# file_summary), so adding a file updates the report without a code edit.
+# A leading --from-files marks those arguments as the sources of an
+# assembled artifact, so the suffix reads "(from 5 sh files)" instead of
+# implying the artifact itself is a shell file. A successful check prints
+# only its "ok" line; the captured tool output is printed after the "FAIL"
+# line. The EXIT trap owns the buffers: an early errexit death still
+# removes them.
 check_pids=() check_bufs=()
 trap 'rm -f "${check_bufs[@]}"' EXIT
-run_check() { # desc cmd...
-	local desc=$1 buf
+run_check() { # [--from-files] desc cmd...
+	local desc buf out summary from_files=0
+	if [[ ${1-} == --from-files ]]; then
+		from_files=1
+		shift
+	fi
+	desc=$1
 	shift
+	summary=$(file_summary "${from_files}" "$@")
+	if [[ -n ${summary} ]]; then
+		desc="${desc} ${summary}"
+	fi
 	buf=$(mktemp)
 	check_bufs+=("${buf}")
 	{
-		if "$@"; then
+		if out=$("$@" 2>&1); then
 			printf 'ok   %s\n' "${desc}"
 		else
 			printf 'FAIL %s\n' "${desc}"
+			if [[ -n ${out} ]]; then
+				printf '%s\n' "${out}"
+			fi
 			exit 1
 		fi
 	} > "${buf}" 2>&1 &
@@ -100,7 +165,7 @@ wait_checks() {
 	check_pids=() check_bufs=()
 }
 
-for tool in shfmt shellcheck dockerfmt yamlfmt actionlint; do
+for tool in shfmt shellcheck dockerfmt yamlfmt mbake make actionlint; do
 	command -v "${tool}" > /dev/null 2>&1 || {
 		printf '[lint] missing tool: %s (install it to run this check)\n' "${tool}" >&2
 		exit 1
@@ -155,11 +220,15 @@ sh_list=$(git_list '*.sh')
 md_list=$(git_list '*.md')
 yaml_list=$(git_list '*.yml' '*.yaml')
 docker_list=$(git_list '*Dockerfile*')
-sh_files=() md_files=() yaml_files=() docker_files=()
+make_list=$(git_list 'Makefile')
+workflow_list=$(git_list '.github/workflows/*.yml' '.github/workflows/*.yaml')
+sh_files=() md_files=() yaml_files=() docker_files=() make_files=() workflow_files=()
 [[ -n ${sh_list} ]] && mapfile -t sh_files <<< "${sh_list}"
 [[ -n ${md_list} ]] && mapfile -t md_files <<< "${md_list}"
 [[ -n ${yaml_list} ]] && mapfile -t yaml_files <<< "${yaml_list}"
 [[ -n ${docker_list} ]] && mapfile -t docker_files <<< "${docker_list}"
+[[ -n ${make_list} ]] && mapfile -t make_files <<< "${make_list}"
+[[ -n ${workflow_list} ]] && mapfile -t workflow_files <<< "${workflow_list}"
 
 # awk program printing one heredoc body to stdout. -s is the opener line
 # number, -d the delimiter line, -u=1 for quoted openers (no shell
@@ -531,32 +600,66 @@ lint_yamlfmt() { # files...
 	return "${rc}"
 }
 
+# Every repo Makefile must be canonical mbake output. Format over stdin and
+# compare byte for byte, so the check never rewrites the working tree; the
+# repo .bake.toml pins every formatter rule for local and CI runs alike.
+lint_mbake() { # files...
+	local make_file out rc=0
+	for make_file in "$@"; do
+		if ! out=$(mbake format --stdin --config .bake.toml < "${make_file}" 2>&1); then
+			printf '%s: mbake format failed:\n%s\n' "${make_file}" "${out}" >&2
+			rc=1
+			continue
+		fi
+		if ! cmp -s <(printf '%s\n' "${out}") "${make_file}"; then
+			printf '%s: not canonical mbake output (diff: < mbake, > file):\n' "${make_file}" >&2
+			diff <(printf '%s\n' "${out}") "${make_file}" | sed 's/^/  /' >&2 || true
+			rc=1
+		fi
+	done
+	return "${rc}"
+}
+
+# Every repo Makefile must also pass mbake's GNU make syntax validation.
+# The global tool check requires make, so mbake cannot silently skip it.
+lint_mbake_validate() { # files...
+	local out
+	if ! out=$(mbake validate --config .bake.toml "$@" 2>&1); then
+		printf 'mbake validate failed:\n%s\n' "${out}" >&2
+		return 1
+	fi
+}
+
 if [[ ${#sh_files[@]} -gt 0 ]]; then
-	run_check "shfmt -l -s -i 0 -bn -ci -sr (${#sh_files[@]} sh)" \
+	run_check "shfmt -l -s -i 0 -bn -ci -sr" \
 		shfmt -l -s -d -i 0 -bn -ci -sr "${sh_files[@]}"
-	run_check "shellcheck -o all -x (${#sh_files[@]} sh)" shellcheck -o all -x "${sh_files[@]}"
-	run_check "shellcheck directives (${#sh_files[@]} sh)" lint_shellcheck_directives "${sh_files[@]}"
-	run_check "heredoc yaml (${#sh_files[@]} sh)" lint_heredocs_yaml "${sh_files[@]}"
-	run_check "heredoc coverage (${#sh_files[@]} sh)" lint_heredoc_coverage "${sh_files[@]}"
-	run_check "heredoc awk (${#sh_files[@]} sh)" lint_heredoc_awk "${sh_files[@]}"
+	run_check "shellcheck -o all -x" shellcheck -o all -x "${sh_files[@]}"
+	run_check "shellcheck directives" lint_shellcheck_directives "${sh_files[@]}"
+	run_check --from-files "heredoc yaml" lint_heredocs_yaml "${sh_files[@]}"
+	run_check --from-files "heredoc coverage: YAML/HAPROXY/AWK" lint_heredoc_coverage "${sh_files[@]}"
+	run_check --from-files "heredoc awk" lint_heredoc_awk "${sh_files[@]}"
 	if [[ ${haproxy_tool} -eq 1 ]]; then
-		run_check "haproxy -c (assembled LB config)" lint_haproxy_c "${sh_files[@]}"
-		run_check "haproxy style (assembled LB config)" lint_haproxy_style "${sh_files[@]}"
+		run_check --from-files "haproxy -c: assembled LB config" lint_haproxy_c "${sh_files[@]}"
+		run_check --from-files "haproxy style: assembled LB config" lint_haproxy_style "${sh_files[@]}"
 	fi
 fi
 if [[ ${#md_files[@]} -gt 0 ]]; then
-	run_check "prettier (${#md_files[@]} md)" "${prettier_cmd[@]}" --check --end-of-line lf "${md_files[@]}"
+	run_check "prettier" "${prettier_cmd[@]}" --check --end-of-line lf "${md_files[@]}"
 fi
 if [[ ${#yaml_files[@]} -gt 0 ]]; then
-	run_check "yamlfmt (${#yaml_files[@]} yml/yaml)" lint_yamlfmt "${yaml_files[@]}"
+	run_check "yamlfmt" lint_yamlfmt "${yaml_files[@]}"
 fi
 if [[ ${#docker_files[@]} -gt 0 ]]; then
-	for dockerfile in "${docker_files[@]}"; do
-		run_check "dockerfmt -s -n (${dockerfile})" dockerfmt -s -n --check "${dockerfile}"
-	done
-	run_check "RUN heredoc shell (${#docker_files[@]} Dockerfile)" lint_dockerfile_heredocs "${docker_files[@]}"
+	run_check "dockerfmt -s -n" dockerfmt -s -n --check "${docker_files[@]}"
+	run_check --from-files "RUN heredoc: shell" lint_dockerfile_heredocs "${docker_files[@]}"
 fi
-run_check "actionlint" actionlint
+if [[ ${#make_files[@]} -gt 0 ]]; then
+	run_check "mbake format" lint_mbake "${make_files[@]}"
+	run_check "mbake validate" lint_mbake_validate "${make_files[@]}"
+fi
+if [[ ${#workflow_files[@]} -gt 0 ]]; then
+	run_check "actionlint" actionlint "${workflow_files[@]}"
+fi
 wait_checks
 
 if [[ ${status} -ne 0 ]]; then

@@ -23,11 +23,12 @@
       # Fedora container for the dnf packages (shellcheck, golang, ...) so CI
       # and local runs agree. shfmt rides go install like the other floaters:
       # its Fedora package is orphaned. The toolchain floats :latest on
-      # purpose (Dependabot sees none of the go tools, nor the workflow
+      # purpose (Dependabot sees none of the go/pip tools, nor the workflow
       # `container:` image), so a toolchain breakage is fixed here by hand.
       # prettier resolves via npx (latest in lint.sh); yamlfmt
       # (sigs.k8s.io/yaml) formats the repo YAML files and lints the inline
-      # heredoc configs; actionlint checks the workflows plus the shell of
+      # heredoc configs; mbake (pip) formats and validates the Makefile
+      # against .bake.toml; actionlint checks the workflows plus the shell of
       # every run: block.
       container: "fedora:latest",
       timeout-minutes: 15,
@@ -35,11 +36,12 @@
         name: "Install lint tools",
         run: "\
            set -euo pipefail\n\
-           dnf install -y git shellcheck nodejs npm golang haproxy\n\
+           dnf install -y git shellcheck nodejs npm golang haproxy make python3-pip\n\
            go install mvdan.cc/sh/v3/cmd/shfmt@latest\n\
            go install github.com/reteps/dockerfmt@latest\n\
            go install sigs.k8s.io/yaml/yamlfmt@latest\n\
            go install github.com/rhysd/actionlint/cmd/actionlint@latest\n\
+           python3 -m pip install --root-user-action=ignore mbake\n\
            echo \"$(go env GOPATH)/bin\" >>\"$GITHUB_PATH\"\n\
           ",
       }, {
@@ -56,6 +58,7 @@
            dockerfmt version\n\
            shfmt --version | sed -n '1p'\n\
            yamlfmt -h | sed -n '1p'\n\
+           mbake --version\n\
            actionlint --version | sed -n '1p'\n\
            haproxy -v | sed -n '1p'\n\
           ",
