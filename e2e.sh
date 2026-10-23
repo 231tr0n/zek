@@ -869,7 +869,9 @@ EOF
 EOF
 	# The retry loops ride out endpoint-sync lag and slow upstream DNS.
 	# timeout bounds each attempt; 10 attempts + 2s sleeps cap each loop
-	# at ~70s, and the 180s wait covers both loops plus pod startup. The
+	# at ~70s, and the 180s wait covers both loops plus pod startup. wget
+	# writes to a file so only a successful attempt reaches the log; a
+	# timed-out attempt must not satisfy the pong assertion. The
 	# in-cluster lookup uses the FQDN: busybox
 	# nslookup does not expand the pod's search list for a 1-dot name
 	# (it behaves as if ndots were 1, so kubernetes.default is sent
@@ -894,7 +896,7 @@ EOF
       command: [
         "sh",
         "-c",
-        "i=0; until timeout 5 wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 10 ] && exit 1; sleep 2; done; timeout 5 nslookup kubernetes.default.svc.cluster.local; i=0; until timeout 5 nslookup kubernetes.io; do i=\$((i+1)); [ \$i -ge 10 ] && echo external-dns-failed && break; sleep 2; done",
+        "i=0; until timeout 5 wget -qO /tmp/pong http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 10 ] && exit 1; sleep 2; done; cat /tmp/pong; timeout 5 nslookup kubernetes.default.svc.cluster.local; i=0; until timeout 5 nslookup kubernetes.io; do i=\$((i+1)); [ \$i -ge 10 ] && echo external-dns-failed && break; sleep 2; done",
       ],
     }],
   },
