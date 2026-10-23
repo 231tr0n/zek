@@ -1190,7 +1190,13 @@ EOF
 		"starting ${cluster}-lb starting ${cluster}-master-1 starting ${cluster}-master-2 starting ${cluster}-master-3 starting ${cluster}-worker-1" \
 		"${out}"
 	wait_for "${cluster}: control plane readyz after down/up" 120 readyz_ok "${cluster}"
-	assert_cmd "${cluster}: node count after down/up" 4 node_count "${cluster}"
+	# Readyz answers before the API has converged after a restart cycle:
+	# one-shot kubectl can race the apiserver's authorization load (a
+	# Forbidden turns the count into 0) and the kubelets re-register later
+	# than readyz. node_count_is polls instead of asserting a snapshot -
+	# the etcd objects even let a nil kubelet window count as 4, so only
+	# polling proves the cluster really came back.
+	wait_for "${cluster}: node count after down/up" 300 node_count_is "${cluster}" 4
 	# shellcheck disable=SC2310
 	container_running "${cluster}-lb" || fail "${cluster}: load balancer not running after down/up"
 	# The LB config carries the long-lived stream timeouts port-forward
@@ -2353,7 +2359,10 @@ EOF
 	# (600s budget) finishes what --timeout 1 interrupted.
 	zk "${cluster}" up
 	wait_for "${cluster}: control plane readyz after timeout" 120 readyz_ok "${cluster}"
-	assert_cmd "${cluster}: node count after timeout recovery" 2 node_count "${cluster}"
+	# Same one-shot race as multi-master's down/up: after the restacked
+	# containers the apiserver and kubelets may still be converging, so
+	# poll the count.
+	wait_for "${cluster}: node count after timeout recovery" 120 node_count_is "${cluster}" 2
 
 	# A static-IP start racing docker's endpoint cleanup retries instead
 	# of failing at once (start_node in zek.sh): with the master's address
