@@ -4,9 +4,13 @@
   "on": {
     workflow_call: {
       # e2e: files whose changes can alter what the end-to-end suite
-      # exercises (the image, the CLI it drives, the harness itself).
-      # image: image content inputs only; CI scripts are intentionally
-      # excluded so harness-only changes do not publish.
+      # exercises (the image, the CLI it drives, the harness itself). The
+      # CI scripts lint.sh/format.sh are included too, so their changes
+      # get the full pipeline like every other script change.
+      # image: every file the built image can depend on. format.sh has no
+      # image content of its own, but it joins the publish gate so a
+      # formatter change still runs GHCR end to end (the rebuilt image
+      # content itself is unchanged).
       outputs: {
         e2e: {
           description: "Whether an e2e-relevant file changed",
@@ -67,8 +71,8 @@
            image=false\n\
            while IFS= read -r file; do\n\
           \  case \"${file}\" in\n\
-          \    Dockerfile | entrypoint.sh | Makefile) e2e=true image=true ;;\n\
-          \    e2e.sh | zek.sh | .github/scripts/* | .github/workflows/*) e2e=true ;;\n\
+          \    Dockerfile | entrypoint.sh | Makefile | format.sh) e2e=true image=true ;;\n\
+          \    e2e.sh | zek.sh | lint.sh | .github/scripts/* | .github/workflows/*) e2e=true ;;\n\
           \  esac\n\
            done <<< \"${files}\"\n\
            echo \"e2e=${e2e}\" >>\"$GITHUB_OUTPUT\"\n\

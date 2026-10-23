@@ -65,7 +65,7 @@
 #                  --timeout failing fast (a dead API and a node that never
 #                  registers), clean recreating the worker
 #                  (new Node UID, same pinned address) with
-#                  --image/--dns/--pod-cidr/--mounts,
+#                  --image/--latest/--dns/--pod-cidr/--mounts,
 #                  and destroy removing the containers and network
 #   persistence    flannel + a workload pinned to the single worker, then
 #                  recovery from: docker stop/start of every node at once,
@@ -281,8 +281,13 @@ cleanup() {
 trap cleanup EXIT
 
 # --- helpers ----------------------------------------------------------------
+# The image under test is normally a :latest tag (CI builds <repo>:latest and
+# the local default is zek:latest), so exercise zek.sh's --latest path. A
+# custom non-latest tag keeps going through ZEK_IMAGE unchanged.
+ZEK_LATEST_ARGS=()
+[[ ${ZEK_IMAGE} == *:latest ]] && ZEK_LATEST_ARGS=(--latest)
 # zk <cluster> <args...> - ./zek.sh pinned to a cluster.
-zk() { ./zek.sh --cluster "$1" "${@:2}"; }
+zk() { ./zek.sh --cluster "$1" "${ZEK_LATEST_ARGS[@]}" "${@:2}"; }
 
 up() { # cluster workers masters
 	local cluster=$1 workers=$2 masters=$3
@@ -1867,6 +1872,11 @@ EOF
 # instead of merely invoked (the per-job destroy swallows its exit).
 test_smoke() {
 	local cluster=$1 uids_before uids_after out role master_ip start_wait worker_ip_before
+	# --version is the one action that must work without a cluster or
+	# Docker: it prints the release version and exits during flag parsing.
+	out=$(./zek.sh --version) || fail "${cluster}: --version failed: ${out}"
+	[[ ${out} =~ ^zek[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] \
+		|| fail "${cluster}: --version output: want 'zek <x.y.z>', got '${out}'"
 	up "${cluster}" 1 1
 	# status prints the HEALTHCHECK verdict as its own column, so the
 	# master's first successful probe has to land before the read.
@@ -2032,6 +2042,8 @@ EOF
 		env ZEK_MASTERS=0 ./zek.sh --cluster "${cluster}-nope" up
 	assert_die "${cluster}: invalid ZEK_POD_CIDR env" "invalid pod CIDR" \
 		env ZEK_POD_CIDR=garbage ./zek.sh status
+	assert_die "${cluster}: invalid ZEK_LATEST" "invalid ZEK_LATEST" \
+		env ZEK_LATEST=bogus ./zek.sh status
 	assert_die "${cluster}: ZEK_CLUSTER selects the cluster" \
 		"no cluster named e2e-nope" env ZEK_CLUSTER=e2e-nope ./zek.sh status
 	assert_die "${cluster}: clean refuses a control-plane node" "cannot clean" \
@@ -2422,9 +2434,16 @@ EOF
 	# fresh dynamic one - that address is what its kubelet certificate and
 	# every reference to the node are built on.
 	worker_ip_before=$(container_ip "${cluster}-worker-1")
-	log "${cluster}: clean ${cluster}-worker-1 with --image/--dns/--pod-cidr/--mounts"
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" --image "${ZEK_IMAGE}" --dns 1.1.1.1 \
+	log "${cluster}: clean ${cluster}-worker-1 with --image/--latest/--dns/--pod-cidr/--mounts"
+	# --latest must replace the --image tag with :latest. When the image
+	# under test is a :latest tag, point --image at a tag that does not
+	# exist so a broken rewrite fails at docker run; the assertion below
+	# then requires the worker to come back on ZEK_IMAGE.
+	local -a clean_image_args=(--image "${ZEK_IMAGE}")
+	if [[ ${ZEK_IMAGE} == *:latest ]]; then
+		clean_image_args=(--image "${ZEK_IMAGE%:latest}:e2e-missing" --latest)
+	fi
+	out=$(./zek.sh --cluster "${cluster}" "${clean_image_args[@]}" --dns 1.1.1.1 \
 		--pod-cidr 10.245.0.0/16 --mounts "${WORK_DIR}:/e2e-mount" \
 		clean "${cluster}-worker-1" 2>&1) || fail "${cluster}: clean failed: ${out}"
 	assert_cmd "${cluster}: address of the recreated worker" "${worker_ip_before}" \

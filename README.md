@@ -18,22 +18,50 @@ No CNI is installed automatically. Once the nodes are up you install your own (f
 ## Build
 
 ```sh
-make build    # tags zek:<alpine>-<k8s>-<commit>, zek:<alpine>-<k8s>-latest and :latest
+make build
 ```
 
-Each build is tagged `<alpine>-<k8s>-<commit>` where the version pair is pinned
-in the Makefile (`ALPINE_VERSION`, `KUBERNETES_VERSION`) and the last component
-is the short git commit SHA (suffixed `-dirty` when the working tree has
-uncommitted changes), so every machine building the same commit produces the
-same tag and no state needs to be shared. `:latest` is re-pointed at each new
-build so default usage keeps working. `make build-nocache` re-runs the image
-preload step. Neither version is hard-coded in the Dockerfile. To build with
-raw docker, substitute the versions pinned in the Makefile:
+The commit tag is `<alpine>-<k8s>-<commit>`: the version pair is pinned in the
+Makefile (`ALPINE_VERSION`, `KUBERNETES_VERSION`) and the last component is the
+short git commit SHA (suffixed `-dirty` when the working tree has uncommitted
+changes), so every machine building the same commit produces the same tag and
+no state needs to be shared. `:latest` is re-pointed at each new build so
+default usage keeps working. `make build-nocache` re-runs the image preload
+step. Neither version is hard-coded in the Dockerfile.
+
+Every build also gets `<alpine>-<k8s>-latest` for the pinned combo and five
+version aliases that hold alpine at major, minor or full while tracking either
+the kubernetes minor or full version. With the current pins these are `3-1.37`,
+`3-1.37.1`, `3.24-1.37`, `3.24-1.37.1` and `3.24.3-1.37`. The kubernetes `v`
+prefix is dropped in those aliases, and `-` separates the two versions because
+Docker tags cannot contain `/`.
+
+To build with raw docker, substitute the versions pinned in the Makefile:
 
 ```sh
 docker build --build-arg ALPINE_VERSION=<alpine-version> \
   --build-arg KUBERNETES_VERSION=<k8s-version> -t zek:latest .
 ```
+
+## Versioning and releases
+
+`./zek.sh --version` prints the script release version. A released `zek.sh`
+pins its default node image to a specific Alpine/Kubernetes pair
+(`ghcr.io/231tr0n/zek:3.24.3-v1.37.1-latest`), so upgrading the script does not
+silently change the cluster's image versions. Override it with
+`--image`/`ZEK_IMAGE`, or follow the `latest` tag of the selected image
+repository with `--latest`/`ZEK_LATEST=1`:
+
+```sh
+./zek.sh --latest up
+ZEK_LATEST=1 ./zek.sh up
+
+make build
+ZEK_IMAGE=zek:latest ./zek.sh up
+```
+
+When cutting a release, bump `ZEK_VERSION` and update `DEFAULT_IMAGE` in
+`zek.sh` to the image that release was tested against.
 
 ## Upgrading Kubernetes
 
@@ -72,6 +100,10 @@ the published credentials in one run.
 ./zek.sh up                            # restart the same topology
 ./zek.sh destroy                       # remove the containers and network
 ```
+
+These commands use the release-pinned default image. After a local `make build`,
+run them with `ZEK_IMAGE=zek:latest` (or `--image zek:latest`) to use that image
+instead; see "Versioning and releases" above.
 
 `up [--workers N] [--masters M]` creates the cluster on the first run
 (defaults: 1 worker, 1 master; a bare number — `up 2` — is a shorthand for
@@ -117,15 +149,16 @@ on it is refused before anything is created.
 
 ### Flags and environment
 
-Every setting exists twice: as a flag and as an environment variable. The
-flag wins when both are set. Global flags go before the command
+Every setting except `--version` exists twice: as a flag and as an environment
+variable. The flag wins when both are set. Global flags go before the command
 (`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
 
 | Variable        | Flag          | Effect                                                                    |
 | --------------- | ------------- | ------------------------------------------------------------------------- |
 | `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                              |
 | `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                    |
-| `ZEK_IMAGE`     | `--image`     | Node image (default `zek:latest`)                                         |
+| `ZEK_IMAGE`     | `--image`     | Node image (default: release-pinned GHCR image)                           |
+| `ZEK_LATEST`    | `--latest`    | Use the `latest` tag of the selected image repository (`0`/`1`)           |
 | `ZEK_WORKERS`   | `--workers`   | Workers for the first `up` (default `1`, `0` allowed: control-plane only) |
 | `ZEK_MASTERS`   | `--masters`   | Masters for the first `up` (default `1`)                                  |
 | `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                 |

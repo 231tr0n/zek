@@ -45,12 +45,10 @@
 # only writes the ordered per-check report buffers to disk (mktemp). Each
 # report label gets an automatic count of its input files, labeled by kind.
 # Checks that lint assembled heredoc bodies label those files as sources
-# (e.g. "from 5 sh files") so the body language stays unambiguous.
+# (e.g. "from 6 sh files") so the body language stays unambiguous.
 #
-# Fix locally with:  shfmt -w -s -i 0 -bn -ci -sr <files>  |
-#                    prettier --write <files>  |
-#                    dockerfmt -s -n -w Dockerfile  |  yamlfmt -w -o=kyaml <files>  |
-#                    mbake format --config .bake.toml <files>  |
+# Fix locally with:  make format  (the formatters above, in place; heredoc
+#                    bodies stay hand-maintained)  |
 #                    dnf install haproxy make python3-pip  |
 #                    go install sigs.k8s.io/yaml/yamlfmt@latest  |
 #                    go install github.com/rhysd/actionlint/cmd/actionlint@latest  |
@@ -77,8 +75,8 @@ fi
 
 status=0
 
-# file_summary FROM_FILES ARG... - "(5 sh)" or "(1 Makefile)" for the
-# regular files among ARG..., or "(from 5 sh files)" when FROM_FILES=1
+# file_summary FROM_FILES ARG... - "(6 sh)" or "(1 Makefile)" for the
+# regular files among ARG..., or "(from 6 sh files)" when FROM_FILES=1
 # describes them as the sources of an assembled artifact. Every check
 # passes files of one kind; tool names and flags are not regular files.
 file_summary() { # from_files args...
@@ -119,7 +117,7 @@ file_summary() { # from_files args...
 # label is suffixed with a count of the regular-file arguments (see
 # file_summary), so adding a file updates the report without a code edit.
 # A leading --from-files marks those arguments as the sources of an
-# assembled artifact, so the suffix reads "(from 5 sh files)" instead of
+# assembled artifact, so the suffix reads "(from 6 sh files)" instead of
 # implying the artifact itself is a shell file. A successful check prints
 # only its "ok" line; the captured tool output is printed after the "FAIL"
 # line. The EXIT trap owns the buffers: an early errexit death still

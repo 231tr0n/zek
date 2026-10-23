@@ -33,14 +33,19 @@
 #                               tail a node container's logs
 #   ./zek.sh [flags] destroy    remove the cluster's containers and network
 #
-#   Global flags go before the command. Every one has an env twin and can
-#   be written as --flag value or --flag=value; when both are set the flag
-#   wins:
+#   Global flags go before the command. Flags that take a value have an env
+#   twin and can be written as --flag value or --flag=value; when both are
+#   set the flag wins:
+#   --version               print the zek.sh version
+#   --latest                use the latest tag of the selected image
+#                           repository (ZEK_LATEST=1; by default, the
+#                           release-pinned image's repository)
 #   --cluster NAME          cluster to operate on (ZEK_CLUSTER, default zek)
 #   --timeout SECONDS       bound for every internal wait (control plane up,
 #                           nodes registered, credentials published);
 #                           default 600 (ZEK_TIMEOUT)
-#   --image IMAGE           node image (ZEK_IMAGE, default zek:latest)
+#   --image IMAGE           node image (ZEK_IMAGE, default: release-pinned
+#                           GHCR image; see DEFAULT_IMAGE)
 #   --subnet CIDR           cluster subnet (ZEK_SUBNET, default: first free
 #                           172.20.X.0/24)
 #   --master-ip IP          first master's IP (ZEK_MASTER_IP, default
@@ -53,9 +58,9 @@
 #                           host-path:container-path[:options] (ZEK_MOUNTS)
 #   up-only flags: --workers N (ZEK_WORKERS), --masters M (ZEK_MASTERS).
 #
-# Env overrides: the env twin of every flag above - ZEK_CLUSTER,
-#                ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET, ZEK_MASTER_IP, ZEK_DNS,
-#                ZEK_POD_CIDR, ZEK_MOUNTS, ZEK_WORKERS, ZEK_MASTERS.
+# Env overrides: ZEK_LATEST (0/1; same as --latest) and the value flags:
+# ZEK_CLUSTER, ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET, ZEK_MASTER_IP, ZEK_DNS,
+# ZEK_POD_CIDR, ZEK_MOUNTS, ZEK_WORKERS, ZEK_MASTERS.
 set -euo pipefail
 
 log() { echo "[zek] $*" >&2; }
@@ -105,11 +110,40 @@ require_ipv4() { # <value> cidr|addr <label>
 	done
 }
 
-# Settings: environment first (each flag's env twin), then the flags parsed
-# below override them (flag > env > default), then everything is validated.
+# Script release version, independent of the pinned image version. Bump this
+# when cutting a zek.sh release; --version prints it.
+ZEK_VERSION="0.1.0"
+# Image a released zek.sh uses by default. The version pair is pinned so the
+# script does not silently move to different Alpine/Kubernetes versions.
+# ZEK_IMAGE/--image override it, e.g. ZEK_IMAGE=zek:latest for a local build.
+DEFAULT_IMAGE="ghcr.io/231tr0n/zek:3.24.3-v1.37.1-latest"
+
+# latest_image <image> - replace the tag (or digest) with :latest, keeping
+# the repository and any registry port. --latest uses this on the effective
+# IMAGE, so a custom --image/ZEK_IMAGE repository still selects its own
+# latest tag.
+latest_image() {
+	local image=${1%%@*}
+	if [[ ${image##*/} == *:* ]]; then
+		image=${image%:*}
+	fi
+	printf '%s:latest\n' "${image}"
+}
+
+# Settings: environment first (each value flag's env twin), then the flags
+# parsed below override them (flag > env > default), then everything is
+# validated.
 CLUSTER="${ZEK_CLUSTER:-zek}"
 WAIT_TIMEOUT="${ZEK_TIMEOUT:-600}"
-IMAGE="${ZEK_IMAGE:-zek:latest}"
+IMAGE="${ZEK_IMAGE:-${DEFAULT_IMAGE}}"
+# ZEK_LATEST is the env twin of --latest. Apply it before parsing flags so an
+# explicit --image still wins.
+ZEK_LATEST="${ZEK_LATEST:-0}"
+case "${ZEK_LATEST}" in
+	0) ;;
+	1) IMAGE=$(latest_image "${IMAGE}") ;;
+	*) die "invalid ZEK_LATEST '${ZEK_LATEST}' (expected 0 or 1; same as --latest)" ;;
+esac
 SUBNET="${ZEK_SUBNET:-}"
 MASTER_IP="${ZEK_MASTER_IP:-}"
 DNS="${ZEK_DNS:-}"
@@ -123,6 +157,7 @@ MOUNTS="${ZEK_MOUNTS:-}"
 # environment, and cmd_up's flags override them.
 ENV_WORKERS="${ZEK_WORKERS:-1}"
 ENV_MASTERS="${ZEK_MASTERS:-1}"
+
 # Join credentials published by the first master (read_join_credentials):
 # declared here so `set -u` never sees an implicit global.
 CRED_ARGS=()
@@ -142,6 +177,10 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--timeout=*) WAIT_TIMEOUT="${1#*=}" && shift ;;
+		--latest)
+			IMAGE=$(latest_image "${IMAGE}")
+			shift
+			;;
 		--image)
 			shift
 			[[ $# -gt 0 ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
@@ -184,6 +223,10 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--mounts=*) MOUNTS="${1#*=}" && shift ;;
+		--version)
+			printf 'zek %s\n' "${ZEK_VERSION}"
+			exit 0
+			;;
 		*) break ;;
 	esac
 done
@@ -841,7 +884,7 @@ cmd_destroy() {
 }
 
 usage() {
-	die "usage: $0 [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
+	die "usage: $0 [--version] [--latest] [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
 }
 
 # Global flags are only parsed before the command (see the header), so a
