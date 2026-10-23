@@ -867,9 +867,10 @@ EOF
   },
 }
 EOF
-	# The retry loops ride out endpoint-sync lag and slow upstream DNS;
-	# 15 x (fast failure + 2s) bounds each dead end at ~75s instead of
-	# the full e2e budget. The in-cluster lookup uses the FQDN: busybox
+	# The retry loops ride out endpoint-sync lag and slow upstream DNS.
+	# timeout bounds each attempt; 10 attempts + 2s sleeps cap each loop
+	# at ~70s, and the 180s wait covers both loops plus pod startup. The
+	# in-cluster lookup uses the FQDN: busybox
 	# nslookup does not expand the pod's search list for a 1-dot name
 	# (it behaves as if ndots were 1, so kubernetes.default is sent
 	# literally and always NXDOMAINs). Short names with the search list
@@ -893,13 +894,13 @@ EOF
       command: [
         "sh",
         "-c",
-        "i=0; until wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 15 ] && exit 1; sleep 2; done; nslookup kubernetes.default.svc.cluster.local; i=0; until nslookup kubernetes.io; do i=\$((i+1)); [ \$i -ge 15 ] && echo external-dns-failed && break; sleep 2; done",
+        "i=0; until timeout 5 wget -qO- http://e2e-svc/; do i=\$((i+1)); [ \$i -ge 10 ] && exit 1; sleep 2; done; timeout 5 nslookup kubernetes.default.svc.cluster.local; i=0; until timeout 5 nslookup kubernetes.io; do i=\$((i+1)); [ \$i -ge 10 ] && echo external-dns-failed && break; sleep 2; done",
       ],
     }],
   },
 }
 EOF
-	wait_for "${cluster}: service test pod finished" 120 svc_test_done "${cluster}"
+	wait_for "${cluster}: service test pod finished" 180 svc_test_done "${cluster}"
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" kubectl logs svc-test 2> /dev/null) || out=""
 	[[ ${out} == *pong* ]] \
@@ -1030,6 +1031,13 @@ diag() {
 		custom-columns='NS:.metadata.namespace,POD:.metadata.name,CPU-REQ:.spec.containers[*].resources.requests.cpu,CPU-LIM:.spec.containers[*].resources.limits.cpu' || true
 	./zek.sh --cluster "${cluster}" kubectl get events -A --sort-by=.lastTimestamp 2> /dev/null \
 		| tail -50 || true
+	# The service test's client logs are the only way to tell a hung
+	# wget from a slow DNS retry; the pod is absent for tests that never
+	# create it.
+	if ./zek.sh --cluster "${cluster}" kubectl get pod svc-test > /dev/null 2>&1; then
+		./zek.sh --cluster "${cluster}" kubectl logs svc-test --tail=50 2>&1 || true
+		./zek.sh --cluster "${cluster}" kubectl get endpoints e2e-svc -o wide 2>&1 || true
+	fi
 	# shellcheck disable=SC2310
 	container_list=$(cluster_containers "${cluster}") || container_list=""
 	while IFS= read -r container; do
