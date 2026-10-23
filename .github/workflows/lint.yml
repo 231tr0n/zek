@@ -57,7 +57,7 @@
            npx --yes prettier --version\n\
            dockerfmt version\n\
            shfmt --version | sed -n '1p'\n\
-           yamlfmt -h | sed -n '1p'\n\
+           go version -m \"$(command -v yamlfmt)\" | awk '$1 == \"mod\" { print \"yamlfmt (\" $2 \") \" $3 }'\n\
            mbake --version\n\
            actionlint --version | sed -n '1p'\n\
            haproxy -v | sed -n '1p'\n\

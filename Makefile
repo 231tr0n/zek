@@ -63,7 +63,7 @@ lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	npx --yes prettier --version; \
 	dockerfmt version; \
 	shfmt --version | sed -n "1p"; \
-	yamlfmt -h | sed -n "1p"; \
+	go version -m "$$(command -v yamlfmt)" | awk "\$$1 == \"mod\" { print \"yamlfmt (\" \$$2 \") \" \$$3 }"; \
 	mbake --version; \
 	actionlint --version | sed -n "1p"; \
 	haproxy -v | sed -n "1p"; \
