@@ -57,10 +57,7 @@
         },
       }, {
         name: "Push image",
-        run: "\
-           set -euo pipefail\n\
-           docker push --all-tags \"${IMAGE}\"\n\
-          ",
+        run: "make push",
       }],
     },
   },
