@@ -75,16 +75,14 @@
         # split so each entry finishes well inside five minutes.
         # multi-master stays a single entry: its 3+1 bring-up is most of
         # the cost and every additional entry would repeat it, so
-        # splitting multiplies the runtime instead of shortening it. It
-        # also finishes with a second bring-up (LB reuse after a failed
-        # create), hence the wider cap. The cap is a timeout, not the
-        # expected runtime - the test ran in ~10 minutes before the split;
-        # the extra room covers the CI variance seen while creating 3+1.
-        # cilium is likewise unsplit - its install is dominated by pulling
-        # CNI images from quay.io, which no split can shorten. The image
-        # build above is a separate step; only the job's 90-minute
-        # timeout bounds it.
-        timeout-minutes: "${{ matrix.test == 'multi-master' && 20 || matrix.test == 'cilium' && 10 || 5 }}",
+        # splitting multiplies the runtime instead of shortening it. Its
+        # aborted-create/LB-reuse check uses that same bring-up, but the
+        # HA checks still put the entry around six minutes. cilium is
+        # likewise unsplit - its install is dominated by pulling CNI
+        # images from quay.io, which no split can shorten. The image build
+        # above is a separate step; only the job's 90-minute timeout
+        # bounds it.
+        timeout-minutes: "${{ matrix.test == 'multi-master' && 10 || matrix.test == 'cilium' && 10 || 5 }}",
         run: "\
            set -euo pipefail\n\
            ZEK_IMAGE=\"${IMAGE}:latest\" ./e2e.sh \"${{ matrix.test }}\"\n\

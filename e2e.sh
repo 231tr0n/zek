@@ -27,18 +27,19 @@
 #                  restart, while a kubelet kill is healed by the
 #                  supervisor inside the probe window so the verdict
 #                  stays healthy
-#   multi-master   3 masters + 1 worker: HA init/join behind the LB, all
-#                  control-plane static pods (apiserver, etcd, scheduler,
-#                  controller-manager) Running on every master, apiserver
-#                  logs and a port-forward streaming through the LB, the
-#                  LB container's HEALTHCHECK (haproxy stats page) turns
+#   multi-master   3 masters + 1 worker: a create aborted after its first
+#                  node leaves the LB reusable by the next up, then HA
+#                  init/join behind the LB, all control-plane static pods
+#                  (apiserver, etcd, scheduler, controller-manager)
+#                  Running on every master, apiserver logs and a
+#                  port-forward streaming through the LB, the LB
+#                  container's HEALTHCHECK (haproxy stats page) turns
 #                  healthy, 3 etcd members with one backend line each,
 #                  quorum survives one stopped master and breaks on two,
 #                  an interrupted join on a second master recovers
-#                  without republishing credentials, `zek down`/`up`
+#                  without republishing credentials, and `zek down`/`up`
 #                  restarts the HA cluster incl. the LB and its live
-#                  haproxy config, and the next up reuses the LB left by
-#                  a create aborted after its first node
+#                  haproxy config
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -1089,12 +1090,51 @@ diag() {
 
 # The HA checks stay in one test on purpose: every CI matrix entry pays
 # its own 3+1 bring-up (the dominant cost), so splitting them would
-# repeat that setup per entry instead of shortening the run. This test
-# keeps a wider CI timeout for the same reason.
+# repeat that setup per entry instead of shortening the run. The
+# aborted-create check runs first, so its final up is the only full
+# bring-up, and the test keeps a wider CI timeout than the cheap splits.
 
 test_multi_master() {
 	local cluster=$1 master_idx out lb_ip up_pid
-	up "${cluster}" 1 3
+	# LB reuse after a failed create runs first: abort a 3+1 create as soon
+	# as its first node container exists, remove the nodes it got to, and
+	# let the next up reuse the leftover network and LB. That final up is
+	# the single full bring-up every check below uses.
+	log "${cluster}: LB reused after a failed create"
+	# Called directly rather than through zk: $! must be the zek.sh
+	# process this test kills, not a wrapper subshell. The redirect keeps
+	# the aborted run's output out of the parallel test log.
+	./zek.sh --cluster "${cluster}" up --workers 1 --masters 3 \
+		> "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" 2>&1 &
+	up_pid=$!
+	# Wait for master-1, not just the LB (up to 60s): the LB appears a
+	# moment before the node, and killing before the first node exists
+	# would let its in-flight docker run land after the cleanup below.
+	for _ in {1..300}; do
+		if docker inspect "${cluster}-master-1" > /dev/null 2>&1; then
+			break
+		fi
+		sleep 0.2
+	done
+	kill "${up_pid}" 2> /dev/null || true
+	wait "${up_pid}" 2> /dev/null || true
+	docker inspect "${cluster}-master-1" > /dev/null 2>&1 \
+		|| fail "${cluster}: failed create started no master"
+	# The abandoned run created the network and LB from scratch; the next
+	# up must take the reuse branches, not create them again.
+	grep -q "creating ${cluster}-lb" "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" \
+		|| fail "${cluster}: aborted create did not create the load balancer"
+	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
+	# Only the LB and the network stay behind, like a create that died
+	# after its first node. All four names are removed defensively.
+	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" \
+		> /dev/null 2>&1 || true
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 1 --masters 3 2>&1) || fail "${cluster}: up after failed create failed: ${out}"
+	[[ ${out} == *"reusing ${cluster}-lb"* ]] \
+		|| fail "${cluster}: up did not reuse the load balancer: ${out}"
+	assert_cmd "${cluster}: LB kept its IP after reuse" "${lb_ip}" \
+		docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb"
 	assert_cmd "${cluster}: node count" 4 node_count "${cluster}"
 	assert_cmd "${cluster}: etcd members" 3 ns_pod_count "${cluster}" '^etcd-'
 	for master_idx in 1 2 3; do
@@ -1265,46 +1305,6 @@ EOF
 		fail "${cluster}: join-master republished credentials on resume"
 	fi
 
-	# LB reuse after a failed create: start from no cluster, abort a fresh
-	# 3+1 create as soon as its first node container exists, and remove the
-	# nodes it got to. The network and LB stay behind; the next up must
-	# reuse them instead of failing on a duplicate container or subnet.
-	log "${cluster}: LB reused after a failed create"
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" destroy 2>&1) \
-		|| fail "${cluster}: destroy before the failed create failed: ${out}"
-	# Called directly rather than through zk: $! must be the zek.sh
-	# process this test kills, not a wrapper subshell. The redirect keeps
-	# the aborted run's output out of the parallel test log.
-	./zek.sh --cluster "${cluster}" up --workers 1 --masters 3 \
-		> "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" 2>&1 &
-	up_pid=$!
-	# Wait for master-1, not just the LB (up to 60s): the LB appears a
-	# moment before the node, and killing before the first node exists
-	# would let its in-flight docker run land after the cleanup below.
-	for _ in {1..300}; do
-		if docker inspect "${cluster}-master-1" > /dev/null 2>&1; then
-			break
-		fi
-		sleep 0.2
-	done
-	kill "${up_pid}" 2> /dev/null || true
-	wait "${up_pid}" 2> /dev/null || true
-	docker inspect "${cluster}-master-1" > /dev/null 2>&1 \
-		|| fail "${cluster}: failed create started no master"
-	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
-	# Only the LB and the network stay behind, like a create that died
-	# after its first node. All four names are removed defensively.
-	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" \
-		> /dev/null 2>&1 || true
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up --workers 1 --masters 3 2>&1) || fail "${cluster}: up after failed create failed: ${out}"
-	[[ ${out} == *"reusing ${cluster}-lb"* ]] \
-		|| fail "${cluster}: up did not reuse the load balancer: ${out}"
-	assert_cmd "${cluster}: LB kept its IP after reuse" "${lb_ip}" \
-		docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb"
-	wait_for "${cluster}: control plane readyz after LB reuse" 120 readyz_ok "${cluster}"
-	assert_cmd "${cluster}: node count after LB reuse" 4 node_count "${cluster}"
 }
 
 test_multi_worker() {
