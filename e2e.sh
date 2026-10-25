@@ -27,21 +27,18 @@
 #                  restart, while a kubelet kill is healed by the
 #                  supervisor inside the probe window so the verdict
 #                  stays healthy
-#   multi-master-1 3 masters + 1 worker: HA init/join behind the LB, all
+#   multi-master   3 masters + 1 worker: HA init/join behind the LB, all
 #                  control-plane static pods (apiserver, etcd, scheduler,
 #                  controller-manager) Running on every master, apiserver
-#                  logs and a port-forward streaming through the LB, and
-#                  the LB container's HEALTHCHECK (haproxy stats page)
-#                  turns healthy
-#   multi-master-2 3 masters + 1 worker: the etcd quorum survives one
-#                  stopped master and breaks when two are down
-#   multi-master-3 an interrupted join on a second master recovers without
-#                  republishing credentials, and `zek down`/`up` restarts
-#                  the HA cluster incl. the LB and its live haproxy config
-#                  (one backend line per master, stats page, haproxy -c)
-#   multi-master-4 a 3+1 create aborted as soon as its first node exists:
-#                  the next up reuses the LB and recreates the full topology
-#                  instead of failing on a duplicate container or subnet
+#                  logs and a port-forward streaming through the LB, the
+#                  LB container's HEALTHCHECK (haproxy stats page) turns
+#                  healthy, 3 etcd members with one backend line each,
+#                  quorum survives one stopped master and breaks on two,
+#                  an interrupted join on a second master recovers
+#                  without republishing credentials, the LB is reused
+#                  after a failed create, and `zek down`/`up` restarts
+#                  the HA cluster incl. the LB and its live haproxy
+#                  config
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -93,7 +90,7 @@
 #                  an early interrupted init/join that wipes and re-inits
 #                  (with ctr hidden), and an interrupted control-plane setup
 #                  (same wipe); an interrupted control-plane join on a
-#                  second master is covered in multi-master-3 instead
+#                  second master is covered in multi-master instead
 #
 # Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its own
 # cluster and pre-allocated subnet, but they share one scratch dir -
@@ -134,7 +131,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-ALL_TESTS=(single-node multi-master-1 multi-master-2 multi-master-3 multi-master-4 multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
+ALL_TESTS=(single-node multi-master multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
 
 export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
 export ZEK_TIMEOUT="${ZEK_TIMEOUT:-600}"
@@ -159,7 +156,7 @@ fail() {
 }
 
 usage() {
-	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master-1|multi-master-2|multi-master-3|multi-master-4|multi-worker|flannel|cilium|smoke-1|smoke-2|smoke-3|smoke-4|smoke-5|persistence-1|persistence-2|recovery-1|recovery-2]..."
+	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master|multi-worker|flannel|cilium|smoke-1|smoke-2|smoke-3|smoke-4|smoke-5|persistence-1|persistence-2|recovery-1|recovery-2]..."
 }
 
 # --- flag parsing and test selection ----------------------------------------
@@ -1090,12 +1087,13 @@ diag() {
 
 # --- tests ------------------------------------------------------------------
 
-# The HA checks are split into independently scheduled tests: each pays a
-# full 3+1 bring-up, so keeping them together would push one run past the
-# five-minute CI budget.
+# The HA checks stay in one test on purpose: every CI matrix entry pays
+# its own 3+1 bring-up (the dominant cost), so splitting them would
+# repeat that setup per entry instead of shortening the run. This test
+# keeps a wider CI timeout for the same reason.
 
-test_multi_master_1() {
-	local cluster=$1 master_idx out
+test_multi_master() {
+	local cluster=$1 master_idx out lb_ip
 	up "${cluster}" 1 3
 	assert_cmd "${cluster}: node count" 4 node_count "${cluster}"
 	assert_cmd "${cluster}: etcd members" 3 ns_pod_count "${cluster}" '^etcd-'
@@ -1182,12 +1180,6 @@ EOF
 		pf_serves "${cluster}-master-1"
 	docker exec "${cluster}-master-1" pkill -f "port-forward" 2> /dev/null || true
 	zk "${cluster}" kubectl delete pod e2e-pf --wait=false > /dev/null
-}
-
-test_multi_master_2() {
-	local cluster=$1
-	up "${cluster}" 1 3
-	wait_for "${cluster}: control plane readyz" 120 readyz_ok "${cluster}"
 
 	# 3 etcd members: stopping one leaves 2 of 3 - a quorum, so the API
 	# keeps serving; a second stop would not.
@@ -1208,37 +1200,6 @@ test_multi_master_2() {
 	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
 	wait_for "${cluster}: apiserver on master-3 serving again" 300 master_readyz "${cluster}" 3
 	wait_for "${cluster}: control plane readyz after quorum restore" 120 readyz_ok "${cluster}"
-}
-
-test_multi_master_3() {
-	local cluster=$1 out
-	up "${cluster}" 1 3
-	wait_for "${cluster}: control plane readyz" 120 readyz_ok "${cluster}"
-
-	# Interrupted control-plane join on a second master: kubelet.conf
-	# gone, certs left behind. The same reset as an interrupted init must
-	# wipe and re-join (the container keeps its JOIN_* env across restarts).
-	log "${cluster}: interrupted control-plane join on master-2 recovers"
-	docker exec "${cluster}-master-2" rm -f /etc/kubernetes/kubelet.conf
-	docker restart "${cluster}-master-2" > /dev/null
-	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
-		"interrupted control-plane setup detected; resetting partial state"
-	# The re-join re-runs the image import with a full store, so it must
-	# take the skip fast path instead of re-reading ~500MB of tarballs.
-	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
-		"already in the containerd store; skipping import"
-	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
-	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
-	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
-	# A joining master must never rotate the published credentials on
-	# resume: nothing of the set may exist on its layer, and its logs
-	# must not show a republish.
-	docker exec "${cluster}-master-2" test ! -f /etc/cluster/token \
-		|| fail "${cluster}: join-master published credentials it must not rotate"
-	# shellcheck disable=SC2310
-	if log_has "${cluster}-master-2" "republishing"; then
-		fail "${cluster}: join-master republished credentials on resume"
-	fi
 
 	log "${cluster}: zek down + up restarts the HA cluster incl. the load balancer"
 	zk "${cluster}" down
@@ -1278,40 +1239,38 @@ test_multi_master_3() {
 		|| fail "${cluster}: haproxy stats page does not serve"
 	docker exec "${cluster}-lb" haproxy -c -f /etc/haproxy/haproxy.cfg \
 		|| fail "${cluster}: live haproxy.cfg fails haproxy -c"
-}
 
-test_multi_master_4() {
-	local cluster=$1 lb_ip out up_pid
-	# A failed create leaves the network and LB behind. Start a full 3+1
-	# create, abort it once the first node container exists (before the
-	# slow control-plane bring-up), and remove the nodes it got to. The
-	# next up must reuse the LB and recreate the same topology - the path
-	# a create that died this way takes, without two full bring-ups.
+	# Interrupted control-plane join on a second master: kubelet.conf
+	# gone, certs left behind. The same reset as an interrupted init must
+	# wipe and re-join (the container keeps its JOIN_* env across restarts).
+	log "${cluster}: interrupted control-plane join on master-2 recovers"
+	docker exec "${cluster}-master-2" rm -f /etc/kubernetes/kubelet.conf
+	docker restart "${cluster}-master-2" > /dev/null
+	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
+		"interrupted control-plane setup detected; resetting partial state"
+	# The re-join re-runs the image import with a full store, so it must
+	# take the skip fast path instead of re-reading ~500MB of tarballs.
+	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
+		"already in the containerd store; skipping import"
+	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
+	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
+	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
+	# A joining master must never rotate the published credentials on
+	# resume: nothing of the set may exist on its layer, and its logs
+	# must not show a republish.
+	docker exec "${cluster}-master-2" test ! -f /etc/cluster/token \
+		|| fail "${cluster}: join-master published credentials it must not rotate"
+	# shellcheck disable=SC2310
+	if log_has "${cluster}-master-2" "republishing"; then
+		fail "${cluster}: join-master republished credentials on resume"
+	fi
+
+	# LB reuse after a failed create: with the nodes gone but the network
+	# and LB left behind, the next up must reuse the LB instead of failing
+	# on a duplicate container or subnet.
 	log "${cluster}: LB reused after a failed create"
-	# Called directly rather than through zk: $! must be the zek.sh
-	# process this test kills, not a wrapper subshell. The redirect keeps
-	# the aborted run's output out of the parallel test log.
-	./zek.sh --cluster "${cluster}" up --workers 1 --masters 3 \
-		> "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" 2>&1 &
-	up_pid=$!
-	# Wait for master-1, not just the LB (up to 60s): the LB appears a
-	# moment before the node, and killing before the first node exists
-	# would let its in-flight docker run land after the cleanup below.
-	for _ in {1..300}; do
-		if docker inspect "${cluster}-master-1" > /dev/null 2>&1; then
-			break
-		fi
-		sleep 0.2
-	done
-	kill "${up_pid}" 2> /dev/null || true
-	wait "${up_pid}" 2> /dev/null || true
-	docker inspect "${cluster}-master-1" > /dev/null 2>&1 \
-		|| fail "${cluster}: failed create started no master"
 	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
-	# Only the LB and the network stay behind, like a create that died
-	# after its first node. All four names are removed defensively.
-	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" \
-		> /dev/null 2>&1 || true
+	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" > /dev/null
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers 1 --masters 3 2>&1) || fail "${cluster}: up after failed create failed: ${out}"
 	[[ ${out} == *"reusing ${cluster}-lb"* ]] \
@@ -1618,7 +1577,7 @@ test_persistence_1() {
 		"purging stale containers from previous node instance" "${purges_before}"
 	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "master restart"
 	# The credentials were complete, so the resume must not have rotated
-	# them - the master-1 twin of the join-master guard in multi-master-3,
+	# them - the master-1 twin of the join-master guard in multi-master,
 	# compared by count (assert_persistent_state above already waited out the resume,
 	# so no new line by now means none is coming).
 	repubs_after=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "published credentials incomplete; republishing" || true)
@@ -2457,7 +2416,7 @@ test_smoke_4() {
 	# (600s budget) finishes what --timeout 1 interrupted.
 	zk "${cluster}" up
 	wait_for "${cluster}: control plane readyz after timeout" 120 readyz_ok "${cluster}"
-	# Same one-shot race as multi-master-3's down/up: after the restacked
+	# Same one-shot race as multi-master's down/up: after the restacked
 	# containers the apiserver and kubelets may still be converging, so
 	# poll the count.
 	wait_for "${cluster}: node count after timeout recovery" 120 node_count_is "${cluster}" 2
