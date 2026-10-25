@@ -35,13 +35,22 @@
           # the 4 vCPU/16GB runner starve kubelet, so no job ever runs two.
           test: [
             "single-node",
-            "multi-master",
+            "multi-master-1",
+            "multi-master-2",
+            "multi-master-3",
+            "multi-master-4",
             "multi-worker",
             "flannel",
             "cilium",
-            "smoke",
-            "persistence",
-            "recovery",
+            "smoke-1",
+            "smoke-2",
+            "smoke-3",
+            "smoke-4",
+            "smoke-5",
+            "persistence-1",
+            "persistence-2",
+            "recovery-1",
+            "recovery-2",
           ],
         },
       },
@@ -65,6 +74,14 @@
         run: "./.github/scripts/build-image.sh",
       }, {
         name: "Run e2e tests",
+        # Hard budget per matrix entry: the long flows are split into
+        # smoke-N/multi-master-N/persistence-N/recovery-N tests so each
+        # run finishes well inside five minutes. cilium is the exception:
+        # its install is dominated by pulling CNI images from quay.io,
+        # which no split can shorten, so it keeps a wider cap. The image
+        # build above is a separate step; only the job's 90-minute
+        # timeout bounds it.
+        timeout-minutes: "${{ matrix.test == 'cilium' && 10 || 5 }}",
         run: "\
            set -euo pipefail\n\
            ZEK_IMAGE=\"${IMAGE}:latest\" ./e2e.sh \"${{ matrix.test }}\"\n\

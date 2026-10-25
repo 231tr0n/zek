@@ -27,17 +27,21 @@
 #                  restart, while a kubelet kill is healed by the
 #                  supervisor inside the probe window so the verdict
 #                  stays healthy
-#   multi-master   3 masters + 1 worker: HA init/join behind the LB, all
+#   multi-master-1 3 masters + 1 worker: HA init/join behind the LB, all
 #                  control-plane static pods (apiserver, etcd, scheduler,
 #                  controller-manager) Running on every master, apiserver
-#                  logs and a port-forward streaming through the LB, the
-#                  LB container's HEALTHCHECK (haproxy stats page) turns
-#                  healthy, 3 etcd members with one backend line each,
-#                  quorum survives one stopped master and breaks on two,
-#                  an interrupted join on a second master recovers
-#                  without republishing credentials, the LB is reused
-#                  after a failed create, and `zek down`/`up` restarts
-#                  the HA cluster incl. the LB
+#                  logs and a port-forward streaming through the LB, and
+#                  the LB container's HEALTHCHECK (haproxy stats page)
+#                  turns healthy
+#   multi-master-2 3 masters + 1 worker: the etcd quorum survives one
+#                  stopped master and breaks when two are down
+#   multi-master-3 an interrupted join on a second master recovers without
+#                  republishing credentials, and `zek down`/`up` restarts
+#                  the HA cluster incl. the LB and its live haproxy config
+#                  (one backend line per master, stats page, haproxy -c)
+#   multi-master-4 a 3+1 create aborted as soon as its first node exists:
+#                  the next up reuses the LB and recreates the full topology
+#                  instead of failing on a duplicate container or subnet
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -51,37 +55,45 @@
 #                  cluster DNS and external DNS forwarding
 #   cilium         same with cilium (cilium CLI downloaded on demand,
 #                  version matched to the cluster's k8s release)
-#   smoke          the zek.sh surface: status (healthy/starting/-
-#                  here, unhealthy in single-node, plus the unreachable
-#                  control plane), logs, kubectl exec (the `--` delimiter
-#                  and stdin with -i), every flag in both spellings + env
-#                  precedence + loud error paths (host/network/gateway/
-#                  broadcast/outside IPs for masters and workers, a worker
-#                  landing on the HA load balancer, subnet reuse, size
-#                  bounds, trailing args, e2e selection incl. ZEK_TIMEOUT,
+#   smoke-1        the basic zek.sh surface: status, logs, kubectl exec
+#                  (the `--` delimiter and stdin with -i), and every flag
+#                  in both spellings plus flag > env precedence
+#   smoke-2        the functional --subnet/--master-ip/--pod-cidr probe:
+#                  a throwaway cluster is created with explicit values and
+#                  the network, master address and node spec inspected
+#                  before it is destroyed again
+#   smoke-3        loud error paths (host/network/gateway/broadcast/
+#                  outside IPs for masters and workers, a worker landing
+#                  on the HA load balancer, subnet reuse, size bounds,
+#                  trailing args, e2e selection incl. ZEK_TIMEOUT),
 #                  entrypoint flags incl. node `--` and the kubectl wait
-#                  timeout), --subnet/--master-ip/--pod-cidr functional, up
-#                  shorthand vs fixed topology (workers and masters),
-#                  --timeout failing fast (a dead API and a node that never
-#                  registers), clean recreating the worker
-#                  (new Node UID, same pinned address) with
-#                  --image/--latest/--dns/--pod-cidr/--mounts,
-#                  and destroy removing the containers and network
-#   persistence    flannel + a workload pinned to the single worker, then
-#                  recovery from: docker stop/start of every node at once,
-#                  a stopped worker, a restarted master, `zek down`/`up`
-#                  (both nodes keep their pinned address), a kubelet crash
-#                  (supervisor restart) and a missing or wrong failSwapOn or
-#                  pod-level gate key - same nodes (UIDs), workload Ready
-#                  and coredns rolled out again after each cycle
-#   recovery       crash-recovery paths: a NO_HOST_MODULES node, an
+#                  timeout, the creds-less/bad-token join paths, and every
+#                  up spelling vs the fixed topology
+#   smoke-4        the --timeout bound (a dead API and a node that never
+#                  registers), static-IP start retries while the address
+#                  is held, status/down on a stopped cluster (`-` health
+#                  column), and recovery after each failure
+#   smoke-5        clean on a stopped cluster and recreating a worker
+#                  (new Node UID, same pinned address, the `starting`
+#                  health verdict) with --image/--latest/--dns,
+#                  --pod-cidr and --mounts, status with the API down,
+#                  and destroy removing everything
+#   persistence-1  flannel + a workload pinned to the single worker, then
+#                  recovery from docker stop/start of every node at once,
+#                  a stopped worker, and a restarted master (same node
+#                  UIDs, workload Ready, coredns rolled out again)
+#   persistence-2  flannel + the same workload, then recovery from `zek
+#                  down`/`up` and a kubelet crash, plus a missing or wrong
+#                  failSwapOn or pod-level gate key (same nodes, workload
+#                  Ready after each cycle)
+#   recovery-1     crash-recovery paths: a NO_HOST_MODULES node, an
 #                  interrupted worker join, lost master credentials (the
-#                  republish), a kubectl wait for the config, a late
-#                  interrupted init that completes without a wipe, an early
-#                  interrupted init/join that wipes and re-inits (with ctr
-#                  hidden), and an interrupted control-plane setup (same
-#                  wipe); an interrupted control-plane join on a second
-#                  master is covered in multi-master instead
+#                  republish), and a kubectl wait for the config
+#   recovery-2     a late interrupted init that completes without a wipe,
+#                  an early interrupted init/join that wipes and re-inits
+#                  (with ctr hidden), and an interrupted control-plane setup
+#                  (same wipe); an interrupted control-plane join on a
+#                  second master is covered in multi-master-3 instead
 #
 # Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its own
 # cluster and pre-allocated subnet, but they share one scratch dir -
@@ -122,7 +134,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-ALL_TESTS=(single-node multi-master multi-worker flannel cilium smoke persistence recovery)
+ALL_TESTS=(single-node multi-master-1 multi-master-2 multi-master-3 multi-master-4 multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
 
 export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
 export ZEK_TIMEOUT="${ZEK_TIMEOUT:-600}"
@@ -147,7 +159,7 @@ fail() {
 }
 
 usage() {
-	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master|multi-worker|flannel|cilium|smoke|persistence|recovery]..."
+	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master-1|multi-master-2|multi-master-3|multi-master-4|multi-worker|flannel|cilium|smoke-1|smoke-2|smoke-3|smoke-4|smoke-5|persistence-1|persistence-2|recovery-1|recovery-2]..."
 }
 
 # --- flag parsing and test selection ----------------------------------------
@@ -296,7 +308,7 @@ up() { # cluster workers masters
 
 # || true: the sweep and the per-job cleanup call this for clusters that
 # may not exist; a genuinely failed destroy leaves containers for the next
-# sweep to report. The smoke test asserts a real destroy separately.
+# sweep to report. smoke-5 asserts a real destroy separately.
 destroy() { ./zek.sh --cluster "$1" destroy > /dev/null 2>&1 || true; }
 
 # A static-IP start can race the previous endpoint's cleanup and fail
@@ -377,6 +389,20 @@ wait_for() { # desc timeout-secs func args...
 }
 
 readyz_ok() { zk "$1" kubectl get --raw='/readyz' 2> /dev/null | grep -qx ok; }
+
+# Consecutive failures, not one: a single blip while the LB reshuffles its
+# backends must not pass for the stable quorum loss this proves.
+readyz_down() { # cluster
+	local _
+	for _ in 1 2 3; do
+		# shellcheck disable=SC2310
+		if readyz_ok "$1"; then
+			return 1
+		fi
+		sleep 2
+	done
+	return 0
+}
 
 nodes_ready_quick() {
 	zk "$1" kubectl wait --for=condition=Ready node --all \
@@ -480,10 +506,10 @@ poll_port_forward() { # cluster
 	done
 }
 
-# podCIDR of smoke's throwaway e2e-fn master: the controller-manager
+# podCIDR of smoke-2's throwaway e2e-fn master: the controller-manager
 # stamps spec.podCIDR onto the node seconds after it registers, so this
 # is polled (wait_for) instead of read once. e2e-fn's name is fixed by
-# test_smoke.
+# test_smoke_2.
 probe_pod_cidr() {
 	docker exec e2e-fn-master-1 env KUBECONFIG=/etc/kubernetes/admin.conf \
 		kubectl get node e2e-fn-master-1 -o jsonpath='{.spec.podCIDR}' \
@@ -1064,8 +1090,12 @@ diag() {
 
 # --- tests ------------------------------------------------------------------
 
-test_multi_master() {
-	local cluster=$1 master_idx out lb_ip
+# The HA checks are split into independently scheduled tests: each pays a
+# full 3+1 bring-up, so keeping them together would push one run past the
+# five-minute CI budget.
+
+test_multi_master_1() {
+	local cluster=$1 master_idx out
 	up "${cluster}" 1 3
 	assert_cmd "${cluster}: node count" 4 node_count "${cluster}"
 	assert_cmd "${cluster}: etcd members" 3 ns_pod_count "${cluster}" '^etcd-'
@@ -1152,6 +1182,12 @@ EOF
 		pf_serves "${cluster}-master-1"
 	docker exec "${cluster}-master-1" pkill -f "port-forward" 2> /dev/null || true
 	zk "${cluster}" kubectl delete pod e2e-pf --wait=false > /dev/null
+}
+
+test_multi_master_2() {
+	local cluster=$1
+	up "${cluster}" 1 3
+	wait_for "${cluster}: control plane readyz" 120 readyz_ok "${cluster}"
 
 	# 3 etcd members: stopping one leaves 2 of 3 - a quorum, so the API
 	# keeps serving; a second stop would not.
@@ -1167,15 +1203,42 @@ EOF
 	# masters rejoin and the cluster serves again.
 	log "${cluster}: HA - stop master-2 and master-3, quorum must break"
 	docker stop "${cluster}-master-2" "${cluster}-master-3" > /dev/null
-	sleep 30
-	# shellcheck disable=SC2310
-	if zk "${cluster}" kubectl get --raw='/readyz' 2> /dev/null | grep -qx ok; then
-		fail "${cluster}: API still readyz without etcd quorum"
-	fi
+	wait_for "${cluster}: API stops answering without etcd quorum" 120 readyz_down "${cluster}"
 	start_containers "${cluster}-master-2" "${cluster}-master-3"
 	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
 	wait_for "${cluster}: apiserver on master-3 serving again" 300 master_readyz "${cluster}" 3
 	wait_for "${cluster}: control plane readyz after quorum restore" 120 readyz_ok "${cluster}"
+}
+
+test_multi_master_3() {
+	local cluster=$1 out
+	up "${cluster}" 1 3
+	wait_for "${cluster}: control plane readyz" 120 readyz_ok "${cluster}"
+
+	# Interrupted control-plane join on a second master: kubelet.conf
+	# gone, certs left behind. The same reset as an interrupted init must
+	# wipe and re-join (the container keeps its JOIN_* env across restarts).
+	log "${cluster}: interrupted control-plane join on master-2 recovers"
+	docker exec "${cluster}-master-2" rm -f /etc/kubernetes/kubelet.conf
+	docker restart "${cluster}-master-2" > /dev/null
+	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
+		"interrupted control-plane setup detected; resetting partial state"
+	# The re-join re-runs the image import with a full store, so it must
+	# take the skip fast path instead of re-reading ~500MB of tarballs.
+	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
+		"already in the containerd store; skipping import"
+	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
+	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
+	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
+	# A joining master must never rotate the published credentials on
+	# resume: nothing of the set may exist on its layer, and its logs
+	# must not show a republish.
+	docker exec "${cluster}-master-2" test ! -f /etc/cluster/token \
+		|| fail "${cluster}: join-master published credentials it must not rotate"
+	# shellcheck disable=SC2310
+	if log_has "${cluster}-master-2" "republishing"; then
+		fail "${cluster}: join-master republished credentials on resume"
+	fi
 
 	log "${cluster}: zek down + up restarts the HA cluster incl. the load balancer"
 	zk "${cluster}" down
@@ -1215,38 +1278,40 @@ EOF
 		|| fail "${cluster}: haproxy stats page does not serve"
 	docker exec "${cluster}-lb" haproxy -c -f /etc/haproxy/haproxy.cfg \
 		|| fail "${cluster}: live haproxy.cfg fails haproxy -c"
+}
 
-	# Interrupted control-plane join on a second master: kubelet.conf
-	# gone, certs left behind. The same reset as an interrupted init must
-	# wipe and re-join (the container keeps its JOIN_* env across restarts).
-	log "${cluster}: interrupted control-plane join on master-2 recovers"
-	docker exec "${cluster}-master-2" rm -f /etc/kubernetes/kubelet.conf
-	docker restart "${cluster}-master-2" > /dev/null
-	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
-		"interrupted control-plane setup detected; resetting partial state"
-	# The re-join re-runs the image import with a full store, so it must
-	# take the skip fast path instead of re-reading ~500MB of tarballs.
-	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
-		"already in the containerd store; skipping import"
-	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
-	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
-	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
-	# A joining master must never rotate the published credentials on
-	# resume: nothing of the set may exist on its layer, and its logs
-	# must not show a republish.
-	docker exec "${cluster}-master-2" test ! -f /etc/cluster/token \
-		|| fail "${cluster}: join-master published credentials it must not rotate"
-	# shellcheck disable=SC2310
-	if log_has "${cluster}-master-2" "republishing"; then
-		fail "${cluster}: join-master republished credentials on resume"
-	fi
-
-	# LB reuse after a failed create: with the nodes gone but the network
-	# and LB left behind, the next up must reuse the LB instead of failing
-	# on a duplicate container or subnet.
+test_multi_master_4() {
+	local cluster=$1 lb_ip out up_pid
+	# A failed create leaves the network and LB behind. Start a full 3+1
+	# create, abort it once the first node container exists (before the
+	# slow control-plane bring-up), and remove the nodes it got to. The
+	# next up must reuse the LB and recreate the same topology - the path
+	# a create that died this way takes, without two full bring-ups.
 	log "${cluster}: LB reused after a failed create"
+	# Called directly rather than through zk: $! must be the zek.sh
+	# process this test kills, not a wrapper subshell. The redirect keeps
+	# the aborted run's output out of the parallel test log.
+	./zek.sh --cluster "${cluster}" up --workers 1 --masters 3 \
+		> "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" 2>&1 &
+	up_pid=$!
+	# Wait for master-1, not just the LB (up to 60s): the LB appears a
+	# moment before the node, and killing before the first node exists
+	# would let its in-flight docker run land after the cleanup below.
+	for _ in {1..300}; do
+		if docker inspect "${cluster}-master-1" > /dev/null 2>&1; then
+			break
+		fi
+		sleep 0.2
+	done
+	kill "${up_pid}" 2> /dev/null || true
+	wait "${up_pid}" 2> /dev/null || true
+	docker inspect "${cluster}-master-1" > /dev/null 2>&1 \
+		|| fail "${cluster}: failed create started no master"
 	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
-	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" > /dev/null
+	# Only the LB and the network stay behind, like a create that died
+	# after its first node. All four names are removed defensively.
+	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" \
+		> /dev/null 2>&1 || true
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers 1 --masters 3 2>&1) || fail "${cluster}: up after failed create failed: ${out}"
 	[[ ${out} == *"reusing ${cluster}-lb"* ]] \
@@ -1418,9 +1483,14 @@ test_cilium() {
 # `docker stop all` + daemon restart - exactly what the full stop/start
 # and `zek down`/`up` cycles below exercise. No test reboots the host
 # (it would kill the parallel jobs).
-test_persistence() {
-	local cluster=$1 start_uids start_web out purges_before repubs_before repubs_after
-	local master_ip_before worker_ip_before
+#
+# The persistence checks are split into two matrix entries around the
+# shared setup below, so each run fits the five-minute CI budget.
+
+# Shared setup for the two persistence halves: a 1+1 cluster with flannel
+# and a workload pinned to the worker. Fills the caller's uids/web locals.
+persistence_setup() { # cluster uids-var web-var
+	local cluster=$1 uids_var=$2 web_var=$3 setup_uids setup_web
 	up "${cluster}" 1 1
 	log "${cluster}: installing flannel + workload"
 	apply_flannel "${cluster}"
@@ -1461,32 +1531,43 @@ test_persistence() {
 }
 EOF
 	zk "${cluster}" kubectl rollout status deploy/web --timeout="${ZEK_E2E_TIMEOUT}s"
-	start_uids=$(node_uids "${cluster}")
-	start_web=$(web_info "${cluster}")
-	[[ -n ${start_web} ]] || fail "${cluster}: web pod not found"
+	setup_uids=$(node_uids "${cluster}")
+	setup_web=$(web_info "${cluster}")
+	[[ -n ${setup_web} ]] || fail "${cluster}: web pod not found"
 	# The deployment has no toleration, so with a control-plane taint in
 	# place the only eligible node is the worker; landing elsewhere means
 	# the taint is gone (a regression every later step would hide).
-	[[ ${start_web} == *"@${cluster}-worker-1" ]] \
-		|| fail "${cluster}: web pod must sit on the worker, got '${start_web}'"
+	[[ ${setup_web} == *"@${cluster}-worker-1" ]] \
+		|| fail "${cluster}: web pod must sit on the worker, got '${setup_web}'"
+	# printf -v resolves the name in the caller's dynamic scope; a plain
+	# assignment here would set a global instead of the caller's local.
+	printf -v "${uids_var}" '%s' "${setup_uids}"
+	printf -v "${web_var}" '%s' "${setup_web}"
+}
 
-	assert_state() { # what
-		# recovery first (the API may be down right after a restart),
-		# then the identity checks that must not change
-		wait_for "${cluster}: readyz after $1" 300 readyz_ok "${cluster}"
-		wait_nodes_ready "${cluster}"
-		# coredns must be rolled out again too: the workload only needs
-		# the overlay, but a restart that breaks cluster DNS would pass
-		# every check below.
-		wait_coredns "${cluster}"
-		zk "${cluster}" kubectl rollout status deploy/web --timeout="${ZEK_E2E_TIMEOUT}s"
-		assert_cmd "${cluster}: node UIDs after ${1}" "${start_uids}" node_uids "${cluster}"
-		assert_cmd "${cluster}: web pod after ${1}" "${start_web}" web_info "${cluster}"
-	}
+assert_persistent_state() { # cluster uids web what
+	local cluster=$1 start_uids=$2 start_web=$3 what=$4
+	# recovery first (the API may be down right after a restart), then the
+	# identity checks that must not change
+	wait_for "${cluster}: readyz after ${what}" 300 readyz_ok "${cluster}"
+	wait_nodes_ready "${cluster}"
+	# coredns must be rolled out again too: the workload only needs the
+	# overlay, but a restart that breaks cluster DNS would pass every
+	# check below.
+	wait_coredns "${cluster}"
+	zk "${cluster}" kubectl rollout status deploy/web --timeout="${ZEK_E2E_TIMEOUT}s"
+	assert_cmd "${cluster}: node UIDs after ${what}" "${start_uids}" node_uids "${cluster}"
+	assert_cmd "${cluster}: web pod after ${what}" "${start_web}" web_info "${cluster}"
+}
+
+test_persistence_1() {
+	local cluster=$1 start_uids start_web purges_before repubs_before repubs_after
+	local container_list role candidate
+	local -a names=()
+	local -a wave=()
+	persistence_setup "${cluster}" start_uids start_web
 
 	log "${cluster}: docker stop + start every node at once"
-	local -a names=()
-	local container_list
 	# shellcheck disable=SC2310
 	container_list=$(cluster_containers "${cluster}") || fail "${cluster}: cannot list containers"
 	if [[ -n ${container_list} ]]; then
@@ -1501,8 +1582,6 @@ EOF
 	# own restart: workers use dynamic IPs, so a worker starting first
 	# can claim a stopped master's static address and leave the master
 	# failing with "Address already in use".
-	local role candidate
-	local -a wave=()
 	for role in lb master worker; do
 		wave=()
 		for candidate in "${names[@]}"; do
@@ -1514,7 +1593,7 @@ EOF
 			start_containers "${wave[@]}"
 		fi
 	done
-	assert_state "full stop/start"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "full stop/start"
 
 	log "${cluster}: docker stop + start a single worker"
 	docker stop "${cluster}-worker-1" > /dev/null
@@ -1523,7 +1602,7 @@ EOF
 	start_containers "${cluster}-worker-1"
 	wait_for "${cluster}: worker-1 back to Ready" "${ZEK_E2E_TIMEOUT}" node_status_is "${cluster}" \
 		"${cluster}-worker-1" True
-	assert_state "worker restart"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "worker restart"
 
 	log "${cluster}: docker restart the master"
 	# Count both lines first: the purge line is also logged on the initial
@@ -1537,13 +1616,18 @@ EOF
 	# kubelet never reattaches to them (cleanup_stale_cri).
 	wait_for "${cluster}: stale CRI purged on restart" 60 log_count_grew "${cluster}-master-1" \
 		"purging stale containers from previous node instance" "${purges_before}"
-	assert_state "master restart"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "master restart"
 	# The credentials were complete, so the resume must not have rotated
-	# them - the master-1 twin of the join-master guard in multi-master,
-	# compared by count (assert_state above already waited out the resume,
+	# them - the master-1 twin of the join-master guard in multi-master-3,
+	# compared by count (assert_persistent_state above already waited out the resume,
 	# so no new line by now means none is coming).
 	repubs_after=$(docker logs "${cluster}-master-1" 2>&1 | grep -cF "published credentials incomplete; republishing" || true)
 	assert_eq "${cluster}: no republish on resume" "${repubs_before}" "${repubs_after}"
+}
+
+test_persistence_2() {
+	local cluster=$1 start_uids start_web out master_ip_before worker_ip_before
+	persistence_setup "${cluster}" start_uids start_web
 
 	log "${cluster}: zek down + zek up"
 	# Both nodes keep the static address they were created with: the restart
@@ -1572,7 +1656,7 @@ EOF
 		container_ip "${cluster}-master-1"
 	assert_cmd "${cluster}: worker-1 address across down/up" "${worker_ip_before}" \
 		container_ip "${cluster}-worker-1"
-	assert_state "zek down/up"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "zek down/up"
 
 	log "${cluster}: kubelet crash on worker-1 - the supervisor restarts it"
 	# shellcheck disable=SC2310
@@ -1587,7 +1671,7 @@ EOF
 		"kubelet exited, restarting"
 	wait_nodes_ready "${cluster}"
 	wait_for "${cluster}: control plane readyz after kubelet crash" 120 readyz_ok "${cluster}"
-	assert_state "kubelet crash"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "kubelet crash"
 
 	log "${cluster}: kubelet config without failSwapOn - the supervisor re-adds it"
 	# Delete only the key: the supervisor's ensure_kubelet_config rewrites
@@ -1598,7 +1682,7 @@ EOF
 	wait_for "${cluster}: kubelet running again after config edit" 60 kubelet_running "${cluster}-worker-1"
 	wait_for "${cluster}: failSwapOn restored" 60 kubelet_failswapon "${cluster}-worker-1"
 	wait_nodes_ready "${cluster}"
-	assert_state "failSwapOn re-add"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "failSwapOn re-add"
 
 	log "${cluster}: kubelet config with a wrong failSwapOn - the supervisor rewrites it"
 	docker exec "${cluster}-worker-1" sed -i 's/^failSwapOn:.*/failSwapOn: true/' /var/lib/kubelet/config.yaml
@@ -1606,7 +1690,7 @@ EOF
 	wait_for "${cluster}: kubelet running again after wrong value" 60 kubelet_running "${cluster}-worker-1"
 	wait_for "${cluster}: failSwapOn rewritten" 60 kubelet_failswapon "${cluster}-worker-1"
 	wait_nodes_ready "${cluster}"
-	assert_state "failSwapOn rewrite"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "failSwapOn rewrite"
 
 	# The same two paths for the pod-level vertical scaling gate, which
 	# ensure_kubelet_config writes into kubeadm's featureGates block
@@ -1622,7 +1706,7 @@ EOF
 	wait_for "${cluster}: re-added gate is the effective one" 60 \
 		kubelet_gate_is "${cluster}" "${cluster}-worker-1" InPlacePodLevelResourcesVerticalScaling false
 	wait_nodes_ready "${cluster}"
-	assert_state "pod-level gate re-add"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "pod-level gate re-add"
 
 	log "${cluster}: kubelet config with the pod-level gate on - the supervisor rewrites it"
 	docker exec "${cluster}-worker-1" sed -i 's/^  InPlacePodLevelResourcesVerticalScaling:.*/  InPlacePodLevelResourcesVerticalScaling: true/' \
@@ -1633,7 +1717,7 @@ EOF
 	wait_for "${cluster}: rewritten gate is the effective one" 60 \
 		kubelet_gate_is "${cluster}" "${cluster}-worker-1" InPlacePodLevelResourcesVerticalScaling false
 	wait_nodes_ready "${cluster}"
-	assert_state "pod-level gate rewrite"
+	assert_persistent_state "${cluster}" "${start_uids}" "${start_web}" "pod-level gate rewrite"
 }
 
 test_single_node() {
@@ -1872,12 +1956,13 @@ EOF
 		health_is "${cluster}-master-1" healthy
 }
 
-# The zek.sh surface no other test reaches: kubectl exec's `--`, flag
-# forms and env precedence, the loud error paths, the up spellings, the
-# --timeout bound, clean's docker wiring, and a destroy that is asserted
-# instead of merely invoked (the per-job destroy swallows its exit).
-test_smoke() {
-	local cluster=$1 uids_before uids_after out role master_ip start_wait worker_ip_before
+# The zek.sh surface no other test reaches. It is split into five
+# independently scheduled tests so no one run can grow past the
+# five-minute CI budget: the basic commands, the functional flag probe,
+# the loud error paths, the timeout/IP failure paths, and clean + destroy.
+
+test_smoke_1() {
+	local cluster=$1 out
 	# --version is the one action that must work without a cluster or
 	# Docker: it prints the release version and exits during flag parsing.
 	out=$(./zek.sh --version) || fail "${cluster}: --version failed: ${out}"
@@ -1977,7 +2062,10 @@ EOF
 	fi
 	[[ ${out} == *"${cluster}-master-1"* ]] \
 		|| fail "${cluster}: --cluster won over ZEK_CLUSTER but ran: ${out}"
+}
 
+test_smoke_2() {
+	local cluster=$1
 	# --subnet/--master-ip/--pod-cidr must really shape the network, the
 	# master and the node spec kube-proxy and the CNI read, not just
 	# parse: a throwaway cluster is created with explicit values and
@@ -1996,7 +2084,13 @@ EOF
 	./zek.sh --cluster e2e-fn destroy > /dev/null 2>&1 || true
 	assert_eq "${cluster}: --subnet reached the network" "${probe_subnet}" "${actual_subnet}"
 	assert_eq "${cluster}: --master-ip reached the master" "${probe_master_ip}" "${actual_ip}"
+}
 
+test_smoke_3() {
+	local cluster=$1 out role join_ca_hash join_api_endpoint
+	# The entrypoint and join probes below need a real node; every loud
+	# error path between them must leave this cluster untouched.
+	up "${cluster}" 1 1
 	# Loud error paths; none of these may touch the cluster.
 	assert_die "${cluster}: --cluster without a value" "--cluster needs a cluster name" \
 		./zek.sh --cluster
@@ -2018,11 +2112,11 @@ EOF
 	assert_die "${cluster}: master colliding with the LB IP" "load balancer's IP" \
 		env ZEK_MASTERS=9 ./zek.sh --cluster "${cluster}-lbcol" up
 	assert_die "${cluster}: duplicate test names" "requested twice" \
-		./e2e.sh smoke smoke
+		./e2e.sh smoke-1 smoke-1
 	assert_die "${cluster}: --e2e-tests plus positional tests" "mutually exclusive" \
-		./e2e.sh --e2e-tests smoke smoke
+		./e2e.sh --e2e-tests smoke-1 smoke-1
 	assert_die "${cluster}: ZEK_E2E_TESTS plus positional tests" "mutually exclusive" \
-		env ZEK_E2E_TESTS=smoke ./e2e.sh smoke
+		env ZEK_E2E_TESTS=smoke-1 ./e2e.sh smoke-1
 	assert_die "${cluster}: empty --e2e-tests" "--e2e-tests needs a non-empty value" \
 		./e2e.sh --e2e-tests=
 	# The numeric bounds are checked before the stale sweep destroys
@@ -2155,25 +2249,25 @@ EOF
 	# empty ZEK_E2E_TESTS dies like the flag form, and the boolean only
 	# accepts bare/=1.
 	assert_die "${cluster}: bad ZEK_TIMEOUT" "ZEK_TIMEOUT must be an integer" \
-		env ZEK_TIMEOUT=abc ./e2e.sh smoke
+		env ZEK_TIMEOUT=abc ./e2e.sh smoke-1
 	assert_die "${cluster}: empty ZEK_E2E_TESTS" "needs a non-empty value" \
 		env ZEK_E2E_TESTS= ./e2e.sh
 	assert_die "${cluster}: --e2e-keep-on-fail=2" "is a boolean" \
-		./e2e.sh --e2e-keep-on-fail=2 smoke
+		./e2e.sh --e2e-keep-on-fail=2 smoke-1
 	assert_die "${cluster}: ZEK_E2E_KEEP_ON_FAIL=2" "must be 0 or 1" \
-		env ZEK_E2E_KEEP_ON_FAIL=2 ./e2e.sh smoke
+		env ZEK_E2E_KEEP_ON_FAIL=2 ./e2e.sh smoke-1
 	assert_die "${cluster}: --cilium-version without a value" "needs a value" \
 		./e2e.sh --cilium-version
 	# e2e.sh's own --flag=value spellings die the same loud deaths (all
 	# before the stale sweep, so none of these touch any cluster) - plus
 	# an unknown test name, which is a usage error, not a test.
-	assert_die "${cluster}: --timeout= form" "must be an integer" ./e2e.sh --timeout=abc smoke
-	assert_die "${cluster}: --e2e-timeout= form" "must be an integer" ./e2e.sh --e2e-timeout=0 smoke
+	assert_die "${cluster}: --timeout= form" "must be an integer" ./e2e.sh --timeout=abc smoke-1
+	assert_die "${cluster}: --e2e-timeout= form" "must be an integer" ./e2e.sh --e2e-timeout=0 smoke-1
 	assert_die "${cluster}: --e2e-jobs= form" "must be an integer" \
-		env ZEK_E2E_JOBS=2 ./e2e.sh --e2e-jobs=two smoke
-	assert_die "${cluster}: --image= form" "not found" ./e2e.sh --image=x-nope smoke
+		env ZEK_E2E_JOBS=2 ./e2e.sh --e2e-jobs=two smoke-1
+	assert_die "${cluster}: --image= form" "not found" ./e2e.sh --image=x-nope smoke-1
 	assert_die "${cluster}: --e2e-tests= plus positional" "mutually exclusive" \
-		./e2e.sh --e2e-tests=smoke smoke
+		./e2e.sh --e2e-tests=smoke-1 smoke-1
 	assert_die "${cluster}: unknown test name" "usage:" ./e2e.sh bogus-test
 
 	# The entrypoint's own flag surface (PR#4): every value flag must
@@ -2331,7 +2425,11 @@ EOF
 		|| fail "${cluster}: up 0 shorthand failed: ${out}"
 	[[ ${out} == *"topology is fixed"* ]] \
 		|| fail "${cluster}: up 0 must warn that the topology is fixed: ${out}"
+}
 
+test_smoke_4() {
+	local cluster=$1 out master_ip start_wait
+	up "${cluster}" 1 1
 	# --timeout must kill a doomed up fast instead of hanging (the
 	# README's fail-fast claim), and a plain up must recover after.
 	log "${cluster}: --timeout 1 dies on a downed cluster instead of hanging"
@@ -2359,7 +2457,7 @@ EOF
 	# (600s budget) finishes what --timeout 1 interrupted.
 	zk "${cluster}" up
 	wait_for "${cluster}: control plane readyz after timeout" 120 readyz_ok "${cluster}"
-	# Same one-shot race as multi-master's down/up: after the restacked
+	# Same one-shot race as multi-master-3's down/up: after the restacked
 	# containers the apiserver and kubelets may still be converging, so
 	# poll the count.
 	wait_for "${cluster}: node count after timeout recovery" 120 node_count_is "${cluster}" 2
@@ -2378,8 +2476,10 @@ EOF
 	docker run -d --name "${cluster}-iphold" --network "${cluster}-net" --ip "${master_ip}" \
 		busybox:latest sleep 300 > /dev/null
 	start_wait=${SECONDS}
+	# --timeout caps the failure path too: if docker start succeeds but the
+	# address stays unusable, wait_for_api dies in 60s instead of 600s.
 	# shellcheck disable=SC2310
-	if out=$(zk "${cluster}" up 2>&1); then
+	if out=$(zk "${cluster}" --timeout 60 up 2>&1); then
 		fail "${cluster}: up should have failed while ${master_ip} is held: ${out}"
 	fi
 	[[ $((SECONDS - start_wait)) -ge 15 ]] \
@@ -2416,7 +2516,11 @@ EOF
 		"kubelet exited, restarting"
 	wait_for "${cluster}: worker-1 re-registered" "${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 2
 	wait_for "${cluster}: control plane readyz after re-register" 120 readyz_ok "${cluster}"
+}
 
+test_smoke_5() {
+	local cluster=$1 uids_before uids_after out worker_ip_before
+	up "${cluster}" 1 1
 	# clean on a stopped cluster: evict tolerates the dead control plane
 	# (drain/delete fail open), and the credential read - which needs a
 	# live master - dies on its bound instead of hanging. A throwaway
@@ -2511,8 +2615,12 @@ EOF
 		|| fail "${cluster}: second destroy: ${out}"
 }
 
-test_recovery() {
-	local cluster=$1 join_token join_ca_hash join_api_endpoint restore_pid out uids_before
+# The crash-recovery paths, split into two independently scheduled tests
+# so a re-init (which waits out a full control-plane bring-up) cannot push
+# the whole run past the five-minute CI budget.
+
+test_recovery_1() {
+	local cluster=$1 join_token join_ca_hash join_api_endpoint restore_pid out
 	up "${cluster}" 1 1
 
 	# A node started with NO_HOST_MODULES=1 must still join: the host
@@ -2580,6 +2688,11 @@ test_recovery() {
 		|| fail "${cluster}: kubectl did not wait for the config: ${out}"
 	wait "${restore_pid}" 2> /dev/null || true
 	assert_cmd "${cluster}: nodes listed after the wait" 2 node_count "${cluster}"
+}
+
+test_recovery_2() {
+	local cluster=$1 uids_before
+	up "${cluster}" 1 1
 
 	# Interrupted late init: kubelet.conf present, completion markers gone,
 	# but the manifests (and the serving control plane behind them) remain -
