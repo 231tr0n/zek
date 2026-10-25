@@ -35,10 +35,10 @@
 #                  healthy, 3 etcd members with one backend line each,
 #                  quorum survives one stopped master and breaks on two,
 #                  an interrupted join on a second master recovers
-#                  without republishing credentials, the LB is reused
-#                  after a failed create, and `zek down`/`up` restarts
-#                  the HA cluster incl. the LB and its live haproxy
-#                  config
+#                  without republishing credentials, `zek down`/`up`
+#                  restarts the HA cluster incl. the LB and its live
+#                  haproxy config, and the next up reuses the LB left by
+#                  a create aborted after its first node
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -1093,7 +1093,7 @@ diag() {
 # keeps a wider CI timeout for the same reason.
 
 test_multi_master() {
-	local cluster=$1 master_idx out lb_ip
+	local cluster=$1 master_idx out lb_ip up_pid
 	up "${cluster}" 1 3
 	assert_cmd "${cluster}: node count" 4 node_count "${cluster}"
 	assert_cmd "${cluster}: etcd members" 3 ns_pod_count "${cluster}" '^etcd-'
@@ -1265,12 +1265,38 @@ EOF
 		fail "${cluster}: join-master republished credentials on resume"
 	fi
 
-	# LB reuse after a failed create: with the nodes gone but the network
-	# and LB left behind, the next up must reuse the LB instead of failing
-	# on a duplicate container or subnet.
+	# LB reuse after a failed create: start from no cluster, abort a fresh
+	# 3+1 create as soon as its first node container exists, and remove the
+	# nodes it got to. The network and LB stay behind; the next up must
+	# reuse them instead of failing on a duplicate container or subnet.
 	log "${cluster}: LB reused after a failed create"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" destroy 2>&1) \
+		|| fail "${cluster}: destroy before the failed create failed: ${out}"
+	# Called directly rather than through zk: $! must be the zek.sh
+	# process this test kills, not a wrapper subshell. The redirect keeps
+	# the aborted run's output out of the parallel test log.
+	./zek.sh --cluster "${cluster}" up --workers 1 --masters 3 \
+		> "${WORK_DIR}/lb-reuse-create.${JOB_TEST}.log" 2>&1 &
+	up_pid=$!
+	# Wait for master-1, not just the LB (up to 60s): the LB appears a
+	# moment before the node, and killing before the first node exists
+	# would let its in-flight docker run land after the cleanup below.
+	for _ in {1..300}; do
+		if docker inspect "${cluster}-master-1" > /dev/null 2>&1; then
+			break
+		fi
+		sleep 0.2
+	done
+	kill "${up_pid}" 2> /dev/null || true
+	wait "${up_pid}" 2> /dev/null || true
+	docker inspect "${cluster}-master-1" > /dev/null 2>&1 \
+		|| fail "${cluster}: failed create started no master"
 	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
-	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" > /dev/null
+	# Only the LB and the network stay behind, like a create that died
+	# after its first node. All four names are removed defensively.
+	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" "${cluster}-worker-1" \
+		> /dev/null 2>&1 || true
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers 1 --masters 3 2>&1) || fail "${cluster}: up after failed create failed: ${out}"
 	[[ ${out} == *"reusing ${cluster}-lb"* ]] \
