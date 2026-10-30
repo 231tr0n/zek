@@ -1,7 +1,7 @@
 IMAGE              ?= zek
 # Pin the latest versions explicitly; bump these to move to a newer release.
 ALPINE_VERSION     ?= 3.24.3
-KUBERNETES_VERSION ?= v1.37.1
+KUBERNETES_VERSION ?= v1.37.2
 
 # Version aliases: hold alpine at major, minor or full while tracking either
 # the kubernetes minor or full version. For the current pins that is 3-1.37,
