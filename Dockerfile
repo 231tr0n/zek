@@ -14,8 +14,7 @@ ARG TARGETARCH
 # joined line, unreadable for 30+ packages. No `set -x` in the body for
 # the same reason (it would echo that line back).
 RUN <<'EOF'
-# Single line on purpose: a `\` continuation inside this heredoc cannot
-# satisfy shfmt (tabs) and dockerfmt (spaces) at once - while the build
+# Single line on purpose: keeps the package list diffable, and the build
 # log only ever shows the short `RUN <<'EOF'` header either way.
 apk add --no-cache bash ca-certificates containerd containerd-ctr runc cni-plugins iptables ip6tables nftables cri-tools haproxy gcompat coreutils findutils grep gawk sed diffutils procps-ng curl inetutils-telnet netcat-openbsd traceroute bind-tools openssh-client mtr iproute2 iputils ethtool nfs-utils socat conntrack-tools ebtables openssl kmod ipset tar lsof strace tcpdump jq yq less vim tree file
 EOF
@@ -79,6 +78,9 @@ COPY entrypoint.sh /entrypoint.sh
 # page; nodes -> containerd alive AND kubelet's healthz (both started by
 # entrypoint.sh, kubelet under its supervisor). The 120s start period
 # covers kubeadm init/join before kubelet answers its healthz.
+# The continuation lines stay indented: dockerfmt -i 0 would otherwise
+# unindent them along with the heredoc bodies.
+# dockerfmt-ignore
 HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -sf -m 2 http://127.0.0.1:8404/ > /dev/null || \
     { pgrep -x containerd > /dev/null && curl -sf -m 2 http://127.0.0.1:10248/healthz > /dev/null; }

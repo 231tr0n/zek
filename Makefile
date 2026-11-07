@@ -96,7 +96,7 @@ lint: ## Run ./lint.sh in a fedora:latest container, exactly like CI
 	$(call fedora_bash, \
 	shellcheck --version | sed -n "2p"; \
 	npx --yes prettier --version; \
-	dockerfmt version; \
+	go version -m "$$(command -v dockerfmt)" | awk "\$$1 == \"mod\" { print \"dockerfmt (\" \$$2 \") \" \$$3 }"; \
 	shfmt --version | sed -n "1p"; \
 	go version -m "$$(command -v yamlfmt)" | awk "\$$1 == \"mod\" { print \"yamlfmt (\" \$$2 \") \" \$$3 }"; \
 	mbake --version; \
