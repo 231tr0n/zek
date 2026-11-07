@@ -1,6 +1,6 @@
 IMAGE              ?= zek
 # Pin the latest versions explicitly; bump these to move to a newer release.
-ALPINE_VERSION     ?= 3.24.3
+ALPINE_VERSION     ?= 3.24.4
 KUBERNETES_VERSION ?= v1.37.2
 
 # Version aliases: hold alpine at major, minor or full while tracking either
