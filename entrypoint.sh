@@ -580,7 +580,8 @@ complete_interrupted_init() {
 	# WAIT_TIMEOUT rides in from zek.sh (--timeout); default like the
 	# kubectl role's wait below when running outside it.
 	local tail_version advertise_ip deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
-	until curl -skf https://127.0.0.1:6443/readyz 2> /dev/null | grep -qx ok; do
+	until curl -skf --connect-timeout 2 --max-time 5 \
+		https://127.0.0.1:6443/readyz 2> /dev/null | grep -qx ok; do
 		[[ ${SECONDS} -lt ${deadline} ]] || return 1
 		sleep 2
 	done

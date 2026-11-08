@@ -121,10 +121,10 @@
 # wins when both are set; value flags take --flag value or --flag=value):
 #   --image IMAGE            image under test (ZEK_IMAGE, default zek:latest)
 #   --timeout SECONDS        per-wait budget inside zek.sh (ZEK_TIMEOUT,
-#                            default 540)
+#                            default 360)
 #   --e2e-timeout SECONDS    budget for kubectl waits (ZEK_E2E_TIMEOUT,
-#                            default 540: below the 10-minute CI ceiling so
-#                            a stuck wait fails with diagnostics first)
+#                            default 360: leaves time for bring-up and
+#                            cleanup inside the 10-minute CI job)
 #   --e2e-tests LIST         comma separated test list (ZEK_E2E_TESTS; same
 #                            as the args; cannot be combined with positional
 #                            test names)
@@ -147,8 +147,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 ALL_TESTS=(single-node multi-master multi-master-recovery topology multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
 
 export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
-export ZEK_TIMEOUT="${ZEK_TIMEOUT:-540}"
-ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-540}"
+export ZEK_TIMEOUT="${ZEK_TIMEOUT:-360}"
+ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-360}"
 ZEK_E2E_JOBS="${ZEK_E2E_JOBS:-2}"
 # Optional override; when empty the cilium test resolves a release that
 # matches the cluster's k8s version (resolve_cilium_version below).
@@ -434,7 +434,7 @@ node_status_is() { # cluster node want(True|False)
 	# wait_for/assert_eq decides), so the directive is intentional here
 	# and repeated per site the same way.
 	# shellcheck disable=SC2310
-	got=$(zk "${cluster}" kubectl get node "${node}" \
+	got=$(zk "${cluster}" kubectl --request-timeout=10s get node "${node}" \
 		-o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2> /dev/null) || return 1
 	# A dead kubelet's node flips Ready=Unknown after the grace period and
 	# stays there, so wanting False means "anything but Ready".
@@ -445,7 +445,7 @@ node_status_is() { # cluster node want(True|False)
 	fi
 }
 
-node_count() { zk "$1" kubectl get nodes --no-headers | wc -l; }
+node_count() { zk "$1" kubectl --request-timeout=10s get nodes --no-headers | wc -l; }
 
 node_count_is() { # cluster want
 	local cluster=$1 want=$2 got
@@ -455,7 +455,7 @@ node_count_is() { # cluster want
 
 ready_false_count() {
 	# shellcheck disable=SC2310
-	zk "$1" kubectl get nodes \
+	zk "$1" kubectl --request-timeout=10s get nodes \
 		-o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
 		| grep -c False || true
 }
@@ -471,7 +471,7 @@ ready_false_count_is() { # cluster want
 pressure_clear() {
 	local got line
 	# shellcheck disable=SC2310
-	got=$(zk "$1" kubectl get nodes \
+	got=$(zk "$1" kubectl --request-timeout=10s get nodes \
 		-o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="MemoryPressure")].status} {.status.conditions[?(@.type=="DiskPressure")].status} {.status.conditions[?(@.type=="PIDPressure")].status}{"\n"}{end}' \
 		2> /dev/null) || return 1
 	# One line per node, each exactly "False False False"; an empty
@@ -487,10 +487,10 @@ pressure_clear() {
 ds_ready() { # cluster ds-name
 	local want ready
 	# shellcheck disable=SC2310
-	want=$(zk "$1" kubectl -n kube-system get ds "$2" \
+	want=$(zk "$1" kubectl --request-timeout=10s -n kube-system get ds "$2" \
 		-o jsonpath='{.status.desiredNumberScheduled}' 2> /dev/null) || return 1
 	# shellcheck disable=SC2310
-	ready=$(zk "$1" kubectl -n kube-system get ds "$2" \
+	ready=$(zk "$1" kubectl --request-timeout=10s -n kube-system get ds "$2" \
 		-o jsonpath='{.status.numberReady}' 2> /dev/null) || return 1
 	[[ -n ${want} && ${want} != 0 && ${ready} == "${want}" ]]
 }
@@ -545,13 +545,13 @@ probe_pod_cidr_is() { # cluster want-cluster-cidr
 }
 
 node_uids() {
-	zk "$1" kubectl get nodes \
+	zk "$1" kubectl --request-timeout=10s get nodes \
 		-o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}' | sort
 }
 
 ns_pod_count() { # cluster 'name-regex'
 	# shellcheck disable=SC2310
-	zk "$1" kubectl -n kube-system get pods --no-headers | grep -cE "$2" || true
+	zk "$1" kubectl --request-timeout=10s -n kube-system get pods --no-headers | grep -cE "$2" || true
 }
 
 # Live stacked-etcd membership, not just the static-pod count: a failed
@@ -590,7 +590,7 @@ lb_lacks_backend() { # cluster ip
 pod_phase() { # cluster pod-name
 	# No stderr suppression: a missing/broken pod must surface
 	# kubectl's error next to the assertion failure that follows.
-	zk "$1" kubectl -n kube-system get pod "$2" -o jsonpath='{.status.phase}'
+	zk "$1" kubectl --request-timeout=10s -n kube-system get pod "$2" -o jsonpath='{.status.phase}'
 }
 pod_phase_is() { # cluster pod-name want
 	local got
@@ -604,7 +604,7 @@ pod_phase_is() { # cluster pod-name want
 svc_test_done() { # cluster
 	local phase
 	# shellcheck disable=SC2310
-	phase=$(zk "$1" kubectl get pod svc-test -o jsonpath='{.status.phase}' 2> /dev/null) \
+	phase=$(zk "$1" kubectl --request-timeout=10s get pod svc-test -o jsonpath='{.status.phase}' 2> /dev/null) \
 		|| return 1
 	[[ ${phase} == Succeeded || ${phase} == Failed ]]
 }
@@ -1057,15 +1057,15 @@ ensure_cilium() {
 	# binary from the published CLI container image (quay.io), which is
 	# pulled from a different CDN. Explicit returns keep a failure from
 	# aborting the suite: this runs as the left side of ||.
-	url=$(curl -fsSLI --connect-timeout 5 --max-time 15 -o /dev/null \
+	url=$(curl -fsSLI --connect-timeout 5 --max-time 10 -o /dev/null \
 		-w '%{url_effective}' https://github.com/cilium/cilium-cli/releases/latest) || url=""
 	tag=${url##*/}
 	[[ -n ${tag} ]] || tag=${fallback}
-	if ! curl -fsSL --connect-timeout 5 --max-time 20 --retry 2 --retry-all-errors \
+	if ! curl -fsSL --connect-timeout 5 --max-time 15 --retry 1 --retry-all-errors \
 		-o "${WORK_DIR}/cilium.tar.gz" \
 		"https://github.com/cilium/cilium-cli/releases/download/${tag}/cilium-linux-${ARCH}.tar.gz"; then
-		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --connect-timeout 5 --max-time 20 \
-			--retry 2 --retry-all-errors -o "${WORK_DIR}/cilium.tar.gz" \
+		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --connect-timeout 5 --max-time 15 \
+			--retry 1 --retry-all-errors -o "${WORK_DIR}/cilium.tar.gz" \
 			"https://github.com/cilium/cilium-cli/releases/download/${fallback}/cilium-linux-${ARCH}.tar.gz"; then
 			tag=${fallback}
 		else
@@ -1074,7 +1074,7 @@ ensure_cilium() {
 			[[ ${tag} == "${fallback}" ]] || tags+=("${fallback}")
 			log "WARNING: cilium GitHub assets unavailable; extracting the CLI from quay.io"
 			for tag in "${tags[@]}"; do
-				timeout 120 docker pull "quay.io/cilium/cilium-cli:${tag}" \
+				timeout 90 docker pull "quay.io/cilium/cilium-cli:${tag}" \
 					> /dev/null 2>&1 || continue
 				cid=$(docker create --entrypoint /usr/local/bin/cilium \
 					"quay.io/cilium/cilium-cli:${tag}" version) || continue
@@ -1117,11 +1117,12 @@ k8s_minor() { # cluster -> e.g. 37, empty when unknown
 
 resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 	local minor="${1:-}" releases tag tag_minor tested_minors fallback newest_tested prev_minor=""
+	local deadline=$((SECONDS + 120))
 	local -a tested_list=()
 	# One page of 100 reaches back for years (patch releases outnumber
 	# minors by far); strict x.y.z keeps rc tags out; API order is
 	# newest-first.
-	releases=$(curl -fsSL --max-time 30 \
+	releases=$(curl -fsSL --connect-timeout 5 --max-time 20 \
 		'https://api.github.com/repos/cilium/cilium/releases?per_page=100' 2> /dev/null \
 		| jq -r '.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' 2> /dev/null) || releases=""
 	[[ -n ${releases} ]] || return 0
@@ -1131,6 +1132,10 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 		return 0
 	}
 	while IFS= read -r tag; do
+		if ((SECONDS >= deadline)); then
+			log "WARNING: cilium version resolution timed out; using the CLI default"
+			break
+		fi
 		[[ -n ${tag} ]] || continue
 		tag_minor=${tag#v}
 		tag_minor=${tag_minor%.*}
@@ -1142,7 +1147,7 @@ resolve_cilium_version() { # k8s-minor (maybe empty) -> vX.Y.Z or empty
 		prev_minor=${tag_minor}
 		# The tested-minor bullets of that release's requirements.rst
 		# (tags with a different doc layout parse empty and are skipped).
-		tested_minors=$(curl -fsSL --max-time 30 \
+		tested_minors=$(curl -fsSL --connect-timeout 5 --max-time 10 \
 			"https://raw.githubusercontent.com/cilium/cilium/${tag}/Documentation/network/kubernetes/requirements.rst" 2> /dev/null \
 			| sed -nE 's/^\* (1\.[0-9]+)$/\1/p') || tested_minors=""
 		[[ -n ${tested_minors} ]] || continue
@@ -2488,9 +2493,10 @@ test_smoke_3() {
 	# master .18, worker-1 .19, so the new worker-2 must get .20. Then the
 	# same /28 refuses an impossible growth before touching the topology:
 	# it has thirteen hosts (.18-.30); with .18/.19/.20 taken only ten are
-	# left, fewer than the twelve new workers a scale to 14 needs. env -u
-	# drops this job's pre-allocated ZEK_SUBNET (the main cluster's /24,
-	# which would otherwise override the probe's subnet).
+	# left, fewer than the twelve new workers a scale to 14 needs. The
+	# creation's explicit --subnet wins over this job's pre-allocated
+	# ZEK_SUBNET (the main cluster's /24), but the later scalings do not
+	# repeat the flag, so env -u is what keeps them on the tiny subnet.
 	log "${cluster}: scaling in a narrow, offset subnet"
 	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" --subnet 172.20.248.16/28 \
 		--master-ip 172.20.248.18 up --workers 1 --masters 1 \
@@ -2509,6 +2515,18 @@ test_smoke_3() {
 		"not enough free addresses" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 14
 	./zek.sh --cluster "${cluster}--tiny" destroy > /dev/null 2>&1 || true
+	# A single-master cluster has no LB, so .10 is a normal host address:
+	# seven workers fill .3-.9, and the next worker must take .10. The
+	# preflight must not keep reserving the address for a nonexistent LB.
+	log "${cluster}: single-master scaling may use the LB address"
+	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" --subnet 172.20.249.0/28 \
+		--master-ip 172.20.249.2 up --workers 7 --masters 1 \
+		> /dev/null 2>&1 || fail "${cluster}: cannot create the .10 probe cluster"
+	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" up --workers 8 \
+		|| fail "${cluster}: single-master growth to .10 failed"
+	assert_cmd "${cluster}: single-master worker used .10" "172.20.249.10" \
+		container_ip "${cluster}--tiny10-worker-8"
+	./zek.sh --cluster "${cluster}--tiny10" destroy > /dev/null 2>&1 || true
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
 	# retry after a failed create (network exists, master does not).
@@ -2592,32 +2610,34 @@ test_smoke_3() {
 	# --kubeconfig must work, `--` must forward and no args must drop
 	# into an interactive shell.
 	log "${cluster}: entrypoint flag surface"
+	# WAIT_TIMEOUT=1 keeps a regression here from waiting out the default
+	# kubectl budget and blowing the job's ten-minute ceiling.
 	for flag in --cluster-dir --node-name --pod-cidr --node-dns --api-endpoint \
 		--join-token --join-ca-hash --join-api-endpoint --join-cert-key \
 		--lb-backends --kubeconfig; do
 		assert_die "${cluster}: entrypoint ${flag} without a value" "needs a value" \
-			docker exec "${cluster}-master-1" /entrypoint.sh kubectl "${flag}"
+			docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh kubectl "${flag}"
 		assert_die "${cluster}: entrypoint ${flag}= empty" "needs a value" \
-			docker exec "${cluster}-master-1" /entrypoint.sh kubectl "${flag}="
+			docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh kubectl "${flag}="
+		assert_die "${cluster}: entrypoint ${flag} '' empty" "needs a value" \
+			docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh kubectl "${flag}" ""
 	done
-	assert_die "${cluster}: entrypoint empty space-form value" "needs a value" \
-		docker exec "${cluster}-master-1" /entrypoint.sh kubectl --cluster-dir ""
 	assert_die "${cluster}: entrypoint rejects an unknown role" "usage:" \
-		docker exec "${cluster}-master-1" /entrypoint.sh bogus
+		docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh bogus
 	# Booleans accept bare and =1, reject any other value, and the node
 	# roles reject stray arguments (only kubectl passes things through).
 	assert_die "${cluster}: entrypoint --master-join=2" "is a boolean" \
-		docker exec "${cluster}-master-1" /entrypoint.sh master --master-join=2
+		docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh master --master-join=2
 	assert_die "${cluster}: entrypoint --no-host-modules=0" "is a boolean" \
-		docker exec "${cluster}-master-1" /entrypoint.sh worker --no-host-modules=0
+		docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh worker --no-host-modules=0
 	# An empty value is still a value: booleans must give the boolean error,
 	# not the value-flag "needs a value" error.
 	for flag in --master-join --no-host-modules; do
 		assert_die "${cluster}: entrypoint ${flag}= empty" "is a boolean" \
-			docker exec "${cluster}-master-1" /entrypoint.sh kubectl "${flag}="
+			docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh kubectl "${flag}="
 	done
 	assert_die "${cluster}: entrypoint unknown argument on master" "unknown argument" \
-		docker exec "${cluster}-master-1" /entrypoint.sh master --bogus-flag
+		docker exec -e WAIT_TIMEOUT=1 "${cluster}-master-1" /entrypoint.sh master --bogus-flag
 	out=$(docker exec "${cluster}-master-1" /entrypoint.sh kubectl \
 		--pod-cidr 10.246.0.0/16 --node-name recovery-ignore \
 		--node-dns 1.1.1.1 --api-endpoint 127.0.0.1:6443 \
@@ -2725,10 +2745,13 @@ test_smoke_3() {
 	# fall back to the resolv.conf scan instead of writing an empty
 	# "nameserver " line.
 	log "${cluster}: whitespace-only NODE_DNS falls back"
+	# --dns pre-populates Docker's resolv.conf with a non-loopback
+	# nameserver; resolv_dns_ok also requires node_setup's "search ." marker,
+	# so this only passes once the whitespace override was dropped.
 	docker run -d --name "${cluster}--worker-nodns-blank" \
 		--hostname "${cluster}--worker-nodns-blank" \
 		--restart=no "${CLONE_ARGS[@]}" \
-		-e "NODE_DNS=   " \
+		--dns 1.1.1.1 -e "NODE_DNS=   " \
 		"${ZEK_IMAGE}" worker > /dev/null
 	wait_for "${cluster}: whitespace-only NODE_DNS used the fallback" 30 \
 		resolv_dns_ok "${cluster}--worker-nodns-blank"
@@ -2825,7 +2848,7 @@ test_smoke_4() {
 	[[ ${out} == *"API not reachable after 1s"* ]] \
 		|| fail "${cluster}: wrong error from the doomed up: ${out}"
 	# The doomed attempt started the containers before dying; a plain up
-	# (600s budget) finishes what --timeout 1 interrupted.
+	# (default budget) finishes what --timeout 1 interrupted.
 	zk "${cluster}" up
 	wait_for "${cluster}: control plane readyz after timeout" 120 readyz_ok "${cluster}"
 	# Same one-shot race as multi-master's down/up: after the restacked
@@ -2848,7 +2871,8 @@ test_smoke_4() {
 		busybox:latest sleep 300 > /dev/null
 	start_wait=${SECONDS}
 	# --timeout caps the failure path too: if docker start succeeds but the
-	# address stays unusable, wait_for_api dies in 60s instead of 600s.
+	# address stays unusable, wait_for_api dies in 60s instead of the full
+	# budget.
 	# shellcheck disable=SC2310
 	if out=$(zk "${cluster}" --timeout 60 up 2>&1); then
 		fail "${cluster}: up should have failed while ${master_ip} is held: ${out}"
@@ -3066,7 +3090,7 @@ test_recovery_1() {
 	# run_kubectl waits for a missing admin.conf instead of dying. The
 	# timeout bounds the worst case: the restore lands after 3s, so a
 	# successful wait finishes in seconds and a failed restore fails
-	# here instead of hanging for run_kubectl's full 600s.
+	# here instead of hanging for run_kubectl's full wait budget.
 	log "${cluster}: kubectl waits for the cluster config to appear"
 	docker exec "${cluster}-master-1" rm -f /etc/cluster/admin.conf
 	(
@@ -3248,6 +3272,18 @@ if [[ -n ${stale_clusters} ]]; then
 		destroy "${stale_cluster}"
 	done <<< "${stale_clusters}"
 fi
+# Helper containers/networks use "<cluster>--suffix" names that do not
+# derive a cluster name, so a hard-killed run could leave them behind and
+# the next run would collide on the name. They are only created inside a
+# test, after this sweep, so this cannot hit a live run.
+while IFS= read -r stale_helper; do
+	[[ -n ${stale_helper} ]] || continue
+	docker rm -f "${stale_helper}" > /dev/null 2>&1 || true
+done <<< "$(docker ps -a --format '{{.Names}}' 2> /dev/null | grep -E '^e2e-.*--' || true)"
+while IFS= read -r stale_net; do
+	[[ -n ${stale_net} ]] || continue
+	docker network rm "${stale_net}" > /dev/null 2>&1 || true
+done <<< "$(docker network ls --format '{{.Name}}' 2> /dev/null | grep -E '^e2e-.*--' || true)"
 
 # Resolve tool downloads once up front: parallel jobs must not race the
 # extraction into the shared BIN_DIR. A failed download must not abort the

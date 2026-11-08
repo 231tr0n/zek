@@ -123,7 +123,8 @@ when its size was not set.
 ./zek.sh up --masters 1        # remove extra masters; the load balancer goes away
 ```
 
-Additions take the first free usable host address on the subnet, and removals
+Additions take the first free usable host address in the master's last-octet
+range (skipping anything outside a narrower `--subnet`), and removals
 drop the **highest-index** node of that role (`worker-3` before `worker-2`), so
 every surviving node keeps its name and address. Removed nodes are drained, then
 their container and `Node` object are deleted; for a master its stacked-etcd
@@ -182,7 +183,7 @@ them out in its own order after a host reboot, which moves a node out from
 under its kubelet certificate and its `Node` object. With more than one master
 the load balancer owns `<subnet>.10` (see below), and a worker that would land
 on it is refused before anything is created. Nodes added by a later `up` take
-the first free usable host address on the subnet, so scaling never moves an
+the first free usable host address in that range, so scaling never moves an
 existing node off the address its kubelet certificate and `Node` object were
 built on. Narrow and offset subnets are handled the same way: unusable
 candidates are skipped, and a scale that cannot fit is refused before any
@@ -251,8 +252,8 @@ follow the masters, so they hit the same wall (2 masters plus 7 workers would
 put worker 7 on `<subnet>.10`). A custom `--master-ip` moves the creation-time
 limit, and the network, gateway and broadcast addresses are always refused.
 Nodes added by a later scaling `up` take the first free usable host address
-on the subnet and skip `<subnet>.10`, so scaling is not bound by the
-creation-time walk.
+in that range and skip `<subnet>.10` while an LB exists or is being created,
+so scaling is not bound by the creation-time walk.
 
 Use **odd** master counts: etcd needs a majority to stay writable. 1 master
 has no redundancy, 2 masters lose quorum if either fails, 3 masters survive

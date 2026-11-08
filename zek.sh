@@ -467,9 +467,10 @@ used_node_ips() {
 	done <<< "${container_list}"
 }
 
-# First free host address on the cluster's /24 for a new node. Existing
-# nodes keep their addresses, so this walks past everything already reserved
-# and always leaves the load balancer's own address free.
+# First free usable host address in the master's last octet for a new node.
+# Existing nodes keep their addresses, so this walks past everything already
+# reserved and, when a load balancer exists (non-empty $2), leaves its
+# address free too.
 alloc_node_ip() { # <subnet> <lb-ip>
 	local subnet=$1 lb_ip=$2 prefix="${MASTER_IP%.*}" used ip candidate
 	used=" $(used_node_ips | tr '\n' ' ') "
@@ -569,13 +570,13 @@ kube() {
 }
 
 # Every internal wait is bounded by WAIT_TIMEOUT (--timeout, default
-# ZEK_TIMEOUT or 600s) so a broken cluster fails fast instead of hanging.
+# ZEK_TIMEOUT or 360s) so a broken cluster fails fast instead of hanging.
 wait_for_api() {
 	local deadline=$((SECONDS + WAIT_TIMEOUT))
 	log "waiting for the API of ${CLUSTER} to answer (timeout ${WAIT_TIMEOUT}s)"
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
 		# shellcheck disable=SC2310
-		kube get nodes > /dev/null 2>&1 && {
+		kube --request-timeout=10s get nodes > /dev/null 2>&1 && {
 			log "control plane is up"
 			return 0
 		}
@@ -591,10 +592,10 @@ wait_for_master_ready() {
 	log "waiting for the control plane on ${name} (timeout ${WAIT_TIMEOUT}s)"
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
 		# shellcheck disable=SC2310
-		phase="$(kube -n kube-system get pod "kube-apiserver-${name}" -o jsonpath='{.status.phase}' 2> /dev/null || true)"
+		phase="$(kube --request-timeout=10s -n kube-system get pod "kube-apiserver-${name}" -o jsonpath='{.status.phase}' 2> /dev/null || true)"
 		if [[ ${phase} == Running ]]; then
 			# shellcheck disable=SC2310
-			phase="$(kube -n kube-system get pod "etcd-${name}" -o jsonpath='{.status.phase}' 2> /dev/null || true)"
+			phase="$(kube --request-timeout=10s -n kube-system get pod "etcd-${name}" -o jsonpath='{.status.phase}' 2> /dev/null || true)"
 			[[ ${phase} == Running ]] && return 0
 		fi
 		sleep 2
@@ -607,7 +608,7 @@ wait_for_nodes() {
 	log "waiting for ${want} node(s) to register (timeout ${WAIT_TIMEOUT}s)"
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
 		# shellcheck disable=SC2310
-		have=$(kube get nodes --no-headers 2> /dev/null | wc -l || true)
+		have=$(kube --request-timeout=10s get nodes --no-headers 2> /dev/null | wc -l || true)
 		[[ ${have} -ge ${want} ]] && return 0
 		sleep 2
 	done
@@ -622,7 +623,7 @@ wait_for_node_total() {
 	log "waiting for exactly ${want} node(s) (timeout ${WAIT_TIMEOUT}s)"
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
 		# shellcheck disable=SC2310
-		have=$(kube get nodes --no-headers 2> /dev/null | wc -l || true)
+		have=$(kube --request-timeout=10s get nodes --no-headers 2> /dev/null | wc -l || true)
 		[[ ${have} -eq ${want} ]] && return 0
 		sleep 2
 	done
@@ -976,9 +977,9 @@ switch_endpoint() { # <new host:port>
 		# enough to ride that out instead of aborting the migration.
 		for _ in {1..10}; do
 			# shellcheck disable=SC2310
-			if kube -n "${namespace}" get configmap "${configmap}" -o yaml 2> /dev/null \
+			if kube --request-timeout=10s -n "${namespace}" get configmap "${configmap}" -o yaml 2> /dev/null \
 				| sed "s#${old_endpoint}#${new_endpoint}#g" \
-				| kube apply -f - > /dev/null 2>&1; then
+				| kube --request-timeout=10s apply -f - > /dev/null 2>&1; then
 				applied=1
 				break
 			fi
@@ -1009,7 +1010,7 @@ switch_endpoint() { # <new host:port>
 	fi
 	# Restart kube-proxy so the updated ConfigMap is applied.
 	# shellcheck disable=SC2310
-	kube -n kube-system rollout restart daemonset kube-proxy > /dev/null 2>&1 || true
+	kube --request-timeout=10s -n kube-system rollout restart daemonset kube-proxy > /dev/null 2>&1 || true
 	return 0
 }
 
@@ -1077,7 +1078,7 @@ reconcile_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
 	local existing_masters existing_workers desired_masters desired_workers
 	local name address node_addr i idx lb_ip backends worker_list master_list node_list
-	local add_masters=0 add_workers=0 needed free
+	local add_masters=0 add_workers=0 needed free reserve_lb_ip=""
 	local -a current_workers=() current_masters=()
 	existing_masters=$(count_masters)
 	existing_workers=$(count_workers)
@@ -1105,6 +1106,15 @@ reconcile_cluster() {
 	if [[ ${desired_masters} -gt 1 ]]; then
 		require_host_ip "${lb_ip}" "${NET_SUBNET}" "load balancer"
 	fi
+	# Only reserve the LB address while one exists or is about to be
+	# created: a single-master cluster may legitimately use .10, and the
+	# HA transition checks that collision explicitly below. During a
+	# HA-to-single scale the LB still exists until the removals, so keep
+	# reserving it then.
+	reserve_lb_ip=""
+	if [[ ${existing_masters} -gt 1 || ${desired_masters} -gt 1 ]]; then
+		reserve_lb_ip=${lb_ip}
+	fi
 	# Refuse an impossible scale before adding anything: a failure halfway
 	# through leaves a partially changed topology behind.
 	if [[ ${desired_masters} -gt ${existing_masters} ]]; then
@@ -1115,7 +1125,7 @@ reconcile_cluster() {
 	fi
 	needed=$((add_masters + add_workers))
 	if [[ ${needed} -gt 0 ]]; then
-		free=$(count_free_node_ips "${NET_SUBNET}" "${lb_ip}")
+		free=$(count_free_node_ips "${NET_SUBNET}" "${reserve_lb_ip}")
 		[[ ${free} -ge ${needed} ]] \
 			|| die "not enough free addresses for ${needed} new node(s): only ${free} usable in ${NET_SUBNET} (lower --workers/--masters or recreate the cluster with a different --master-ip)"
 	fi
@@ -1157,7 +1167,7 @@ reconcile_cluster() {
 		for i in $(seq 1 $((desired_masters - existing_masters))); do
 			idx=$(next_node_index master)
 			name="${CLUSTER}-master-${idx}"
-			address=$(alloc_node_ip "${NET_SUBNET}" "${lb_ip}")
+			address=$(alloc_node_ip "${NET_SUBNET}" "${reserve_lb_ip}")
 			log "adding ${name} (${address}) as control-plane"
 			run_node "${name}" master --ip "${address}" \
 				--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
@@ -1169,7 +1179,7 @@ reconcile_cluster() {
 		for i in $(seq 1 $((desired_workers - existing_workers))); do
 			idx=$(next_node_index worker)
 			name="${CLUSTER}-worker-${idx}"
-			address=$(alloc_node_ip "${NET_SUBNET}" "${lb_ip}")
+			address=$(alloc_node_ip "${NET_SUBNET}" "${reserve_lb_ip}")
 			log "adding ${name} (${address})"
 			run_node "${name}" worker --ip "${address}" "${CRED_ARGS[@]}"
 		done
@@ -1324,7 +1334,7 @@ delete_node() {
 	local name="$1" deadline=$((SECONDS + WAIT_TIMEOUT))
 	while [[ ${SECONDS} -lt ${deadline} ]]; do
 		# shellcheck disable=SC2310
-		if kube delete node "${name}" --ignore-not-found > /dev/null 2>&1; then
+		if kube --request-timeout=10s delete node "${name}" --ignore-not-found > /dev/null 2>&1; then
 			return 0
 		fi
 		sleep 1
