@@ -649,15 +649,19 @@ nodns_applied() { # container ip
 	docker exec "$1" grep -q "^nameserver $2$" /etc/resolv.conf 2> /dev/null
 }
 
-# A node container's resolv.conf was rewritten by node_setup: it has at
-# least one nameserver, none of them empty and none Docker's loopback stub.
+# A node container's resolv.conf was rewritten by node_setup ("search .")
+# and has at least one nameserver, none empty and none Docker's loopback
+# stub. Checking the rewrite marker matters when the node was started with
+# --dns: Docker would otherwise supply a non-loopback nameserver before
+# node_setup ever runs.
 resolv_dns_ok() { # container
 	docker exec "$1" awk '
+		$0 == "search ." { rewritten = 1 }
 		$1 == "nameserver" {
 			if (NF < 2 || $2 ~ /^127\./) bad = 1
 			found = 1
 		}
-		END { exit !(found && !bad) }
+		END { exit !(rewritten && found && !bad) }
 	' /etc/resolv.conf 2> /dev/null
 }
 
@@ -2495,6 +2499,12 @@ test_smoke_3() {
 		|| fail "${cluster}: growing inside the tiny subnet failed"
 	assert_cmd "${cluster}: tiny-subnet worker followed the master" "172.20.248.20" \
 		container_ip "${cluster}--tiny-worker-2"
+	# The derived LB address (.10) is outside this offset /28; growing to HA
+	# must refuse before adding a master instead of creating an unreachable
+	# LB halfway through.
+	assert_die "${cluster}: HA growth refuses an unusable LB address" \
+		"load balancer" \
+		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --masters 2
 	assert_die "${cluster}: scale beyond the free address range" \
 		"not enough free addresses" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 14

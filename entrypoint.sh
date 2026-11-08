@@ -829,31 +829,31 @@ parse_role_flags() {
 				break
 				;;
 			--cluster-dir)
-				[[ $# -ge 2 ]] || die "--cluster-dir needs a value (check --cluster-dir/CLUSTER_DIR)"
+				[[ -n ${2:-} ]] || die "--cluster-dir needs a value (check --cluster-dir/CLUSTER_DIR)"
 				CLUSTER_DIR="$2"
 				shift 2
 				;;
 			--cluster-dir=*) CLUSTER_DIR="${1#*=}" && shift ;;
 			--node-name)
-				[[ $# -ge 2 ]] || die "--node-name needs a value (check --node-name/NODE_NAME)"
+				[[ -n ${2:-} ]] || die "--node-name needs a value (check --node-name/NODE_NAME)"
 				NODE_NAME="$2"
 				shift 2
 				;;
 			--node-name=*) NODE_NAME="${1#*=}" && shift ;;
 			--pod-cidr)
-				[[ $# -ge 2 ]] || die "--pod-cidr needs a value (check --pod-cidr/POD_CIDR)"
+				[[ -n ${2:-} ]] || die "--pod-cidr needs a value (check --pod-cidr/POD_CIDR)"
 				POD_CIDR="$2"
 				shift 2
 				;;
 			--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
 			--node-dns)
-				[[ $# -ge 2 ]] || die "--node-dns needs a value (check --node-dns/NODE_DNS)"
+				[[ -n ${2:-} ]] || die "--node-dns needs a value (check --node-dns/NODE_DNS)"
 				NODE_DNS="$2"
 				shift 2
 				;;
 			--node-dns=*) NODE_DNS="${1#*=}" && shift ;;
 			--api-endpoint)
-				[[ $# -ge 2 ]] || die "--api-endpoint needs a value (check --api-endpoint/API_ENDPOINT)"
+				[[ -n ${2:-} ]] || die "--api-endpoint needs a value (check --api-endpoint/API_ENDPOINT)"
 				API_ENDPOINT="$2"
 				shift 2
 				;;
@@ -864,37 +864,37 @@ parse_role_flags() {
 				;;
 			--master-join=*) die "--master-join is a boolean; use --master-join (or --master-join=1)" ;;
 			--join-token)
-				[[ $# -ge 2 ]] || die "--join-token needs a value (check --join-token/JOIN_TOKEN)"
+				[[ -n ${2:-} ]] || die "--join-token needs a value (check --join-token/JOIN_TOKEN)"
 				JOIN_TOKEN="$2"
 				shift 2
 				;;
 			--join-token=*) JOIN_TOKEN="${1#*=}" && shift ;;
 			--join-ca-hash)
-				[[ $# -ge 2 ]] || die "--join-ca-hash needs a value (check --join-ca-hash/JOIN_CA_HASH)"
+				[[ -n ${2:-} ]] || die "--join-ca-hash needs a value (check --join-ca-hash/JOIN_CA_HASH)"
 				JOIN_CA_HASH="$2"
 				shift 2
 				;;
 			--join-ca-hash=*) JOIN_CA_HASH="${1#*=}" && shift ;;
 			--join-api-endpoint)
-				[[ $# -ge 2 ]] || die "--join-api-endpoint needs a value (check --join-api-endpoint/JOIN_API_ENDPOINT)"
+				[[ -n ${2:-} ]] || die "--join-api-endpoint needs a value (check --join-api-endpoint/JOIN_API_ENDPOINT)"
 				JOIN_API_ENDPOINT="$2"
 				shift 2
 				;;
 			--join-api-endpoint=*) JOIN_API_ENDPOINT="${1#*=}" && shift ;;
 			--join-cert-key)
-				[[ $# -ge 2 ]] || die "--join-cert-key needs a value (check --join-cert-key/JOIN_CERT_KEY)"
+				[[ -n ${2:-} ]] || die "--join-cert-key needs a value (check --join-cert-key/JOIN_CERT_KEY)"
 				JOIN_CERT_KEY="$2"
 				shift 2
 				;;
 			--join-cert-key=*) JOIN_CERT_KEY="${1#*=}" && shift ;;
 			--lb-backends)
-				[[ $# -ge 2 ]] || die "--lb-backends needs a value (check --lb-backends/LB_BACKENDS)"
+				[[ -n ${2:-} ]] || die "--lb-backends needs a value (check --lb-backends/LB_BACKENDS)"
 				LB_BACKENDS="$2"
 				shift 2
 				;;
 			--lb-backends=*) LB_BACKENDS="${1#*=}" && shift ;;
 			--kubeconfig)
-				[[ $# -ge 2 ]] || die "--kubeconfig needs a value (check --kubeconfig/KUBECONFIG)"
+				[[ -n ${2:-} ]] || die "--kubeconfig needs a value (check --kubeconfig/KUBECONFIG)"
 				KUBECONFIG="$2"
 				shift 2
 				;;
