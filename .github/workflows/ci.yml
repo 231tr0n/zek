@@ -29,8 +29,9 @@
       uses: "./.github/workflows/changes.yml",
     },
     build_and_test: {
-      # Only an e2e-relevant change can break e2e; a README or lint-only
-      # change still runs lint above but skips this job.
+      # Only an e2e-relevant change can break e2e: a README-only or other
+      # non-e2e change still runs lint above but skips this job, while
+      # lint.sh and workflow changes count as e2e-relevant and also run it.
       needs: [
         "lint",
         "changes",

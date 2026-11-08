@@ -18,11 +18,15 @@
 #   ./zek.sh [flags] up [--workers N] [--masters M]
 #                               first run: create the cluster with N workers
 #                               (default 1) and M masters (default 1; M>1
-#                               starts the HA load balancer). A bare number
-#                               (up 2) is a shorthand for --workers 2. Later
-#                               runs restart the existing nodes and, when a
-#                               size flag or its env twin is set, add/remove
-#                               nodes to reach that count.
+#                               starts the HA load balancer). --lb starts
+#                               that load balancer with a single master too.
+#                               A bare number (up 2) is a shorthand for
+#                               --workers 2. Later runs restart the existing
+#                               nodes and, when a size flag or its env twin
+#                               is set, add/remove nodes to reach that count.
+#                               Workers scale at any time; masters only while
+#                               the cluster has a load balancer (M>1 or
+#                               --lb; without one the count is locked).
 #   ./zek.sh [flags] down       stop every node container (state is kept)
 #   ./zek.sh [flags] clean <name>
 #                               evict a worker and recreate it with a fresh
@@ -43,6 +47,9 @@
 #   --latest                use the latest tag of the selected image
 #                           repository (ZEK_LATEST=1; by default, the
 #                           release-pinned image's repository)
+#   --lb                    create the load balancer even in a cluster with
+#                           one master, so control-plane nodes can be added
+#                           later (ZEK_LB=1; creation-time only)
 #   --cluster NAME          cluster to operate on (ZEK_CLUSTER, default zek)
 #   --timeout SECONDS       bound for Kubernetes waits (control plane up,
 #                           nodes registered, credentials published);
@@ -62,9 +69,10 @@
 #                           host-path:container-path[:options] (ZEK_MOUNTS)
 #   up-only flags: --workers N (ZEK_WORKERS), --masters M (ZEK_MASTERS).
 #
-# Env overrides: ZEK_LATEST (0/1; same as --latest) and the value flags:
-# ZEK_CLUSTER, ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET, ZEK_MASTER_IP, ZEK_DNS,
-# ZEK_POD_CIDR, ZEK_MOUNTS, ZEK_WORKERS, ZEK_MASTERS.
+# Env overrides: ZEK_LATEST and ZEK_LB (0/1; same as --latest/--lb) and the
+# value flags: ZEK_CLUSTER, ZEK_TIMEOUT, ZEK_IMAGE, ZEK_SUBNET,
+# ZEK_MASTER_IP, ZEK_DNS, ZEK_POD_CIDR, ZEK_MOUNTS, ZEK_WORKERS,
+# ZEK_MASTERS.
 set -euo pipefail
 
 log() { echo "[zek] $*" >&2; }
@@ -99,8 +107,13 @@ require_ipv4() { # <value> cidr|addr <label>
 	esac
 	[[ ${value} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
 		|| die "invalid ${label} '${value}' (${hint})"
-	[[ ${value} != */* ]] || ((10#${value##*/} <= 32)) \
-		|| die "invalid ${label} '${value}' (${hint})"
+	if [[ ${value} == */* ]]; then
+		local prefix=${value##*/}
+		# docker reads /08 as /8; reject the ambiguous spelling instead
+		# of silently creating a much larger network.
+		[[ ${prefix} != 0[0-9]* ]] || die "invalid ${label} '${value}' (${hint})"
+		((10#${prefix} <= 32)) || die "invalid ${label} '${value}' (${hint})"
+	fi
 	local -a parts=()
 	local octet
 	IFS=. read -r -a parts <<< "${value%%/*}"
@@ -140,14 +153,16 @@ latest_image() {
 CLUSTER="${ZEK_CLUSTER:-zek}"
 WAIT_TIMEOUT="${ZEK_TIMEOUT:-600}"
 IMAGE="${ZEK_IMAGE:-${DEFAULT_IMAGE}}"
-# ZEK_LATEST is the env twin of --latest. Apply it before parsing flags so an
-# explicit --image still wins.
-ZEK_LATEST="${ZEK_LATEST:-0}"
-case "${ZEK_LATEST}" in
-	0) ;;
-	1) IMAGE=$(latest_image "${IMAGE}") ;;
-	*) die "invalid ZEK_LATEST '${ZEK_LATEST}' (expected 0 or 1; same as --latest)" ;;
-esac
+# Boolean settings: environment first, flags below override it. They are
+# validated after the flag loop so a flag can override a bad env value
+# (flag > env), and --latest is applied after every --image so the flag
+# order does not change which repository it tags.
+LATEST="${ZEK_LATEST:-0}"
+# --lb requests an LB for a cluster created with a single master, so
+# control-plane nodes can be added later. Creation-time only: retrofitting
+# one would have to move the kubeadm endpoint, which an existing cluster
+# cannot do.
+LB="${ZEK_LB:-0}"
 SUBNET="${ZEK_SUBNET:-}"
 MASTER_IP="${ZEK_MASTER_IP:-}"
 DNS="${ZEK_DNS:-}"
@@ -176,64 +191,100 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--cluster)
 			shift
-			[[ $# -gt 0 ]] || die "--cluster needs a cluster name (check --cluster/ZEK_CLUSTER)"
+			[[ -n ${1:-} ]] || die "--cluster needs a cluster name (check --cluster/ZEK_CLUSTER)"
 			CLUSTER="$1"
 			shift
 			;;
-		--cluster=*) CLUSTER="${1#*=}" && shift ;;
+		--cluster=*)
+			CLUSTER="${1#*=}"
+			[[ -n ${CLUSTER} ]] || die "--cluster needs a cluster name (check --cluster/ZEK_CLUSTER)"
+			shift
+			;;
 		--timeout)
 			shift
-			[[ $# -gt 0 ]] || die "--timeout needs a number of seconds (check --timeout/ZEK_TIMEOUT)"
+			[[ -n ${1:-} ]] || die "--timeout needs a number of seconds (check --timeout/ZEK_TIMEOUT)"
 			WAIT_TIMEOUT="$1"
 			shift
 			;;
-		--timeout=*) WAIT_TIMEOUT="${1#*=}" && shift ;;
+		--timeout=*)
+			WAIT_TIMEOUT="${1#*=}"
+			[[ -n ${WAIT_TIMEOUT} ]] || die "--timeout needs a number of seconds (check --timeout/ZEK_TIMEOUT)"
+			shift
+			;;
 		--latest)
-			IMAGE=$(latest_image "${IMAGE}")
+			LATEST=1
+			shift
+			;;
+		--lb)
+			LB=1
 			shift
 			;;
 		--image)
 			shift
-			[[ $# -gt 0 ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
+			[[ -n ${1:-} ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
 			IMAGE="$1"
 			shift
 			;;
-		--image=*) IMAGE="${1#*=}" && shift ;;
+		--image=*)
+			IMAGE="${1#*=}"
+			[[ -n ${IMAGE} ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
+			shift
+			;;
 		--subnet)
 			shift
-			[[ $# -gt 0 ]] || die "--subnet needs a value (check --subnet/ZEK_SUBNET)"
+			[[ -n ${1:-} ]] || die "--subnet needs a value (check --subnet/ZEK_SUBNET)"
 			SUBNET="$1"
 			shift
 			;;
-		--subnet=*) SUBNET="${1#*=}" && shift ;;
+		--subnet=*)
+			SUBNET="${1#*=}"
+			[[ -n ${SUBNET} ]] || die "--subnet needs a value (check --subnet/ZEK_SUBNET)"
+			shift
+			;;
 		--master-ip)
 			shift
-			[[ $# -gt 0 ]] || die "--master-ip needs a value (check --master-ip/ZEK_MASTER_IP)"
+			[[ -n ${1:-} ]] || die "--master-ip needs a value (check --master-ip/ZEK_MASTER_IP)"
 			MASTER_IP="$1"
 			shift
 			;;
-		--master-ip=*) MASTER_IP="${1#*=}" && shift ;;
+		--master-ip=*)
+			MASTER_IP="${1#*=}"
+			[[ -n ${MASTER_IP} ]] || die "--master-ip needs a value (check --master-ip/ZEK_MASTER_IP)"
+			shift
+			;;
 		--dns)
 			shift
-			[[ $# -gt 0 ]] || die "--dns needs a value (check --dns/ZEK_DNS)"
+			[[ -n ${1:-} ]] || die "--dns needs a value (check --dns/ZEK_DNS)"
 			DNS="$1"
 			shift
 			;;
-		--dns=*) DNS="${1#*=}" && shift ;;
+		--dns=*)
+			DNS="${1#*=}"
+			[[ -n ${DNS} ]] || die "--dns needs a value (check --dns/ZEK_DNS)"
+			shift
+			;;
 		--pod-cidr)
 			shift
-			[[ $# -gt 0 ]] || die "--pod-cidr needs a value (check --pod-cidr/ZEK_POD_CIDR)"
+			[[ -n ${1:-} ]] || die "--pod-cidr needs a value (check --pod-cidr/ZEK_POD_CIDR)"
 			POD_CIDR="$1"
 			shift
 			;;
-		--pod-cidr=*) POD_CIDR="${1#*=}" && shift ;;
+		--pod-cidr=*)
+			POD_CIDR="${1#*=}"
+			[[ -n ${POD_CIDR} ]] || die "--pod-cidr needs a value (check --pod-cidr/ZEK_POD_CIDR)"
+			shift
+			;;
 		--mounts)
 			shift
-			[[ $# -gt 0 ]] || die "--mounts needs a value (check --mounts/ZEK_MOUNTS)"
+			[[ -n ${1:-} ]] || die "--mounts needs a value (check --mounts/ZEK_MOUNTS)"
 			MOUNTS="$1"
 			shift
 			;;
-		--mounts=*) MOUNTS="${1#*=}" && shift ;;
+		--mounts=*)
+			MOUNTS="${1#*=}"
+			[[ -n ${MOUNTS} ]] || die "--mounts needs a value (check --mounts/ZEK_MOUNTS)"
+			shift
+			;;
 		--version)
 			printf 'zek %s\n' "${ZEK_VERSION}"
 			exit 0
@@ -241,11 +292,25 @@ while [[ $# -gt 0 ]]; do
 		*) break ;;
 	esac
 done
+case "${LATEST}" in
+	0) ;;
+	1) ;;
+	*) die "invalid ZEK_LATEST '${LATEST}' (expected 0 or 1; same as --latest)" ;;
+esac
+case "${LB}" in
+	0) ;;
+	1) ;;
+	*) die "invalid ZEK_LB '${LB}' (expected 0 or 1; same as --lb)" ;;
+esac
+# Resolve the image last: --latest selects the latest tag of whichever
+# repository --image/ZEK_IMAGE chose, regardless of their order.
+[[ -n ${IMAGE} ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
+[[ ${LATEST} -eq 1 ]] && IMAGE=$(latest_image "${IMAGE}")
 [[ ${CLUSTER} =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
 	|| die "invalid cluster name '${CLUSTER}' (letters, digits, '-' and '_' only; check --cluster/ZEK_CLUSTER)"
-[[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] \
-	|| die "invalid timeout '${WAIT_TIMEOUT}' (expected seconds >= 1; check --timeout/ZEK_TIMEOUT)"
-[[ -n ${IMAGE} ]] || die "--image needs a value (check --image/ZEK_IMAGE)"
+{ [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] && [[ ${#WAIT_TIMEOUT} -le 5 ]] \
+	&& ((10#${WAIT_TIMEOUT} <= 86400)); } \
+	|| die "invalid timeout '${WAIT_TIMEOUT}' (expected 1-86400 seconds; check --timeout/ZEK_TIMEOUT)"
 require_ipv4 "${SUBNET}" cidr "subnet (--subnet/ZEK_SUBNET)"
 require_ipv4 "${MASTER_IP}" addr "master IP (--master-ip/ZEK_MASTER_IP)"
 require_ipv4 "${DNS}" addr "DNS IP (--dns/ZEK_DNS)"
@@ -291,6 +356,14 @@ net_subnet_of() {
 	docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' \
 		"${NET_NAME}" 2> /dev/null || true
 }
+# An existing network's subnet must be the requested --subnet: silently
+# deriving container addresses from a different subnet later would move a
+# node off its static address and certificate. Empty --subnet always passes.
+require_subnet() { # <existing-subnet>
+	[[ -z ${SUBNET} || ${SUBNET} == "$1" ]] \
+		|| die "cluster ${CLUSTER} uses subnet $1, not --subnet ${SUBNET}; pass --subnet $1 or destroy the cluster"
+}
+
 ensure_net() {
 	local new_subnet=$1
 	# First of the many disabled warnings in this file: this call sits on
@@ -301,13 +374,10 @@ ensure_net() {
 	# shellcheck disable=SC2310
 	if net_exists; then
 		# The existing network belongs to this cluster; reusing its subnet
-		# makes a retry after a failed create work. An explicit --subnet
-		# that disagrees would silently derive wrong container IPs later,
-		# so refuse it instead.
+		# makes a retry after a failed create work.
 		local existing_subnet
 		existing_subnet=$(net_subnet_of)
-		[[ -z ${SUBNET} || ${SUBNET} == "${existing_subnet}" ]] \
-			|| die "cluster ${CLUSTER} uses subnet ${existing_subnet}, not --subnet ${SUBNET}; pass --subnet ${existing_subnet} or destroy the cluster"
+		require_subnet "${existing_subnet}"
 		return 0
 	fi
 	docker network create --driver bridge --subnet "${new_subnet}" "${NET_NAME}" > /dev/null \
@@ -350,6 +420,19 @@ pick_subnet() {
 
 node_exists() { docker inspect --type container "$1" > /dev/null 2>&1; }
 
+# True when this cluster was created with a load balancer (more than one
+# master, or --lb). The container is the normal evidence; master-1 also
+# carries a creation-time marker so the answer stays correct while the
+# cluster is stopped and after the LB container was removed.
+cluster_has_lb() {
+	# shellcheck disable=SC2310
+	if node_exists "${LB_NAME}"; then
+		return 0
+	fi
+	docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${MASTER_NAME}" 2> /dev/null \
+		| grep -q '^ZEK_LB_ENDPOINT='
+}
+
 # Containers attached to this cluster's network (running or stopped).
 network_container_names() { docker ps -a --format '{{.Names}}' -f network="${NET_NAME}" 2> /dev/null || true; }
 
@@ -380,7 +463,7 @@ ${node_list}"
 
 # Running containers of this cluster: everything still attached to the
 # network plus the cluster's own node names (so `down` also stops a node
-# whose endpoint was moved out of the network). Deduplicated.
+# detached from the network). Deduplicated.
 running_cluster_names() {
 	local net_list named_list
 	net_list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}" 2> /dev/null) || net_list=""
@@ -395,10 +478,10 @@ running_cluster_names() {
 # `|| true` keeps an empty match (or a docker failure) from aborting the
 # script under pipefail, which needs an empty/zero result here.
 role_names() { # master|worker
-	# Deliberately not network_container_names: a node temporarily detached from the
-	# cluster network (e.g. while a static address is being moved) must
-	# still count as existing, or scaling would mistake it for a missing
-	# node. The name pattern is the cluster's own namespace.
+	# Deliberately not network_container_names: a node temporarily detached
+	# from the cluster network must still count as existing, or scaling
+	# would mistake it for a missing node. The name pattern is the
+	# cluster's own namespace.
 	docker ps -a --format '{{.Names}}' 2> /dev/null \
 		| grep -E "^${CLUSTER}-$1-[0-9]+$" | sort -V || true
 }
@@ -471,7 +554,11 @@ used_node_ips() {
 # Existing nodes keep their addresses, so this walks past everything already
 # reserved and, when a load balancer exists (non-empty $2), leaves its
 # address free too.
-alloc_node_ip() { # <subnet> <lb-ip>
+# Free usable host addresses for a new node near MASTER_IP, one per line in
+# allocation order: existing reservations and the LB's address (non-empty
+# $2) are skipped, and candidates outside a narrower or offset --subnet are
+# ignored.
+free_node_ips() { # <subnet> <lb-ip>
 	local subnet=$1 lb_ip=$2 prefix="${MASTER_IP%.*}" used ip candidate
 	used=" $(used_node_ips | tr '\n' ' ') "
 	for candidate in $(seq 2 254); do
@@ -487,29 +574,24 @@ alloc_node_ip() { # <subnet> <lb-ip>
 		# shellcheck disable=SC2310
 		is_usable_host_ip "${ip}" "${subnet}" || continue
 		printf '%s\n' "${ip}"
-		return 0
 	done
-	die "no free host address left near ${MASTER_IP} for another node (destroy and recreate the cluster with a different --master-ip)"
+}
+
+# First free address alloc_node_ip can hand out.
+alloc_node_ip() { # <subnet> <lb-ip>
+	local ips first
+	ips=$(free_node_ips "$1" "$2")
+	[[ -n ${ips} ]] \
+		|| die "no free host address left near ${MASTER_IP} for another node (destroy and recreate the cluster with a different --master-ip)"
+	first=${ips%%$'\n'*}
+	printf '%s\n' "${first}"
 }
 
 # Number of addresses alloc_node_ip could hand out before it runs out. A
 # scale operation checks this first so it cannot die halfway through,
 # leaving a partially changed topology behind.
 count_free_node_ips() { # <subnet> <lb-ip>
-	local subnet=$1 lb_ip=$2 prefix="${MASTER_IP%.*}" used ip candidate free=0
-	used=" $(used_node_ips | tr '\n' ' ') "
-	for candidate in $(seq 2 254); do
-		ip="${prefix}.${candidate}"
-		[[ ${ip} == "${lb_ip}" ]] && continue
-		case " ${used} " in
-			*" ${ip} "*) continue ;;
-			*) ;;
-		esac
-		# shellcheck disable=SC2310
-		is_usable_host_ip "${ip}" "${subnet}" || continue
-		free=$((free + 1))
-	done
-	echo "${free}"
+	free_node_ips "$1" "$2" | wc -l
 }
 
 # Every node is a container on the cluster's network running an entrypoint
@@ -570,7 +652,7 @@ kube() {
 }
 
 # Every internal wait is bounded by WAIT_TIMEOUT (--timeout, default
-# ZEK_TIMEOUT or 360s) so a broken cluster fails fast instead of hanging.
+# ZEK_TIMEOUT or 600s) so a broken cluster fails fast instead of hanging.
 wait_for_api() {
 	local deadline=$((SECONDS + WAIT_TIMEOUT))
 	log "waiting for the API of ${CLUSTER} to answer (timeout ${WAIT_TIMEOUT}s)"
@@ -689,25 +771,26 @@ master_node_ip() { # 1-based master index
 # reallocates from the pool in its own order), which moves a node under its
 # kubelet/apiserver certificates and Node object. $3 is the cluster subnet
 # and $4 the load balancer's own address: the address is validated exactly
-# like a master's, and with more than one master ($2 > 1) a worker that
-# would take the LB's address dies before anything is created.
-worker_node_ip() { # <1-based worker index> <masters> <subnet> <lb-ip>
-	local worker_idx=$1 masters=$2 subnet=$3 lb_ip=$4
+# like a master's, and when the cluster has an LB ($5) a worker that would
+# take the LB's address dies before anything is created.
+worker_node_ip() { # <1-based worker index> <masters> <subnet> <lb-ip> <use-lb>
+	local worker_idx=$1 masters=$2 subnet=$3 lb_ip=$4 use_lb=$5
 	# $(( )) reads its operands as variable names, so a non-numeric base
 	# would die later as a bare unbound-variable error; shape-check it.
 	require_ipv4 "${MASTER_IP}" addr "master IP (--master-ip/ZEK_MASTER_IP)"
 	local subnet_prefix="${MASTER_IP%.*}" base_octet="${MASTER_IP##*.}"
 	local addr="${subnet_prefix}.$((base_octet + masters + worker_idx - 1))"
 	require_host_ip "${addr}" "${subnet}" "worker ${worker_idx}"
-	if [[ ${masters} -gt 1 && ${addr} == "${lb_ip}" ]]; then
+	if [[ ${use_lb} -eq 1 && ${addr} == "${lb_ip}" ]]; then
 		die "worker ${worker_idx} would get IP ${addr}, which is the load balancer's IP (${lb_ip}); lower --workers/ZEK_WORKERS or change --master-ip/ZEK_MASTER_IP"
 	fi
 	echo "${addr}"
 }
 
-# The load balancer's own address on the cluster network (created with more
-# than one master): <subnet>.10. Masters (walking up from --master-ip) and
-# workers (following the masters) both have to stay off it.
+# The load balancer's own address on the cluster network (a cluster with
+# more than one master, or a single master created with --lb): <subnet>.10.
+# Masters (walking up from --master-ip) and workers (following the masters)
+# both have to stay off it when it is in use.
 lb_node_ip() { # <subnet>
 	echo "${1%.*}.10"
 }
@@ -760,6 +843,10 @@ require_host_ip() { # <ip> <cidr> <label>
 	local ip=$1 cidr=$2 label=$3
 	local prefix=${cidr##*/}
 	local ipn netn mask gateway broadcast
+	# Reject an impossible dotted quad (e.g. an octet that overflowed the
+	# master+index arithmetic on a subnet wider than /24) before the CIDR
+	# math can map it to some other valid address.
+	require_ipv4 "${ip}" addr "${label}"
 	# shellcheck disable=SC2310
 	ip_in_cidr "${ip}" "${cidr}" \
 		|| die "${label} ${ip} is outside the cluster subnet ${cidr} (check --subnet/ZEK_SUBNET and --master-ip/ZEK_MASTER_IP)"
@@ -782,7 +869,7 @@ require_host_ip() { # <ip> <cidr> <label>
 
 create_cluster() {
 	local workers="$1" masters="$2"
-	local net_subnet subnet_base lb_ip api_endpoint master_addr i backends=""
+	local net_subnet subnet_base lb_ip api_endpoint master_addr i backends="" use_lb=0
 	local -a worker_addrs=()
 
 	# Reuse this cluster's own network when it exists (retry after a
@@ -792,8 +879,7 @@ create_cluster() {
 	# shellcheck disable=SC2310
 	if net_exists; then
 		net_subnet=$(net_subnet_of)
-		[[ -z ${SUBNET} || ${SUBNET} == "${net_subnet}" ]] \
-			|| die "cluster ${CLUSTER} uses subnet ${net_subnet}, not --subnet ${SUBNET}; pass --subnet ${net_subnet} or destroy the cluster"
+		require_subnet "${net_subnet}"
 	else
 		net_subnet="$(pick_subnet)"
 	fi
@@ -801,14 +887,13 @@ create_cluster() {
 	subnet_base="${net_subnet%.*}"
 	MASTER_IP="${MASTER_IP:-${subnet_base}.2}"
 	# The load balancer's reserved address on the cluster network. At
-	# creation masters/workers must avoid it only when the LB is being
-	# created (masters > 1); reconcile_cluster re-checks it before an HA
-	# transition, since a single-master cluster can legitimately fill it.
+	# creation masters/workers must avoid it whenever the LB is being
+	# created: multiple masters always need one, and --lb asks for one
+	# even with a single master so the control plane can grow later.
 	lb_ip="$(lb_node_ip "${net_subnet}")"
+	[[ ${masters} -gt 1 || ${LB} -eq 1 ]] && use_lb=1
 	api_endpoint="${MASTER_IP}:6443"
-	if [[ ${masters} -gt 1 ]]; then
-		api_endpoint="${lb_ip}:6443"
-	fi
+	[[ ${use_lb} -eq 1 ]] && api_endpoint="${lb_ip}:6443"
 	# Every address docker will be asked to allocate is validated against
 	# the subnet before the network exists: docker only rejects
 	# out-of-range/gateway/broadcast IPs at `docker run --ip`, which would
@@ -819,13 +904,13 @@ create_cluster() {
 	for i in $(seq 1 "${masters}"); do
 		master_addr=$(master_node_ip "${i}")
 		require_host_ip "${master_addr}" "${net_subnet}" "master ${i}"
-		if [[ ${masters} -gt 1 ]]; then
+		if [[ ${use_lb} -eq 1 ]]; then
 			[[ ${master_addr} != "${lb_ip}" ]] \
 				|| die "master ${i} would get IP ${master_addr}, which is the load balancer's IP (${lb_ip}); change --master-ip/ZEK_MASTER_IP or lower --masters/ZEK_MASTERS"
 			backends="${backends:+${backends} }${master_addr}"
 		fi
 	done
-	if [[ ${masters} -gt 1 ]]; then
+	if [[ ${use_lb} -eq 1 ]]; then
 		require_host_ip "${lb_ip}" "${net_subnet}" "load balancer"
 	fi
 	# Workers follow the masters: their addresses are derived and validated
@@ -834,10 +919,10 @@ create_cluster() {
 	# half-created (master and LB exist, so the next `up` would reconcile
 	# and could miss the missing workers).
 	for i in $(seq 1 "${workers}"); do
-		worker_addrs+=("$(worker_node_ip "${i}" "${masters}" "${net_subnet}" "${lb_ip}")")
+		worker_addrs+=("$(worker_node_ip "${i}" "${masters}" "${net_subnet}" "${lb_ip}" "${use_lb}")")
 	done
 	ensure_net "${net_subnet}"
-	if [[ ${masters} -gt 1 ]]; then
+	if [[ ${use_lb} -eq 1 ]]; then
 		# ensure_lb reuses a container left behind by an earlier failed
 		# create and recreates one whose backend list no longer matches.
 		# shellcheck disable=SC2310
@@ -846,13 +931,20 @@ create_cluster() {
 		fi
 		ensure_lb "${backends}"
 	else
-		# A failed HA create can leave an LB behind; this topology has no
-		# use for it, so do not carry it into the new cluster.
+		# A failed create can leave an LB behind; a cluster created
+		# without one has its master count locked, so it must not carry
+		# one into the new cluster.
 		remove_lb
 	fi
 
 	log "creating ${MASTER_NAME} (${MASTER_IP})"
-	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" --env "API_ENDPOINT=${api_endpoint}"
+	local -a master_env=(--env "API_ENDPOINT=${api_endpoint}")
+	# Creation-time LB marker read by cluster_has_lb (stopped containers
+	# and recovery after a removed LB container). Never set on a no-LB
+	# cluster, so the endpoint on a cluster whose master happens to use
+	# <subnet>.10 is not mistaken for an LB.
+	[[ ${use_lb} -eq 1 ]] && master_env+=(--env "ZEK_LB_ENDPOINT=${lb_ip}:6443")
+	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" "${master_env[@]}"
 	wait_for_api
 	read_join_credentials
 
@@ -876,7 +968,8 @@ create_cluster() {
 
 # Start every container that exists, in dependency-safe order: load
 # balancer first (every kubeconfig may point at it), then masters in index
-# order, then workers. e2e asserts this order (multi-master, persistence-2).
+# order, then workers. e2e asserts this order (multi-master-recovery,
+# persistence-2).
 start_existing_nodes() {
 	local name node_list
 	log "restarting cluster ${CLUSTER}"
@@ -894,7 +987,7 @@ start_existing_nodes() {
 	done <<< "${node_list}"
 }
 
-# Backends of the HA load balancer: the address each master was created
+# Backends of the load balancer: the address each master was created
 # with, whether it is running or not (haproxy health-checks them).
 lb_backends() {
 	local name address master_list backends=""
@@ -919,12 +1012,16 @@ lb_env_backends() {
 # entrypoint a reload protocol; the fixed --ip keeps the endpoint stable.
 # The retry waits out docker's endpoint cleanup for the same address.
 ensure_lb() { # <space separated backends>
-	local backends=$1 lb_ip current i
+	local backends=$1 lb_ip current current_ip
 	lb_ip=$(lb_node_ip "${NET_SUBNET}")
 	# shellcheck disable=SC2310
 	if node_exists "${LB_NAME}"; then
 		current=$(lb_env_backends)
-		if [[ ${current} == "${backends}" ]]; then
+		current_ip=$(node_address "${LB_NAME}")
+		# Reuse only when the container still sits on its own reserved
+		# address; a manually disconnected/recreated LB must be rebuilt
+		# rather than started where the endpoint cannot reach it.
+		if [[ ${current} == "${backends}" ]] && [[ ${current_ip} == "${lb_ip}" ]]; then
 			start_node "${LB_NAME}"
 			return 0
 		fi
@@ -933,15 +1030,10 @@ ensure_lb() { # <space separated backends>
 	else
 		log "creating ${LB_NAME} (${lb_ip}) in front of: ${backends}"
 	fi
-	for i in {1..10}; do
-		# shellcheck disable=SC2310
-		if run_node "${LB_NAME}" lb --ip "${lb_ip}" --env "LB_BACKENDS=${backends}"; then
-			return 0
-		fi
-		docker rm -f "${LB_NAME}" > /dev/null 2>&1 || true
-		sleep 2
-	done
-	die "cannot start ${LB_NAME} with backends: ${backends}"
+	# shellcheck disable=SC2310
+	if ! run_node_retry "${LB_NAME}" lb --ip "${lb_ip}" --env "LB_BACKENDS=${backends}"; then
+		die "cannot start ${LB_NAME} with backends: ${backends}"
+	fi
 }
 
 remove_lb() {
@@ -949,124 +1041,6 @@ remove_lb() {
 	node_exists "${LB_NAME}" || return 0
 	log "removing ${LB_NAME}"
 	docker rm -f "${LB_NAME}" > /dev/null
-}
-
-# Point every in-cluster kubeconfig and kubeadm record at a new endpoint.
-# This is needed when a cluster created with the LB endpoint is scaled back
-# to one master: removing the LB without moving the endpoint would break
-# every kubelet, kube-proxy, scheduler and controller-manager at once.
-switch_endpoint() { # <new host:port>
-	local new_endpoint=$1 old_endpoint name node_list namespace configmap record applied
-	old_endpoint=$(docker exec "${MASTER_NAME}" cat /etc/cluster/api-endpoint 2> /dev/null || true)
-	if [[ -z ${old_endpoint} ]]; then
-		warn "cannot read the current endpoint from ${MASTER_NAME}"
-		return 1
-	fi
-	[[ ${old_endpoint} != "${new_endpoint}" ]] || return 0
-	log "switching the cluster endpoint from ${old_endpoint} to ${new_endpoint}"
-	# Update the cluster records first: if any fails, leave every local
-	# kubeconfig on the old (working) endpoint so the LB can still serve and
-	# the next `up` can retry. kube-proxy's ConfigMap carries its own
-	# kubeconfig copy, so it belongs here too.
-	for record in "kube-system/kubeadm-config" "kube-public/cluster-info" \
-		"kube-system/kube-proxy"; do
-		namespace=${record%%/*}
-		configmap=${record#*/}
-		applied=0
-		# A stacked-etcd change can briefly interrupt the API; retry long
-		# enough to ride that out instead of aborting the migration.
-		for _ in {1..10}; do
-			# shellcheck disable=SC2310
-			if kube --request-timeout=10s -n "${namespace}" get configmap "${configmap}" -o yaml 2> /dev/null \
-				| sed "s#${old_endpoint}#${new_endpoint}#g" \
-				| kube --request-timeout=10s apply -f - > /dev/null 2>&1; then
-				applied=1
-				break
-			fi
-			sleep 2
-		done
-		if [[ ${applied} -eq 0 ]]; then
-			warn "could not update configmap ${namespace}/${configmap} to the new endpoint"
-			return 1
-		fi
-	done
-	# kubelet/admin/scheduler/controller-manager kubeconfigs. grep -r follows
-	# the /etc/kubernetes symlink, but /var/lib/kubernetes is its real target
-	# and avoids relying on that.
-	node_list=$(all_node_names)
-	while read -r name; do
-		[[ -n ${name} ]] || continue
-		if ! docker exec "${name}" sh -c \
-			"grep -rl --include='*.conf' -- '${old_endpoint}' /var/lib/kubernetes 2>/dev/null | xargs -r sed -i 's#${old_endpoint}#${new_endpoint}#g'"; then
-			warn "could not rewrite the kubeconfigs on ${name}"
-			return 1
-		fi
-	done <<< "${node_list}"
-	# Published credentials on master-1.
-	if ! docker exec "${MASTER_NAME}" sh -c \
-		"sed -i 's#${old_endpoint}#${new_endpoint}#g' /etc/cluster/admin.conf && printf '%s\n' '${new_endpoint}' > /etc/cluster/api-endpoint"; then
-		warn "could not rewrite the published credentials on ${MASTER_NAME}"
-		return 1
-	fi
-	# Restart kube-proxy so the updated ConfigMap is applied.
-	# shellcheck disable=SC2310
-	kube --request-timeout=10s -n kube-system rollout restart daemonset kube-proxy > /dev/null 2>&1 || true
-	return 0
-}
-
-restart_endpoint_nodes() {
-	local name node_list
-	node_list=$(all_node_names)
-	while read -r name; do
-		[[ -n ${name} ]] || continue
-		log "restarting ${name} to apply the new endpoint"
-		docker restart "${name}" > /dev/null
-	done <<< "${node_list}"
-}
-
-# The LB only exists for multi-master clusters. Removing it is safe when the
-# cluster was created with a single master (the endpoint never pointed at
-# the LB); for an HA-created cluster the endpoint has to move to master-1
-# first.
-maybe_remove_lb() { # <desired-masters>
-	local desired=$1 lb_ip master_address endpoint restart_needed=0 name node_list
-	[[ ${desired} -eq 1 ]] || return 0
-	lb_ip=$(lb_node_ip "${NET_SUBNET}")
-	master_address=$(node_address "${MASTER_NAME}")
-	master_address="${master_address:-${NET_SUBNET%.*}.2}"
-	endpoint=$(docker exec "${MASTER_NAME}" cat /etc/cluster/api-endpoint 2> /dev/null || true)
-	if [[ -z ${endpoint} ]]; then
-		# shellcheck disable=SC2310
-		if node_exists "${LB_NAME}"; then
-			die "cannot read the cluster endpoint from ${MASTER_NAME}; leaving ${LB_NAME} in place"
-		fi
-		return 0
-	fi
-	if [[ ${endpoint} == "${lb_ip}:6443" ]]; then
-		# shellcheck disable=SC2310
-		if ! switch_endpoint "${master_address}:6443"; then
-			die "could not move the cluster endpoint to ${master_address}:6443; leaving ${LB_NAME} in place"
-		fi
-		restart_needed=1
-	fi
-	# Recovery from a partial earlier run: the endpoint file may already be
-	# master-1 while some node kubeconfig still names the LB and was never
-	# restarted. Restart whenever a reference remains (skip the scan when a
-	# switch in this run already requires a restart).
-	if [[ ${restart_needed} -eq 0 ]]; then
-		node_list=$(all_node_names)
-		while read -r name; do
-			[[ -n ${name} ]] || continue
-			if docker exec "${name}" grep -rqF --include='*.conf' -- "${lb_ip}:" /var/lib/kubernetes; then
-				restart_needed=1
-				break
-			fi
-		done <<< "${node_list}"
-	fi
-	remove_lb
-	if [[ ${restart_needed} -eq 1 ]]; then
-		restart_endpoint_nodes
-	fi
 }
 
 # Reconcile an existing cluster to the requested sizes. Only an explicitly
@@ -1077,8 +1051,8 @@ maybe_remove_lb() { # <desired-masters>
 reconcile_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
 	local existing_masters existing_workers desired_masters desired_workers
-	local name address node_addr i idx lb_ip backends worker_list master_list node_list
-	local add_masters=0 add_workers=0 needed free reserve_lb_ip=""
+	local name address i idx lb_ip backends worker_list master_list
+	local add_masters=0 add_workers=0 needed free reserve_lb_ip="" has_lb=0
 	local -a current_workers=() current_masters=()
 	existing_masters=$(count_masters)
 	existing_workers=$(count_workers)
@@ -1089,8 +1063,7 @@ reconcile_cluster() {
 
 	NET_SUBNET=$(net_subnet_of)
 	[[ -n ${NET_SUBNET} ]] || die "cannot determine the subnet of ${NET_NAME}; is the cluster intact? (destroy and recreate it)"
-	[[ -z ${SUBNET} || ${SUBNET} == "${NET_SUBNET}" ]] \
-		|| die "cluster ${CLUSTER} uses subnet ${NET_SUBNET}, not --subnet ${SUBNET}; pass --subnet ${NET_SUBNET} or destroy the cluster"
+	require_subnet "${NET_SUBNET}"
 	# The live cluster's own addresses are authoritative; --master-ip is a
 	# creation-time default and must not move an existing cluster's base.
 	# A master detached from the network loses its IPAMConfig (docker
@@ -1100,19 +1073,39 @@ reconcile_cluster() {
 	MASTER_IP=$(node_address "${MASTER_NAME}")
 	MASTER_IP="${MASTER_IP:-${NET_SUBNET%.*}.2}"
 	lb_ip=$(lb_node_ip "${NET_SUBNET}")
+	# An LB-backed cluster keeps that identity even while the LB container
+	# is missing (master-1 carries a creation-time marker), so the
+	# recovery path below can recreate it. Local `has_lb` keeps the
+	# guards and the allocation precheck consistent.
+	# shellcheck disable=SC2310
+	if cluster_has_lb; then
+		has_lb=1
+	fi
+	# --lb is a creation-time choice: retrofitting one would have to move
+	# the cluster's kubeadm endpoint and the apiserver certificate SANs
+	# built for it, which an existing cluster cannot do.
+	if [[ ${LB} -eq 1 ]] && [[ ${has_lb} -eq 0 ]]; then
+		die "cannot add a load balancer to an existing cluster (--lb/ZEK_LB only applies at creation); destroy it and recreate with --lb to make its control plane scalable"
+	fi
+	# Master scaling is gated on the LB: it is the cluster's stable
+	# endpoint. Without one only a single master is possible, so its
+	# master count is locked; every multi-master cluster has an LB, which
+	# also keeps a cluster from reaching multiple masters without one.
+	# Workers are unrestricted.
+	if [[ ${desired_masters} -ne ${existing_masters} ]] && [[ ${has_lb} -eq 0 ]]; then
+		die "cannot scale masters without a load balancer: only one master is possible in a cluster without an LB; recreate it with --lb or --masters N to make its control plane scalable"
+	fi
 	# A narrow or offset subnet can put the derived LB address outside its
 	# usable host range; refuse before adding nodes or creating the LB,
 	# which would otherwise die halfway through the scale.
 	if [[ ${desired_masters} -gt 1 ]]; then
 		require_host_ip "${lb_ip}" "${NET_SUBNET}" "load balancer"
 	fi
-	# Only reserve the LB address while one exists or is about to be
-	# created: a single-master cluster may legitimately use .10, and the
-	# HA transition checks that collision explicitly below. During a
-	# HA-to-single scale the LB still exists until the removals, so keep
-	# reserving it then.
+	# Keep the LB's address out of the allocator whenever the cluster has
+	# (or is about to get) an LB. A no-LB cluster may legitimately use
+	# .10, and a missing LB is recreated at .10 before any node is added.
 	reserve_lb_ip=""
-	if [[ ${existing_masters} -gt 1 || ${desired_masters} -gt 1 ]]; then
+	if [[ ${desired_masters} -gt 1 ]] || [[ ${has_lb} -eq 1 ]]; then
 		reserve_lb_ip=${lb_ip}
 	fi
 	# Refuse an impossible scale before adding anything: a failure halfway
@@ -1129,27 +1122,11 @@ reconcile_cluster() {
 		[[ ${free} -ge ${needed} ]] \
 			|| die "not enough free addresses for ${needed} new node(s): only ${free} usable in ${NET_SUBNET} (lower --workers/--masters or recreate the cluster with a different --master-ip)"
 	fi
-	# A single-master cluster created with enough workers can have one on
-	# the LB's reserved address (the creation-time formula only checks that
-	# collision when the LB already exists). Refuse the HA transition
-	# before adding anything rather than failing half-way through the LB
-	# create.
-	if [[ ${desired_masters} -gt 1 ]]; then
-		node_list=$(cluster_container_names)
-		while read -r name; do
-			[[ -n ${name} && ${name} != "${LB_NAME}" ]] || continue
-			node_addr=$(node_address "${name}")
-			if [[ ${node_addr} == "${lb_ip}" ]]; then
-				die "cannot add the load balancer: ${name} already uses its address ${lb_ip}; destroy and recreate the cluster with a different --master-ip"
-			fi
-		done <<< "${node_list}"
-	fi
-
 	start_existing_nodes
-	# HA-created kubeconfigs point at the LB, so it has to be serving
-	# before the API wait. This also recreates a missing LB from a failed
-	# create or a manual removal.
-	if [[ ${desired_masters} -gt 1 ]]; then
+	# Kubeconfigs of an LB-backed cluster (HA, or --lb with one master)
+	# point at the LB, so it has to be serving before the API wait. This
+	# also recreates an LB container that was removed.
+	if [[ ${desired_masters} -gt 1 ]] || [[ ${has_lb} -eq 1 ]]; then
 		backends=$(lb_backends)
 		ensure_lb "${backends}"
 	fi
@@ -1206,11 +1183,13 @@ reconcile_cluster() {
 		unset 'current_masters[idx]'
 	done
 
-	if [[ ${desired_masters} -gt 1 ]]; then
+	# Backends only change with the master set. Scaling down to one master
+	# keeps the LB (the early ensure_lb above started or recreated it); this
+	# final pass shrinks its backends to master-1 so the cluster can grow
+	# back later.
+	if [[ ${desired_masters} -ne ${existing_masters} ]]; then
 		backends=$(lb_backends)
 		ensure_lb "${backends}"
-	else
-		maybe_remove_lb "${desired_masters}"
 	fi
 
 	wait_for_api
@@ -1224,23 +1203,27 @@ cmd_up() {
 		case "$1" in
 			--workers)
 				[[ $# -ge 2 ]] || die "--workers needs a value (check --workers/ZEK_WORKERS)"
+				[[ -n ${2:-} ]] || die "--workers needs a value (check --workers/ZEK_WORKERS)"
 				workers="$2"
 				workers_set=1
 				shift 2
 				;;
 			--masters)
 				[[ $# -ge 2 ]] || die "--masters needs a value (check --masters/ZEK_MASTERS)"
+				[[ -n ${2:-} ]] || die "--masters needs a value (check --masters/ZEK_MASTERS)"
 				masters="$2"
 				masters_set=1
 				shift 2
 				;;
 			--workers=*)
 				workers="${1#*=}"
+				[[ -n ${workers} ]] || die "--workers needs a value (check --workers/ZEK_WORKERS)"
 				workers_set=1
 				shift
 				;;
 			--masters=*)
 				masters="${1#*=}"
+				[[ -n ${masters} ]] || die "--masters needs a value (check --masters/ZEK_MASTERS)"
 				masters_set=1
 				shift
 				;;
@@ -1254,12 +1237,6 @@ cmd_up() {
 			*) usage ;;
 		esac
 	done
-	if [[ ${workers_set} -eq 1 && -z ${workers} ]]; then
-		die "--workers needs a value (check --workers/ZEK_WORKERS)"
-	fi
-	if [[ ${masters_set} -eq 1 && -z ${masters} ]]; then
-		die "--masters needs a value (check --masters/ZEK_MASTERS)"
-	fi
 	# An env twin that was actually set is an explicit topology request too;
 	# leaving both unset is what makes a later `up` only restart.
 	if [[ ${workers_set} -eq 0 && ${WORKERS_ENV_SET} -eq 1 ]]; then
@@ -1430,16 +1407,21 @@ cmd_clean() {
 	# that formula, using master-1's requested address as the base.
 	worker_addr=$(node_address "${name}")
 	if [[ -z ${worker_addr} ]]; then
-		local masters net_subnet lb_ip master_addr=""
+		local masters net_subnet lb_ip master_addr="" use_lb=0
 		net_subnet=$(net_subnet_of)
+		[[ -n ${net_subnet} ]] || die "cannot determine the subnet of ${NET_NAME}; is the cluster intact? (destroy and recreate it)"
 		# shellcheck disable=SC2310
 		if node_exists "${MASTER_NAME}"; then
 			master_addr=$(node_address "${MASTER_NAME}")
 		fi
 		MASTER_IP="${master_addr:-${MASTER_IP:-${net_subnet%.*}.2}}"
 		lb_ip=$(lb_node_ip "${net_subnet}")
+		# shellcheck disable=SC2310
+		if cluster_has_lb; then
+			use_lb=1
+		fi
 		masters=$(count_masters)
-		worker_addr=$(worker_node_ip "${name##*-}" "${masters}" "${net_subnet}" "${lb_ip}")
+		worker_addr=$(worker_node_ip "${name##*-}" "${masters}" "${net_subnet}" "${lb_ip}" "${use_lb}")
 	fi
 
 	# A node's netns lives on its container; a fresh container is the only
@@ -1519,7 +1501,7 @@ cmd_destroy() {
 }
 
 usage() {
-	die "usage: $0 [--version] [--latest] [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
+	die "usage: $0 [--version] [--latest] [--lb] [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
 }
 
 # Global flags are only parsed before the command (see the header), so a

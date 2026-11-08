@@ -8,10 +8,10 @@ One image, four roles:
 | --------- | ------------------------------------------------------------------------------ |
 | `master`  | Control-plane node: `kubeadm init` or `kubeadm join --control-plane` + kubelet |
 | `worker`  | Worker node: `kubeadm join` + kubelet                                          |
-| `lb`      | haproxy in front of the masters (only used with `--masters > 1`)               |
+| `lb`      | haproxy in front of the masters (HA clusters, and `--lb`)                      |
 | `kubectl` | `kubectl` client for the cluster                                               |
 
-Clusters are managed with `./zek.sh`. `up` creates the cluster on the first run and reconciles it afterwards: a bare `up` restarts the existing containers, while `up --workers N --masters M` adds or removes nodes to match the requested topology. Surviving nodes keep their names and static addresses. Several clusters can run side by side.
+Clusters are managed with `./zek.sh`. `up` creates the cluster on the first run and reconciles it afterwards: a bare `up` restarts the existing containers, while `up --workers N --masters M` adds or removes nodes to match the requested topology (workers at any time; masters only on a cluster that has a load balancer). Surviving nodes keep their names and static addresses. Several clusters can run side by side.
 
 No CNI is installed automatically. Once the nodes are up you install your own (flannel, cilium, ...); until then nodes report `NotReady`, which is expected.
 
@@ -32,7 +32,7 @@ step. Neither version is hard-coded in the Dockerfile.
 Every build also gets `<alpine>-<k8s>-latest` for the pinned combo and five
 version aliases that hold alpine at major, minor or full while tracking either
 the kubernetes minor or full version. With the current pins these are `3-1.37`,
-`3-1.37.2`, `3.24-1.37`, `3.24-1.37.2` and `3.24.3-1.37`. The kubernetes `v`
+`3-1.37.2`, `3.24-1.37`, `3.24-1.37.2` and `3.24.4-1.37`. The kubernetes `v`
 prefix is dropped in those aliases, and `-` separates the two versions because
 Docker tags cannot contain `/`.
 
@@ -118,9 +118,9 @@ when its size was not set.
 
 ```sh
 ./zek.sh up --workers 4        # grow this cluster to 4 workers (masters unchanged)
-./zek.sh up --masters 3        # add control-plane nodes and start the load balancer
+./zek.sh up --masters 3        # add control-plane nodes (clusters with an LB)
 ./zek.sh up --workers 1        # remove the highest-index workers
-./zek.sh up --masters 1        # remove extra masters; the load balancer goes away
+./zek.sh up --masters 1        # remove extra masters; the load balancer stays
 ```
 
 Additions take the first free usable host address in the master's last-octet
@@ -131,26 +131,32 @@ their container and `Node` object are deleted; for a master its stacked-etcd
 member is removed too. `master-1` is never removed — it holds the published
 credentials and is the container every `zek.sh kubectl` call uses.
 
-The load balancer follows the master count: it is created when masters > 1 and
-removed when the count returns to 1. A cluster created with a single master has
-`master-1` as its kubeadm endpoint; scaling it up creates the LB for the new
-masters, but kubeadm cannot move the existing endpoint, so the published
-`admin.conf` keeps pointing at `master-1` (and works, since `master-1` stays).
-The existing apiserver certificates are not reissued in this direction, so
-the generated kubeconfigs stay on `master-1`; the LB is an additional address
-for the new control planes, not a replacement endpoint.
+The load balancer is what makes the control plane scalable: it is the
+cluster's stable endpoint, and a cluster without one is always exactly one
+master (master scaling is refused there). A cluster created with more than one
+master always has one; a single-master cluster gets one only if `--lb`
+(`ZEK_LB=1`) is passed at creation, which also makes the LB its kubeadm
+endpoint. `--lb` is a creation-time choice only: retrofitting an LB would have
+to move the cluster's endpoint and the apiserver certificate SANs, which an
+existing cluster cannot do. Workers scale up and down regardless of the
+master setup.
 
-A cluster created with multiple masters uses the LB as its endpoint; scaling it
-back to one master rewrites the node kubeconfigs, `cluster-info`,
-`kubeadm-config` and kube-proxy's config to `master-1` before removing the LB,
-then restarts the remaining nodes to apply the change. A single-master cluster
-whose workers already fill `<subnet>.10` cannot grow to multiple masters (the
-LB needs that address); `up` refuses before adding anything.
+Scaling an HA-created (or `--lb`) cluster down to one master keeps the LB: the
+endpoint stays on it and only its backend list shrinks to `master-1`. That
+cluster can be grown back to multiple masters later (`up` refreshes the
+certificate key before adding them); scaling never removes an LB.
+
+To start with one master but keep the control plane scalable, create it with
+an LB:
+
+```sh
+./zek.sh --lb up --workers 2 --masters 1
+```
 
 Every Kubernetes wait in zek.sh is bounded by `--timeout SECONDS` (default
 600, override with `ZEK_TIMEOUT`), so a broken cluster fails fast instead of
-hanging (container start/create, LB-recreate and endpoint-record retries use
-small fixed budgets outside it):
+hanging (container start/create and LB-recreate retries use small fixed budgets
+outside it):
 
 ```sh
 ./zek.sh --timeout 120 up   # give up after 2 minutes
@@ -180,9 +186,10 @@ follow the last master, so `<subnet>.3` and `<subnet>.4` for the default
 one-master cluster.
 Without that, docker's dynamic pool would pick the addresses — and it hands
 them out in its own order after a host reboot, which moves a node out from
-under its kubelet certificate and its `Node` object. With more than one master
-the load balancer owns `<subnet>.10` (see below), and a worker that would land
-on it is refused before anything is created. Nodes added by a later `up` take
+under its kubelet certificate and its `Node` object. With an LB (more than one
+master, or `--lb`) the load balancer owns `<subnet>.10` (see below), and a
+worker that would land on it is refused before anything is created. Nodes
+added by a later `up` take
 the first free usable host address in that range, so scaling never moves an
 existing node off the address its kubelet certificate and `Node` object were
 built on. Narrow and offset subnets are handled the same way: unusable
@@ -195,19 +202,20 @@ Every setting except `--version` exists twice: as a flag and as an environment
 variable. The flag wins when both are set. Global flags go before the command
 (`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
 
-| Variable        | Flag          | Effect                                                                          |
-| --------------- | ------------- | ------------------------------------------------------------------------------- |
-| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                                    |
-| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                          |
-| `ZEK_IMAGE`     | `--image`     | Node image (default: release-pinned GHCR image)                                 |
-| `ZEK_LATEST`    | `--latest`    | Use the `latest` tag of the selected image repository (`0`/`1`)                 |
-| `ZEK_WORKERS`   | `--workers`   | Workers on `up` (default `1`; set it to request a count on an existing cluster) |
-| `ZEK_MASTERS`   | `--masters`   | Masters on `up` (default `1`; set it to request a count on an existing cluster) |
-| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                       |
-| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                                        |
-| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                                            |
-| `ZEK_POD_CIDR`  | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`)                          |
-| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers                                  |
+| Variable        | Flag          | Effect                                                                                                       |
+| --------------- | ------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                                                                 |
+| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                                                       |
+| `ZEK_IMAGE`     | `--image`     | Node image (default: release-pinned GHCR image)                                                              |
+| `ZEK_LATEST`    | `--latest`    | Use the `latest` tag of the selected image repository (`0`/`1`, default `0`)                                 |
+| `ZEK_LB`        | `--lb`        | Create the LB even with one master, enabling later master scaling (`0`/`1`, default `0`; creation-time only) |
+| `ZEK_WORKERS`   | `--workers`   | Workers on `up` (default `1`; set it to request a count on an existing cluster)                              |
+| `ZEK_MASTERS`   | `--masters`   | Masters on `up` (default `1`; set it to request a count on an existing cluster)                              |
+| `ZEK_SUBNET`    | `--subnet`    | Explicit subnet instead of the first free `172.20.X.0/24`                                                    |
+| `ZEK_MASTER_IP` | `--master-ip` | First master's IP (default `<subnet>.2`)                                                                     |
+| `ZEK_DNS`       | `--dns`       | Upstream DNS for the node containers                                                                         |
+| `ZEK_POD_CIDR`  | `--pod-cidr`  | Pod subnet passed to kubeadm (default `10.244.0.0/16`)                                                       |
+| `ZEK_MOUNTS`    | `--mounts`    | Extra host bind mounts for the node containers                                                               |
 
 ```sh
 ./zek.sh --mounts "/srv/data:/mnt/data" up   # host dir inside every node container
@@ -218,24 +226,27 @@ ZEK_MOUNTS="/srv/data:/mnt/data" ./zek.sh up # same, via environment
 `host-path:container-path[:options]` bindings (`--mounts "/a:/x /b:/y:ro"`).
 Like `--image` and `--dns`, it only affects containers created afterwards —
 nodes added by a scaling `up`, `clean`, and a recreated LB. Existing
-containers are not recreated with these options; topology changes can still
-rewrite their kubeconfigs as described above.
+containers are not recreated with these options.
 
-## High availability (`--masters 3`)
+## High availability (multiple masters, or `--lb`)
 
-With more than one master, zek starts an extra container `<cluster>-lb`
-(haproxy) at `<subnet>.10` (scaling across the one-master boundary creates or
-removes it automatically):
+With more than one master — or a single master plus `--lb` — zek starts an
+extra container `<cluster>-lb` (haproxy) at `<subnet>.10`. It belongs to the
+cluster for life: scaling down to one master keeps it (with the endpoint still
+on it), so the cluster can grow again — a cluster created with one master and
+no `--lb` never gets one. If the `<cluster>-lb` container is removed,
+master-1's creation-time marker keeps the cluster LB-backed and the next `up`
+recreates the LB at `.10` with the current backends:
 
 - haproxy listens on `6443`, round-robins to every master's apiserver and
   health-checks them (stats page at `http://<lb-ip>:8404/`, CSV at
   `http://<lb-ip>:8404/;csv`).
-- for a cluster created with multiple masters, kubeadm's
+- for a cluster created with an LB (multiple masters, or `--lb`), kubeadm's
   `controlPlaneEndpoint` is that address, so every kubeconfig (all kubelets,
   kubectl, scheduler, controller-manager) talks to the endpoint — kubeadm
-  also puts it into the apiserver certificate SANs. A single-master cluster
-  scaled up later keeps `master-1` as its endpoint (see "Changing the
-  topology").
+  also puts it into the apiserver certificate SANs. A cluster created with
+  one master and no `--lb` has no LB and cannot be scaled into HA (see
+  "Changing the topology").
 - each master runs its own stacked **etcd** member and a full set of
   control-plane static pods (leader-elected, so one active scheduler /
   controller-manager, N apiservers).
@@ -263,8 +274,9 @@ takes it out of rotation within seconds; `docker start` brings it back and
 it rejoins the cluster.
 
 The apiserver is also reachable directly at `https://<master-ip>:6443`, but
-the certificate is only issued for the endpoint (and the first master's
-address), so use the endpoint — or `curl -k` — for direct checks.
+the certificate covers the endpoint and each control-plane node's own
+address, not an arbitrary address on the cluster network, so use the
+endpoint — or `curl -k` — for direct checks.
 
 ## Install a CNI
 
@@ -314,10 +326,11 @@ after any CNI/mesh uninstall so the new stack starts from a clean netns.
 
 ## Persistence and recovery
 
-Everything kubeadm, kubelet, containerd and etcd write lives on the node
-container's own writable layer, and the published credentials (`admin.conf`,
-join token, CA hash, API endpoint, certificate key) live under
-`/etc/cluster` on the first master's layer. A node container can be stopped
+All persistent node state that kubeadm, kubelet, containerd and etcd write
+lives on the node container's own writable layer (`/run` and `/tmp` are tmpfs
+runtime paths), and the published credentials (`admin.conf`, join token, CA
+hash, API endpoint, certificate key) live under `/etc/cluster` on the first
+master's layer. A node container can be stopped
 or restarted, and the whole machine can be rebooted, and everything comes
 back with the same identity: the cluster survives `down`/`up`,
 `docker stop`/`docker start`, `docker restart`, a Docker daemon restart and
@@ -328,18 +341,19 @@ worker that `clean` recreates. It is gone once the containers are removed
 (`destroy`, `docker rm`).
 
 A creation that is interrupted before kubeadm finished (crash or power loss
-during `up`) is detected on the next start: the partial state is reset and
-the node re-initialises or re-joins from scratch. Completed nodes are never
-reset.
+during `up`) is detected on the next start: early or partial state is reset
+and the node re-initialises or re-joins from scratch, while a first-master
+init that already reached a serving control plane is completed in place by
+the resume path. Completed nodes are never reset.
 
 ## Notes
 
 - **`--cgroupns=host` is mandatory.** With the private cgroup namespace the kubelet fails to move itself into the right cgroup (`cgroup.procs` write returns `ENOENT`).
 - The kubelet config file keeps `InPlacePodLevelResourcesVerticalScaling` off (`ensure_kubelet_config`), because that shared cgroup namespace also makes the kubelet's cgroup _reads_ non-isolated: with the gate on (its default) it publishes the shared cgroup's `cpu` as each pod's pod-level actuated resource — the same constant for every pod, not the pod's own value — and counts it in the node's admission accounting, where the total grows past the node's capacity and every new pod is rejected `OutOfcpu` on a node that reports itself nearly idle.
-- Node addresses are static (at creation the masters walk up from `--master-ip` and the workers follow the last master; nodes added by later scaling take the first free address; the HA load balancer owns `<subnet>.10`), which is what keeps a node at the same address across a Docker daemon restart or a host reboot. `clean` recreates a worker on the address it already had.
+- Node addresses are static (at creation the masters walk up from `--master-ip` and the workers follow the last master; nodes added by later scaling take the first free address; the load balancer, when the cluster has one, owns `<subnet>.10`), which is what keeps a node at the same address across a Docker daemon restart or a host reboot. `clean` recreates a worker on the address it already had.
 - **`--privileged`** is required for containerd's mounts and the CNI networking.
 - The nodes are prepared so CNI daemonsets "just work": `/etc/cni/net.d` and the CNI bin dir are pre-created world-writable (some installers run as non-root), `/`, `/sys`, `/run` are made shared mounts so eBPF setups can mount fs types into pods, and `bpffs` is pre-mounted at `/sys/fs/bpf`.
-- The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on shutdown. Nothing is written to disk. Set `NO_HOST_MODULES=1` (or pass `--no-host-modules`) on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); life is fully host-neutral then.
+- The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on shutdown. Nothing is written to disk. Set `NO_HOST_MODULES=1` (or pass `--no-host-modules`) on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); no host modules or sysctls are touched then, though the mandatory host cgroup namespace remains in use.
 - The node also raises the host-wide `fs.inotify.max_user_instances` quota to 1024 (all node containers share the per-uid quota) and leaves it raised on exit, since running containers still need it. With `NO_HOST_MODULES=1` this is skipped too.
 - `kube-proxy`'s automatic conntrack table tuning is disabled via its ConfigMap because the global `nf_conntrack_max` sysctl is not writable from a container netns.
 - Containerd's CNI plugin search path is set to `['/opt/cni/bin', '/usr/libexec/cni']` since CNI providers install their plugin binary into `/opt/cni/bin`.

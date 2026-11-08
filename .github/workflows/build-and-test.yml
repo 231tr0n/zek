@@ -75,10 +75,11 @@
         name: "Run e2e tests",
         # Hard budget per matrix entry: every test gets ten minutes, and the
         # internal waits are bounded below that. smoke/persistence/recovery
-        # stay split so jobs run in parallel; the heavy cluster entries
-        # (multi-master*, topology, cilium) have their own smaller bring-up
-        # so no single entry approaches the ceiling. The image build above
-        # is a separate step; only the job's 90-minute timeout bounds it.
+        # stay split so jobs run in parallel; multi-master keeps its
+        # 3-master bring-up while multi-master-recovery, topology and
+        # cilium use smaller ones, so no single entry approaches the
+        # ceiling. The image build above is a separate step; only the job's
+        # 90-minute timeout bounds it.
         timeout-minutes: 10,
         run: "\
            set -euo pipefail\n\

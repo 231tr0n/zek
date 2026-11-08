@@ -5,7 +5,7 @@ KUBERNETES_VERSION ?= v1.37.2
 
 # Version aliases: hold alpine at major, minor or full while tracking either
 # the kubernetes minor or full version. For the current pins that is 3-1.37,
-# 3-1.37.2, 3.24-1.37, 3.24-1.37.2 and 3.24.3-1.37. The `v` prefix is dropped
+# 3-1.37.2, 3.24-1.37, 3.24-1.37.2 and 3.24.4-1.37. The `v` prefix is dropped
 # from kubernetes versions and `-` joins the two because Docker tags cannot
 # contain `/`.
 version_major = $(word 1,$(subst ., ,$(1)))

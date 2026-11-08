@@ -8,8 +8,8 @@
 #            supervisor
 #   worker   kubeadm join + kubelet supervisor
 #   kubectl  kubectl client against the published cluster config
-#   lb       haproxy in front of the control-plane nodes (only started by
-#            the manager for multi-master clusters)
+#   lb       haproxy in front of the control-plane nodes (started by the
+#            manager when the cluster has an LB: multiple masters, or --lb)
 #
 # Flags: every input env var can also be passed as a flag after the role
 # (the name in lower case with '_' as '-', e.g. POD_CIDR -> --pod-cidr); the
@@ -50,8 +50,8 @@
 #   - Host effects are limited to in-memory kernel setup (loading modules the
 #     host lacks, enabling a few sysctls, and raising the host-wide inotify
 #     quota); sysctls are restored best-effort and loaded modules unloaded on
-#     shutdown (nodes share the host netns, so another container may still
-#     need them), and the inotify quota stays raised on purpose. Nothing
+#     shutdown (modules and sysctls are host-wide, so another container may
+#     still need them), and the inotify quota stays raised on purpose. Nothing
 #     touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
 set -euo pipefail
 
@@ -68,6 +68,10 @@ ROLE_ARGS=()
 
 CONTAINERD_PID=""
 SUPERVISOR_PID=""
+# Boolean env inputs (their flags set them to 1 too). Validated below,
+# before any role runs, so a non-0/1 value cannot reach shell arithmetic.
+MASTER_JOIN="${MASTER_JOIN:-0}"
+NO_HOST_MODULES="${NO_HOST_MODULES:-0}"
 declare -A SYSCTL_BEFORE=()
 # Modules the host already had before preflight_host ran (space separated):
 # cleanup only unloads the ones NOT in this list. HOST_SETUP_DONE is set at
@@ -83,8 +87,11 @@ die() {
 	log "ERROR: $*"
 	exit 1
 }
-[[ -z ${WAIT_TIMEOUT:-} || ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] \
-	|| die "invalid WAIT_TIMEOUT '${WAIT_TIMEOUT}' (expected seconds >= 1)"
+if [[ -n ${WAIT_TIMEOUT:-} ]]; then
+	{ [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] && [[ ${#WAIT_TIMEOUT} -le 5 ]] \
+		&& ((10#${WAIT_TIMEOUT} <= 86400)); } \
+		|| die "invalid WAIT_TIMEOUT '${WAIT_TIMEOUT}' (expected seconds 1-86400)"
+fi
 
 # Run a command with its output captured to a log file; on failure surface
 # the log on stderr and die. kubeadm's preflight/cert chatter is one-shot
@@ -141,7 +148,7 @@ preflight_host() {
 	# disk. Skip entirely with NO_HOST_MODULES=1 if the host manages its own
 	# modules (e.g. they were already loaded at boot).
 	local module sysctl_key
-	[[ ${NO_HOST_MODULES:-0} -eq 1 ]] && return 0
+	[[ ${NO_HOST_MODULES} -eq 1 ]] && return 0
 	for module in br_netfilter vxlan; do
 		if [[ -d "/sys/module/${module}" ]]; then
 			HOST_MODULES_PREEXISTING="${HOST_MODULES_PREEXISTING} ${module}"
@@ -488,9 +495,10 @@ publish_cluster_credentials() {
 
 # First control-plane node: kubeadm init against the API endpoint, then
 # publish the credentials the manager hands to every joining node. The
-# endpoint every kubeconfig points at: the load balancer's IP for
-# multi-master clusters, the first master's own address otherwise; zek.sh
-# passes it as API_ENDPOINT, the :- default covers runs without it.
+# endpoint every kubeconfig points at: the load balancer's IP for an
+# LB-backed cluster (multiple masters, or --lb), the first master's own
+# address otherwise; zek.sh passes it as API_ENDPOINT, the :- default
+# covers runs without it.
 init_control_plane() {
 	local advertise_ip k8s_version
 	advertise_ip="$(node_ip)"
@@ -655,7 +663,7 @@ run_master() {
 		# never completes (it would rotate credentials others already use),
 		# and without manifests or kubeconfigs there is nothing servable to
 		# complete - those reset exactly as before.
-		if [[ ${MASTER_JOIN:-0} -eq 1 || ! -f /etc/kubernetes/admin.conf ]] \
+		if [[ ${MASTER_JOIN} -eq 1 || ! -f /etc/kubernetes/admin.conf ]] \
 			|| [[ -z "$(ls -A /etc/kubernetes/manifests 2> /dev/null || true)" ]]; then
 			log "interrupted control-plane init/join detected; resetting partial state"
 			kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
@@ -675,7 +683,7 @@ run_master() {
 		# master is excluded - republishing would rotate the bootstrap
 		# token and certificate key the stored credentials still point
 		# at (kubeadm's upload-certs secret), breaking the next join.
-		if [[ ${MASTER_JOIN:-0} -ne 1 && ! -s "${CLUSTER_DIR}/admin.conf" ]]; then
+		if [[ ${MASTER_JOIN} -ne 1 && ! -s "${CLUSTER_DIR}/admin.conf" ]]; then
 			# shellcheck disable=SC2310
 			if ! complete_interrupted_init; then
 				log "completion failed; resetting and re-initializing"
@@ -683,7 +691,7 @@ run_master() {
 				init_control_plane
 			fi
 		fi
-	elif [[ ${MASTER_JOIN:-0} -eq 1 ]]; then
+	elif [[ ${MASTER_JOIN} -eq 1 ]]; then
 		join_control_plane
 	else
 		init_control_plane
@@ -721,10 +729,11 @@ run_worker() {
 	wait "${SUPERVISOR_PID}"
 }
 
-# TCP load balancer in front of the control-plane nodes (multi-master
-# clusters only). The manager passes the node addresses as LB_BACKENDS
-# (space-separated IPs); haproxy health-checks them so a dead master is
-# taken out of rotation. The stats page on :8404 shows backend state.
+# TCP load balancer in front of the control-plane nodes (LB-backed
+# clusters: multiple masters, or --lb). The manager passes the node
+# addresses as LB_BACKENDS (space-separated IPs); haproxy health-checks them
+# so a dead master is taken out of rotation. The stats page on :8404 shows
+# backend state.
 run_lb() {
 	[[ -n ${LB_BACKENDS:-} ]] || die "LB_BACKENDS must list the control-plane IPs (check --lb-backends)"
 	local haproxy_cfg=/etc/haproxy/haproxy.cfg backend_index=1 backend_ip
@@ -931,6 +940,16 @@ case "${1:-}" in
 		;;
 esac
 parse_role_flags "$@"
+# Booleans are validated on the effective (post-flag) value, so a flag can
+# override a bad env value (flag > env).
+case "${MASTER_JOIN}" in
+	0 | 1) ;;
+	*) die "invalid MASTER_JOIN '${MASTER_JOIN}' (expected 0 or 1; same as --master-join)" ;;
+esac
+case "${NO_HOST_MODULES}" in
+	0 | 1) ;;
+	*) die "invalid NO_HOST_MODULES '${NO_HOST_MODULES}' (expected 0 or 1; same as --no-host-modules)" ;;
+esac
 # `--` bypasses the unknown-argument die above by design (kubectl needs the
 # delimiter itself for `exec POD -- CMD`), so a node role that received one
 # must still die here instead of silently ignoring the trailing args.
