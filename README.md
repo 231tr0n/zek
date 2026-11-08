@@ -47,7 +47,7 @@ docker build --build-arg ALPINE_VERSION=<alpine-version> \
 
 `./zek.sh --version` prints the script release version. A released `zek.sh`
 pins its default node image to a specific Alpine/Kubernetes pair
-(`ghcr.io/231tr0n/zek:3.24.3-v1.37.1-latest`), so upgrading the script does not
+(`ghcr.io/231tr0n/zek:3.24.4-v1.37.2-latest`), so upgrading the script does not
 silently change the cluster's image versions. Override it with
 `--image`/`ZEK_IMAGE`, or follow the `latest` tag of the selected image
 repository with `--latest`/`ZEK_LATEST=1`:

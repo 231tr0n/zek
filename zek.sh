@@ -116,11 +116,11 @@ require_ipv4() { # <value> cidr|addr <label>
 
 # Script release version, independent of the pinned image version. Bump this
 # when cutting a zek.sh release; --version prints it.
-ZEK_VERSION="0.1.0"
+ZEK_VERSION="0.2.0"
 # Image a released zek.sh uses by default. The version pair is pinned so the
 # script does not silently move to different Alpine/Kubernetes versions.
 # ZEK_IMAGE/--image override it, e.g. ZEK_IMAGE=zek:latest for a local build.
-DEFAULT_IMAGE="ghcr.io/231tr0n/zek:3.24.3-v1.37.1-latest"
+DEFAULT_IMAGE="ghcr.io/231tr0n/zek:3.24.4-v1.37.2-latest"
 
 # latest_image <image> - replace the tag (or digest) with :latest, keeping
 # the repository and any registry port. --latest uses this on the effective
