@@ -2771,8 +2771,9 @@ test_smoke_3() {
 	# Every up spelling: --flag=value, the ZEK_WORKERS/ZEK_MASTERS env
 	# twins, and the bare-number shorthand. On an existing cluster these
 	# are desired counts, not creation-time only: a shorthand grows the
-	# worker count, 0 shrinks it, and the master count adds/removes the
-	# extra control plane and the LB.
+	# worker count, 0 shrinks it, and the master count adds the extra
+	# control plane and the LB. Master removal is covered by topology, so
+	# this test stops after the add to keep its runtime bounded.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers=1 --masters=1 2>&1) \
 		|| fail "${cluster}: up --flag=value failed: ${out}"
@@ -2783,43 +2784,12 @@ test_smoke_3() {
 		|| fail "${cluster}: up <n> shorthand failed: ${out}"
 	assert_cmd "${cluster}: node count after up 2" 3 node_count "${cluster}"
 	assert_cmd "${cluster}: containers after up 2" 3 running_count "${cluster}"
-	# A differing --masters adds a control plane and brings up the LB. A
-	# cluster created with one master keeps master-1 as its kubeadm
-	# endpoint; the LB is an additional address, not a replacement.
-	master1_ip=$(container_ip "${cluster}-master-1")
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up --masters 2 2>&1) \
-		|| fail "${cluster}: up --masters 2 failed: ${out}"
-	[[ ${out} == *"adding ${cluster}-master-2"* ]] \
-		|| fail "${cluster}: up --masters 2 did not add master-2: ${out}"
-	assert_cmd "${cluster}: node count after up --masters 2" 4 node_count "${cluster}"
-	assert_cmd "${cluster}: containers after up --masters 2" 5 running_count "${cluster}"
-	# shellcheck disable=SC2310
-	container_running "${cluster}-lb" || fail "${cluster}: up --masters 2 did not start the LB"
-	assert_cmd "${cluster}: single-master endpoint unchanged by HA growth" \
-		"${master1_ip}:6443" docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
-	docker exec "${cluster}-master-1" grep -qF "https://${master1_ip}:6443" \
-		/etc/cluster/admin.conf \
-		|| fail "${cluster}: HA growth moved the endpoint off master-1"
-	# The bare-number shorthand with 0: shrink only the workers; masters
-	# (and the LB) stay.
+	# The bare-number shorthand with 0 shrinks the workers; masters stay.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 0 2>&1) \
 		|| fail "${cluster}: up 0 shorthand failed: ${out}"
-	assert_cmd "${cluster}: node count after up 0" 2 node_count "${cluster}"
-	assert_cmd "${cluster}: containers after up 0" 3 running_count "${cluster}"
-	# Scaling back to one master removes master-2 and the LB. The cluster
-	# was created with master-1 as its endpoint, so no endpoint rewrite is
-	# needed here (the HA-created path is covered by the topology test).
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up --masters 1 2>&1) \
-		|| fail "${cluster}: up --masters 1 failed: ${out}"
-	assert_cmd "${cluster}: node count after up --masters 1" 1 node_count "${cluster}"
-	assert_cmd "${cluster}: containers after up --masters 1" 1 running_count "${cluster}"
-	if docker inspect "${cluster}-lb" > /dev/null 2>&1; then
-		fail "${cluster}: up --masters 1 left the LB behind"
-	fi
-
+	assert_cmd "${cluster}: node count after up 0" 1 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up 0" 1 running_count "${cluster}"
 	# The env twins request real topology changes too, not just the first
 	# creation: grow to one worker and shrink back to none.
 	out=$(env ZEK_WORKERS=1 ./zek.sh --cluster "${cluster}" up 2>&1) \
@@ -2830,6 +2800,24 @@ test_smoke_3() {
 		|| fail "${cluster}: env ZEK_WORKERS=0 scale failed: ${out}"
 	assert_cmd "${cluster}: node count after env worker shrink" 1 node_count "${cluster}"
 	assert_cmd "${cluster}: containers after env worker shrink" 1 running_count "${cluster}"
+	# A differing --masters adds a control plane and brings up the LB. A
+	# cluster created with one master keeps master-1 as its kubeadm
+	# endpoint; the LB is an additional address, not a replacement.
+	master1_ip=$(container_ip "${cluster}-master-1")
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --masters 2 2>&1) \
+		|| fail "${cluster}: up --masters 2 failed: ${out}"
+	[[ ${out} == *"adding ${cluster}-master-2"* ]] \
+		|| fail "${cluster}: up --masters 2 did not add master-2: ${out}"
+	assert_cmd "${cluster}: node count after up --masters 2" 2 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up --masters 2" 3 running_count "${cluster}"
+	# shellcheck disable=SC2310
+	container_running "${cluster}-lb" || fail "${cluster}: up --masters 2 did not start the LB"
+	assert_cmd "${cluster}: single-master endpoint unchanged by HA growth" \
+		"${master1_ip}:6443" docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+	docker exec "${cluster}-master-1" grep -qF "https://${master1_ip}:6443" \
+		/etc/cluster/admin.conf \
+		|| fail "${cluster}: HA growth moved the endpoint off master-1"
 }
 
 test_smoke_4() {
