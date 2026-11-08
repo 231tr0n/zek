@@ -34,7 +34,8 @@
 #                              admin.conf)
 #   --no-host-modules         (NO_HOST_MODULES=1: skip host module setup)
 #   WAIT_TIMEOUT (env only, no flag: zek.sh passes --timeout through) bounds
-#   the kubectl role's wait for the published config; default 600s.
+#   the kubectl role's wait for the published config and interrupted-init
+#   recovery; default 600s.
 #
 # Persistence and host isolation:
 #   - Everything lives on the container's own writable layer: node state
@@ -48,9 +49,10 @@
 #     vars; there is no shared volume between nodes.
 #   - Host effects are limited to in-memory kernel setup (loading modules the
 #     host lacks, enabling a few sysctls, and raising the host-wide inotify
-#     quota); sysctls and any modules we loaded are undone on shutdown, the
-#     inotify quota stays raised on purpose (other zek containers need it),
-#     and nothing touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
+#     quota); sysctls are restored best-effort and loaded modules unloaded on
+#     shutdown (nodes share the host netns, so another container may still
+#     need them), and the inotify quota stays raised on purpose. Nothing
+#     touches disk. Set NO_HOST_MODULES=1 to skip all host setup.
 set -euo pipefail
 
 # Reassigned by the flags after parsing, so not readonly (the full flag/env
@@ -68,11 +70,12 @@ CONTAINERD_PID=""
 SUPERVISOR_PID=""
 declare -A SYSCTL_BEFORE=()
 # Modules the host already had before preflight_host ran (space separated):
-# cleanup only unloads the ones NOT in this list. Set at the end of
-# preflight_host, so cleanup can tell "we never set the host up" (an early
-# die) from "we loaded something" - an empty list must never trigger rmmod.
-HOST_SETUP_DONE=0
+# cleanup only unloads the ones NOT in this list. HOST_SETUP_DONE is set at
+# the end of preflight_host so cleanup can tell "we never set the host up"
+# (an early die) from "we loaded something" - an empty list must never
+# trigger rmmod.
 HOST_MODULES_PREEXISTING=""
+HOST_SETUP_DONE=0
 
 log() { echo "[zek] $*" >&2; }
 warn() { echo "[zek] WARNING: $*" >&2; }
@@ -80,6 +83,8 @@ die() {
 	log "ERROR: $*"
 	exit 1
 }
+[[ -z ${WAIT_TIMEOUT:-} || ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] \
+	|| die "invalid WAIT_TIMEOUT '${WAIT_TIMEOUT}' (expected seconds >= 1)"
 
 # Run a command with its output captured to a log file; on failure surface
 # the log on stderr and die. kubeadm's preflight/cert chatter is one-shot
@@ -135,6 +140,7 @@ preflight_host() {
 	# In-memory kernel setup only: it does not survive a reboot and touches no
 	# disk. Skip entirely with NO_HOST_MODULES=1 if the host manages its own
 	# modules (e.g. they were already loaded at boot).
+	local module sysctl_key
 	[[ ${NO_HOST_MODULES:-0} -eq 1 ]] && return 0
 	for module in br_netfilter vxlan; do
 		if [[ -d "/sys/module/${module}" ]]; then
@@ -240,43 +246,6 @@ cleanup_stale_cri() {
 	crictl rm -f -a > /dev/null 2>&1 || true
 }
 
-import_k8s_images() {
-	# The image build preloaded the kubeadm images (apiserver, etcd, scheduler,
-	# controller-manager, coredns, kube-proxy, pause) as tarballs under
-	# /opt/zek/images. Import them into the CRI image store (content only,
-	# --no-unpack: no mounts needed, unpacking happens lazily when the kubelet
-	# first pulls them). Only runs on a fresh node, once.
-	if ! command -v ctr > /dev/null 2>&1; then
-		warn "ctr not installed; skipping kubeadm image preload"
-		return 0
-	fi
-	# Fast path: the store survives restarts and re-inits run this again,
-	# so without this check every one of them would re-import all seven
-	# tarballs (~500MB of reads) for nothing - under parallel-cluster load
-	# that I/O alone can eat minutes out of the bring-up budget. A partial
-	# store (killed mid-import) falls through and repairs itself with a
-	# full re-import below.
-	local store_images want_image missing=0
-	store_images="$(ctr --namespace k8s.io images ls -q 2> /dev/null)" || store_images=""
-	for want_image in kube-apiserver kube-controller-manager kube-scheduler kube-proxy etcd coredns pause; do
-		[[ ${store_images} == *"${want_image}"* ]] || missing=1
-	done
-	if [[ ${missing} -eq 0 ]]; then
-		log "kubeadm images already in the containerd store; skipping import"
-		return 0
-	fi
-	log "importing preloaded kubeadm images"
-	local tarball
-	for tarball in /opt/zek/images/*.tar; do
-		[[ -e ${tarball} ]] || continue
-		# Stdout is ctr's progress bar (drawn with ANSI escapes and
-		# carriage returns, which a log cannot render): drop it, keep
-		# stderr so a failed import is visible with its reason.
-		ctr --namespace k8s.io images import --no-unpack "${tarball}" > /dev/null \
-			|| warn "failed to import ${tarball}"
-	done
-}
-
 # First global IPv4: the node's own address on the cluster network. awk
 # reads the whole input (no early exit) so `ip` never dies of SIGPIPE -
 # under pipefail that would kill the caller with no message.
@@ -347,7 +316,8 @@ ensure_kubelet_config() {
 
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config
 # and flags file, and without systemd we feed the kubeconfig args ourselves.
-# config.yaml appearing marks kubeadm init/join as done; init does not put
+# The kubelet config appears mid-init (kubelet-start phase), not when init
+# completes; kubelet.conf marks a finished init/join. Init does not put
 # kubelet.conf on kubelet's default path, so it must always be passed on.
 kubelet_supervisor() {
 	trap 'exit 0' TERM INT
@@ -357,7 +327,9 @@ kubelet_supervisor() {
 			local -a kubelet_args=()
 			if [[ -f ${KUBEADM_FLAGS} ]]; then
 				# kubeadm generates this file at runtime, so shellcheck
-				# cannot read it here.
+				# cannot read it here. Declare the sourced variable local
+				# so every kubelet restart starts from a clean value.
+				local KUBELET_KUBEADM_ARGS=""
 				# shellcheck source=/dev/null
 				source "${KUBEADM_FLAGS}"
 				# Drop any deprecated CLI copy kubeadm may still ship
@@ -484,12 +456,16 @@ publish_cluster_credentials() {
 	# 32-byte AES key, so 64 hex characters.
 	join_cert_key="$(openssl rand -hex 32)"
 	for _ in $(seq 1 60); do
-		# No tr needed: command substitution already strips the
-		# trailing newline kubeadm prints.
-		join_token="$(kubeadm token create --ttl 0 2> /dev/null)" || join_token=""
+		# Upload first: creating a token before the API works would leak
+		# a never-expiring token on every failed retry. No tr needed -
+		# command substitution already strips kubeadm's trailing newline.
 		upload_ok=""
 		kubeadm init phase upload-certs --upload-certs \
 			--certificate-key "${join_cert_key}" > /dev/null 2>&1 && upload_ok=1
+		join_token=""
+		if [[ -n ${upload_ok} ]]; then
+			join_token="$(kubeadm token create --ttl 0 2> /dev/null)" || join_token=""
+		fi
 		[[ -n ${join_token} ]] && [[ -n ${upload_ok} ]] && break
 		sleep 2
 	done
@@ -499,7 +475,11 @@ publish_cluster_credentials() {
 	printf '%s' "${join_cert_key}" > "${CLUSTER_DIR}/cert-key"
 	echo "${API_ENDPOINT}" > "${CLUSTER_DIR}/api-endpoint"
 	printf '%s' "${join_ca_hash}" > "${CLUSTER_DIR}/ca-hash"
-	cp /etc/kubernetes/admin.conf "${CLUSTER_DIR}/admin.conf"
+	# Publish the config atomically: admin.conf is the completeness marker,
+	# and a crash mid-copy must not leave a truncated file that later looks
+	# like a valid credential set.
+	cp /etc/kubernetes/admin.conf "${CLUSTER_DIR}/admin.conf.tmp"
+	mv -f "${CLUSTER_DIR}/admin.conf.tmp" "${CLUSTER_DIR}/admin.conf"
 	log "published join credentials to ${CLUSTER_DIR} (endpoint: ${API_ENDPOINT})"
 }
 
@@ -514,7 +494,11 @@ init_control_plane() {
 	API_ENDPOINT="${API_ENDPOINT:-${advertise_ip}:6443}"
 	log "initializing control plane on ${NODE_NAME} (${advertise_ip})"
 	mkdir -p "${CLUSTER_DIR}"
-	import_k8s_images
+	# A reset wipes /etc/kubernetes but not the published copy: clear it so
+	# a re-init that dies before publishing cannot later look complete.
+	rm -f "${CLUSTER_DIR}/init-complete" "${CLUSTER_DIR}/admin.conf" \
+		"${CLUSTER_DIR}/token" "${CLUSTER_DIR}/ca-hash" \
+		"${CLUSTER_DIR}/cert-key" "${CLUSTER_DIR}/api-endpoint"
 	# Pin the version the binaries report: kubeadm's compiled default can
 	# skew ahead of them (v1.37.0 binaries defaulting to v1.37.1 images),
 	# which would dodge the preloaded store and force a live registry pull
@@ -560,7 +544,6 @@ join_control_plane() {
 		|| die "control-plane join needs JOIN_TOKEN, JOIN_CA_HASH, JOIN_API_ENDPOINT and JOIN_CERT_KEY (check --join-token/--join-ca-hash/--join-api-endpoint/--join-cert-key)"
 	local join_token="${JOIN_TOKEN}" join_ca_hash="${JOIN_CA_HASH}" join_api_endpoint="${JOIN_API_ENDPOINT}"
 	log "joining ${NODE_NAME} as a control-plane node via ${join_api_endpoint}"
-	import_k8s_images
 	run_logged /var/log/kubeadm-join.log "control-plane join failed" \
 		kubeadm join "${join_api_endpoint}" \
 		--token "${join_token}" \
@@ -583,7 +566,7 @@ join_control_plane() {
 # completable (or the tail fails) so the caller falls back to reset and a
 # full re-init - which is always safe, just slower.
 complete_interrupted_init() {
-	[[ -f /etc/kubernetes/admin.conf ]] || return 1
+	[[ -s /etc/kubernetes/admin.conf ]] || return 1
 	[[ -n "$(ls -A /etc/kubernetes/manifests 2> /dev/null || true)" ]] || return 1
 	export KUBECONFIG=/etc/kubernetes/admin.conf
 	# Same default as init_control_plane (which never ran on this path):
@@ -659,7 +642,7 @@ run_master() {
 		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
 	elif [[ -f /etc/kubernetes/kubelet.conf ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/init-complete" ]] \
-		&& [[ ! -f "${CLUSTER_DIR}/admin.conf" ]] \
+		&& [[ ! -s "${CLUSTER_DIR}/admin.conf" ]] \
 		&& [[ ! -f "${CLUSTER_DIR}/token" ]]; then
 		# An init that reached the static-pod manifests may have a serving
 		# control plane behind it (it died late, e.g. in mark-control-plane
@@ -688,7 +671,7 @@ run_master() {
 		# master is excluded - republishing would rotate the bootstrap
 		# token and certificate key the stored credentials still point
 		# at (kubeadm's upload-certs secret), breaking the next join.
-		if [[ ${MASTER_JOIN:-0} -ne 1 && ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+		if [[ ${MASTER_JOIN:-0} -ne 1 && ! -s "${CLUSTER_DIR}/admin.conf" ]]; then
 			# shellcheck disable=SC2310
 			if ! complete_interrupted_init; then
 				log "completion failed; resetting and re-initializing"
@@ -722,7 +705,6 @@ run_worker() {
 			|| die "worker join needs JOIN_TOKEN, JOIN_CA_HASH and JOIN_API_ENDPOINT (check --join-token/--join-ca-hash/--join-api-endpoint)"
 		local join_token="${JOIN_TOKEN}" join_ca_hash="${JOIN_CA_HASH}" join_api_endpoint="${JOIN_API_ENDPOINT}"
 		log "joining ${NODE_NAME} to ${join_api_endpoint}"
-		import_k8s_images
 		run_logged /var/log/kubeadm-join.log "kubeadm join failed" \
 			kubeadm join "${join_api_endpoint}" \
 			--token "${join_token}" \
@@ -793,18 +775,18 @@ run_kubectl() {
 	# - so only log when there is something to wait for: the common case is
 	# "config already there".
 	if [[ -z ${KUBECONFIG:-} ]]; then
-		if [[ ! -f "${CLUSTER_DIR}/admin.conf" ]]; then
+		if [[ ! -s "${CLUSTER_DIR}/admin.conf" ]]; then
 			log "waiting for the published cluster config (${CLUSTER_DIR}/admin.conf)"
 			# Bounded by WAIT_TIMEOUT (zek.sh passes --timeout through,
 			# default 600s) so a dead master fails this call instead of
 			# hanging every `zek kubectl` poll for ten minutes.
 			local deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
 			while [[ ${SECONDS} -lt ${deadline} ]]; do
-				[[ -f "${CLUSTER_DIR}/admin.conf" ]] && break
+				[[ -s "${CLUSTER_DIR}/admin.conf" ]] && break
 				sleep 2
 			done
 		fi
-		[[ -f "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found in ${CLUSTER_DIR}; is the master running?"
+		[[ -s "${CLUSTER_DIR}/admin.conf" ]] || die "no admin.conf found in ${CLUSTER_DIR}; is the master running?"
 		KUBECONFIG="${CLUSTER_DIR}/admin.conf"
 	fi
 	export KUBECONFIG

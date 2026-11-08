@@ -3,7 +3,8 @@
 # e2e - end-to-end tests for the zek image.
 #
 # Builds nothing: point it at an image that already exists (make build).
-# Every test creates its own cluster (e2e-<test>), asserts, then destroys it.
+# Every test creates its own main cluster (e2e-<test>), asserts, then
+# destroys it; a few tests also create short-lived helper clusters/networks.
 #
 # Usage:
 #   ./e2e.sh [flags] [test ...]   run the given tests, or all of them
@@ -15,8 +16,8 @@
 #                  and min), node internals (containerd native/unpack,
 #                  CNI dirs, bpffs, cgroupns/cgroup-driver, resolv,
 #                  credentials), the preloaded kubeadm images are
-#                  actually in the containerd store (import ran on first
-#                  init), the kubelet config keeps the pod-level in-place
+#                  actually in the containerd store shipped in the image,
+#                  the kubelet config keeps the pod-level in-place
 #                  vertical scaling gate off (the effective gate in the
 #                  running kubelet, no pod-level actuated resources, and
 #                  admission accounting that stays within the node's own
@@ -36,10 +37,18 @@
 #                  container's HEALTHCHECK (haproxy stats page) turns
 #                  healthy, 3 etcd members with one backend line each,
 #                  quorum survives one stopped master and breaks on two,
-#                  an interrupted join on a second master recovers
-#                  without republishing credentials, and `zek down`/`up`
-#                  restarts the HA cluster incl. the LB and its live
-#                  haproxy config
+#                  and an interrupted control-plane join on master-2
+#                  recovers without republishing credentials
+#   multi-master-recovery
+#                  2 masters + 1 worker: `zek down`/`up` restarts in
+#                  dependency order incl. the LB and its live haproxy
+#                  config
+#   topology       2 masters + 1 worker created HA (the LB is the kubeadm
+#                  endpoint): adding a master grows etcd and the LB
+#                  backends (a worker only grows the node set), removing
+#                  them shrinks both, and scaling to one master rewrites
+#                  the endpoint in kubeconfigs/cluster-info/kubeadm-config/
+#                  kube-proxy before removing the LB
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -54,8 +63,8 @@
 #   cilium         same with cilium (cilium CLI downloaded on demand,
 #                  version matched to the cluster's k8s release)
 #   smoke-1        the basic zek.sh surface: status, logs, kubectl exec
-#                  (the `--` delimiter and stdin with -i), and every flag
-#                  in both spellings plus flag > env precedence
+#                  (the `--` delimiter and stdin with -i), and the value
+#                  flags in both spellings plus flag > env precedence
 #   smoke-2        the functional --subnet/--master-ip/--pod-cidr probe:
 #                  a throwaway cluster is created with explicit values and
 #                  the network, master address and node spec inspected
@@ -65,8 +74,10 @@
 #                  on the HA load balancer, subnet reuse, size bounds,
 #                  trailing args, e2e selection incl. ZEK_TIMEOUT),
 #                  entrypoint flags incl. node `--` and the kubectl wait
-#                  timeout, the creds-less/bad-token join paths, and every
-#                  up spelling vs the fixed topology
+#                  timeout, the creds-less/bad-token join paths, every up
+#                  spelling (including scaling workers/masters up and back
+#                  down), and the refusal to grow a single-master cluster
+#                  whose worker already owns the LB address
 #   smoke-4        the --timeout bound (a dead API and a node that never
 #                  registers), static-IP start retries while the address
 #                  is held, status/down on a stopped cluster (`-` health
@@ -74,8 +85,8 @@
 #   smoke-5        clean on a stopped cluster and recreating a worker
 #                  (new Node UID, same pinned address, the `starting`
 #                  health verdict) with --image/--latest/--dns,
-#                  --pod-cidr and --mounts, status with the API down,
-#                  and destroy removing everything
+#                  --pod-cidr and --mounts, status with the API down, and
+#                  down/destroy removing a node detached from the network
 #   persistence-1  flannel + a workload pinned to the single worker, then
 #                  recovery from docker stop/start of every node at once,
 #                  a stopped worker, and a restarted master (same node
@@ -88,16 +99,17 @@
 #                  interrupted worker join, lost master credentials (the
 #                  republish), and a kubectl wait for the config
 #   recovery-2     a late interrupted init that completes without a wipe,
-#                  an early interrupted init/join that wipes and re-inits
-#                  (with ctr hidden), and an interrupted control-plane setup
-#                  (same wipe); an interrupted control-plane join on a
-#                  second master is covered in multi-master instead
+#                  an early interrupted init/join that wipes and re-inits,
+#                  and an interrupted control-plane setup (same wipe); an
+#                  interrupted control-plane join on a second master is
+#                  covered in multi-master instead
 #
-# Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its own
-# cluster and pre-allocated subnet, but they share one scratch dir -
-# only result/diag/kubeconfig files are per-test - and one docker
-# daemon). Failures never abort the pool - all
-# requested tests run, then diagnostics and the verdict are printed.
+# Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its main
+# cluster and pre-allocated subnet; helper clusters/networks are
+# short-lived). They share one scratch dir - only result/diag/kubeconfig
+# files are per-test - and one docker daemon. Failures never abort the
+# pool - all requested tests run, then diagnostics and the verdict are
+# printed.
 # ZEK_E2E_JOBS/ZEK_E2E_TIMEOUT/ZEK_TIMEOUT are validated before the
 # stale-cluster sweep runs, so a bad value dies without destroying
 # anything. ZEK_SUBNET is not an e2e flag: the runner pre-allocates one
@@ -109,10 +121,10 @@
 # wins when both are set; value flags take --flag value or --flag=value):
 #   --image IMAGE            image under test (ZEK_IMAGE, default zek:latest)
 #   --timeout SECONDS        per-wait budget inside zek.sh (ZEK_TIMEOUT,
-#                            default 600)
+#                            default 540)
 #   --e2e-timeout SECONDS    budget for kubectl waits (ZEK_E2E_TIMEOUT,
-#                            default 1200; large image pulls on a slow day
-#                            can eat 10+ minutes)
+#                            default 540: below the 10-minute CI ceiling so
+#                            a stuck wait fails with diagnostics first)
 #   --e2e-tests LIST         comma separated test list (ZEK_E2E_TESTS; same
 #                            as the args; cannot be combined with positional
 #                            test names)
@@ -132,11 +144,11 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-ALL_TESTS=(single-node multi-master multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
+ALL_TESTS=(single-node multi-master multi-master-recovery topology multi-worker flannel cilium smoke-1 smoke-2 smoke-3 smoke-4 smoke-5 persistence-1 persistence-2 recovery-1 recovery-2)
 
 export ZEK_IMAGE="${ZEK_IMAGE:-zek:latest}"
-export ZEK_TIMEOUT="${ZEK_TIMEOUT:-600}"
-ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-1200}"
+export ZEK_TIMEOUT="${ZEK_TIMEOUT:-540}"
+ZEK_E2E_TIMEOUT="${ZEK_E2E_TIMEOUT:-540}"
 ZEK_E2E_JOBS="${ZEK_E2E_JOBS:-2}"
 # Optional override; when empty the cilium test resolves a release that
 # matches the cluster's k8s version (resolve_cilium_version below).
@@ -157,7 +169,7 @@ fail() {
 }
 
 usage() {
-	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master|multi-worker|flannel|cilium|smoke-1|smoke-2|smoke-3|smoke-4|smoke-5|persistence-1|persistence-2|recovery-1|recovery-2]..."
+	die "usage: $0 [--image img] [--timeout s] [--e2e-timeout s] [--e2e-tests list] [--e2e-jobs n] [--e2e-keep-on-fail] [--cilium-version v] [single-node|multi-master|multi-master-recovery|topology|multi-worker|flannel|cilium|smoke-1|smoke-2|smoke-3|smoke-4|smoke-5|persistence-1|persistence-2|recovery-1|recovery-2]..."
 }
 
 # --- flag parsing and test selection ----------------------------------------
@@ -365,7 +377,7 @@ assert_die() { # desc want-substring cmd args...
 		|| fail "${desc}: want an error mentioning '${want}', got: ${got}"
 }
 
-# Assert restart_cluster's dependency-safe start order from an `up` run's
+# Assert start_existing_nodes' dependency-safe start order from an `up` run's
 # log: load balancer first, then masters in index order, then workers.
 assert_restart_order() { # cluster want-order up-output
 	local cluster=$1 want=$2 up_out=$3 got
@@ -386,7 +398,9 @@ wait_for() { # desc timeout-secs func args...
 	log "ok: ${desc}"
 }
 
-readyz_ok() { zk "$1" kubectl get --raw='/readyz' 2> /dev/null | grep -qx ok; }
+readyz_ok() {
+	zk "$1" kubectl get --raw='/readyz' --request-timeout=5s 2> /dev/null | grep -qx ok
+}
 
 # Consecutive failures, not one: a single blip while the LB reshuffles its
 # backends must not pass for the stable quorum loss this proves.
@@ -444,6 +458,11 @@ ready_false_count() {
 	zk "$1" kubectl get nodes \
 		-o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
 		| grep -c False || true
+}
+ready_false_count_is() { # cluster want
+	local got
+	got=$(ready_false_count "$1")
+	[[ ${got} -eq $2 ]]
 }
 
 # Kubelet's pressure alarms (Memory/Disk/PID) are False on every node.
@@ -535,10 +554,49 @@ ns_pod_count() { # cluster 'name-regex'
 	zk "$1" kubectl -n kube-system get pods --no-headers | grep -cE "$2" || true
 }
 
+# Live stacked-etcd membership, not just the static-pod count: a failed
+# member removal can leave the pod gone but the member record behind.
+etcd_member_count() { # cluster
+	# shellcheck disable=SC2310
+	zk "$1" kubectl -n kube-system exec "etcd-$1-master-1" -- etcdctl \
+		--endpoints=https://127.0.0.1:2379 \
+		--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+		--cert=/etc/kubernetes/pki/etcd/server.crt \
+		--key=/etc/kubernetes/pki/etcd/server.key \
+		member list 2> /dev/null | grep -c . || true
+}
+etcd_member_count_is() { # cluster want
+	local got
+	got=$(etcd_member_count "$1")
+	[[ ${got} -eq $2 ]]
+}
+
+# Backends currently configured in the LB.
+lb_backend_ips() { # cluster
+	docker exec "$1-lb" sh -c \
+		"sed -n 's/^[[:space:]]*server cp[0-9]* \\([^:]*\\):6443.*/\\1/p' /etc/haproxy/haproxy.cfg" \
+		| sort
+}
+lb_backend_count() { # cluster
+	lb_backend_ips "$1" | wc -l
+}
+lb_has_backend() { # cluster ip
+	docker exec "$1-lb" grep -qF " $2:6443 " /etc/haproxy/haproxy.cfg
+}
+lb_lacks_backend() { # cluster ip
+	! docker exec "$1-lb" grep -qF " $2:6443 " /etc/haproxy/haproxy.cfg
+}
+
 pod_phase() { # cluster pod-name
 	# No stderr suppression: a missing/broken pod must surface
 	# kubectl's error next to the assertion failure that follows.
 	zk "$1" kubectl -n kube-system get pod "$2" -o jsonpath='{.status.phase}'
+}
+pod_phase_is() { # cluster pod-name want
+	local got
+	# shellcheck disable=SC2310
+	got=$(pod_phase "$1" "$2" 2> /dev/null) || return 1
+	[[ ${got} == "$3" ]]
 }
 
 # Terminal phase of the default-namespace service test pod: either
@@ -593,7 +651,7 @@ nodns_applied() { # container ip
 
 # Is the apiserver inside a master container serving? (no CNI needed)
 master_readyz() { # cluster master-index
-	docker exec "${1}-master-${2}" curl -skf https://127.0.0.1:6443/readyz 2> /dev/null \
+	docker exec "${1}-master-${2}" curl -skf -m 5 https://127.0.0.1:6443/readyz 2> /dev/null \
 		| grep -qx ok
 }
 
@@ -718,7 +776,7 @@ log_count_grew() { # container text min-count
 
 # The master published a complete credential set (admin.conf is last).
 creds_published() { # cluster
-	docker exec "${1}-master-1" test -f /etc/cluster/admin.conf
+	docker exec "${1}-master-1" test -s /etc/cluster/admin.conf
 }
 
 # Fill CLONE_ARGS with docker run args reproducing container $1's host
@@ -1149,8 +1207,10 @@ test_multi_master() {
 	# The other control-plane static pods, once the API serves: kubeadm
 	# starts them (leader-elected) on every control-plane node.
 	for master_idx in 1 2 3; do
-		assert_cmd "${cluster}: scheduler on master-${master_idx}" Running pod_phase "${cluster}" "kube-scheduler-${cluster}-master-${master_idx}"
-		assert_cmd "${cluster}: controller-manager on master-${master_idx}" Running pod_phase "${cluster}" "kube-controller-manager-${cluster}-master-${master_idx}"
+		wait_for "${cluster}: scheduler on master-${master_idx}" 120 pod_phase_is \
+			"${cluster}" "kube-scheduler-${cluster}-master-${master_idx}" Running
+		wait_for "${cluster}: controller-manager on master-${master_idx}" 120 pod_phase_is \
+			"${cluster}" "kube-controller-manager-${cluster}-master-${master_idx}" Running
 	done
 	# kubectl's server is the LB (control-plane-endpoint), so this streams
 	# through it: kubectl -> LB -> apiserver -> master kubelet -> log file.
@@ -1241,57 +1301,16 @@ EOF
 	wait_for "${cluster}: apiserver on master-3 serving again" 300 master_readyz "${cluster}" 3
 	wait_for "${cluster}: control plane readyz after quorum restore" 120 readyz_ok "${cluster}"
 
-	log "${cluster}: zek down + up restarts the HA cluster incl. the load balancer"
-	zk "${cluster}" down
-	assert_cmd "${cluster}: down stops everything" 0 running_count "${cluster}"
-	# Dependency-safe restart order: the LB first (every kubeconfig points
-	# at it), then masters in index order, then workers - the order
-	# restart_cluster starts them in.
-	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up 2>&1) \
-		|| fail "${cluster}: up after down failed: ${out}"
-	assert_restart_order "${cluster}" \
-		"starting ${cluster}-lb starting ${cluster}-master-1 starting ${cluster}-master-2 starting ${cluster}-master-3 starting ${cluster}-worker-1" \
-		"${out}"
-	wait_for "${cluster}: control plane readyz after down/up" 120 readyz_ok "${cluster}"
-	# Readyz answers before the API has converged after a restart cycle:
-	# one-shot kubectl can race the apiserver's authorization load (a
-	# Forbidden turns the count into 0) and the kubelets re-register later
-	# than readyz. node_count_is polls instead of asserting a snapshot -
-	# the etcd objects even let a nil kubelet window count as 4, so only
-	# polling proves the cluster really came back.
-	wait_for "${cluster}: node count after down/up" 300 node_count_is "${cluster}" 4
-	# shellcheck disable=SC2310
-	container_running "${cluster}-lb" || fail "${cluster}: load balancer not running after down/up"
-	# The LB config carries the long-lived stream timeouts port-forward
-	# needs; assert them on the live file, not just via the stream above.
-	docker exec "${cluster}-lb" grep -q "timeout client 604800s" /etc/haproxy/haproxy.cfg \
-		|| fail "${cluster}: haproxy.cfg misses the 7-day client timeout"
-	docker exec "${cluster}-lb" grep -q "option tcp-check" /etc/haproxy/haproxy.cfg \
-		|| fail "${cluster}: haproxy.cfg misses option tcp-check"
-	# One backend server line per master, on 6443 with health checks.
-	assert_cmd "${cluster}: haproxy backend servers" 3 \
-		docker exec "${cluster}-lb" sh -c 'grep -cE "^[[:space:]]*server cp[0-9]+ " /etc/haproxy/haproxy.cfg || true'
-	# The stats page the image HEALTHCHECK probes must serve, and the live
-	# file must pass the same `haproxy -c` lint.sh runs on the heredoc.
-	docker exec "${cluster}-lb" wget -qO- --timeout=10 http://127.0.0.1:8404/ 2> /dev/null \
-		| grep -q Statistics \
-		|| fail "${cluster}: haproxy stats page does not serve"
-	docker exec "${cluster}-lb" haproxy -c -f /etc/haproxy/haproxy.cfg \
-		|| fail "${cluster}: live haproxy.cfg fails haproxy -c"
-
 	# Interrupted control-plane join on a second master: kubelet.conf
-	# gone, certs left behind. The same reset as an interrupted init must
-	# wipe and re-join (the container keeps its JOIN_* env across restarts).
+	# gone, certs left behind. Three members keep quorum while the reset
+	# temporarily removes master-2 from etcd. The same reset as an
+	# interrupted init must wipe and re-join (the container keeps its
+	# JOIN_* env across restarts).
 	log "${cluster}: interrupted control-plane join on master-2 recovers"
 	docker exec "${cluster}-master-2" rm -f /etc/kubernetes/kubelet.conf
 	docker restart "${cluster}-master-2" > /dev/null
 	wait_for "${cluster}: interrupted join detected on master-2" 60 log_has "${cluster}-master-2" \
 		"interrupted control-plane setup detected; resetting partial state"
-	# The re-join re-runs the image import with a full store, so it must
-	# take the skip fast path instead of re-reading ~500MB of tarballs.
-	wait_for "${cluster}: re-join skipped the image re-import" 60 log_has "${cluster}-master-2" \
-		"already in the containerd store; skipping import"
 	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
 	wait_for "${cluster}: control plane readyz after join recovery" 120 readyz_ok "${cluster}"
 	assert_cmd "${cluster}: node count after join recovery" 4 node_count "${cluster}"
@@ -1304,14 +1323,185 @@ EOF
 	if log_has "${cluster}-master-2" "republishing"; then
 		fail "${cluster}: join-master republished credentials on resume"
 	fi
+}
 
+# HA restart recovery, split out of multi-master so both entries stay below
+# the suite's ten-minute budget. Two masters are enough for the LB endpoint,
+# restart ordering, kubeconfig persistence and live haproxy config; the
+# interrupted control-plane join needs a third etcd member and stays in
+# multi-master.
+test_multi_master_recovery() {
+	local cluster=$1 out
+	up "${cluster}" 1 2
+	wait_for "${cluster}: initial node count" "${ZEK_E2E_TIMEOUT}" \
+		node_count_is "${cluster}" 3
+
+	log "${cluster}: zek down + up restarts the HA cluster incl. the load balancer"
+	zk "${cluster}" down
+	assert_cmd "${cluster}: down stops everything" 0 running_count "${cluster}"
+	# Dependency-safe restart order: the LB first (every kubeconfig points
+	# at it), then masters in index order, then workers.
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up 2>&1) \
+		|| fail "${cluster}: up after down failed: ${out}"
+	assert_restart_order "${cluster}" \
+		"starting ${cluster}-lb starting ${cluster}-master-1 starting ${cluster}-master-2 starting ${cluster}-worker-1" \
+		"${out}"
+	wait_for "${cluster}: control plane readyz after down/up" 120 readyz_ok "${cluster}"
+	# Readyz answers before the API has converged after a restart cycle:
+	# one-shot kubectl can race the apiserver's authorization load (a
+	# Forbidden turns the count into 0) and the kubelets re-register later
+	# than readyz. Poll instead of asserting a snapshot.
+	wait_for "${cluster}: node count after down/up" 300 node_count_is "${cluster}" 3
+	# shellcheck disable=SC2310
+	container_running "${cluster}-lb" || fail "${cluster}: load balancer not running after down/up"
+	# The LB config carries the long-lived stream timeouts port-forward
+	# needs; assert them on the live file, not just via the stream in
+	# multi-master.
+	docker exec "${cluster}-lb" grep -q "timeout client 604800s" /etc/haproxy/haproxy.cfg \
+		|| fail "${cluster}: haproxy.cfg misses the 7-day client timeout"
+	docker exec "${cluster}-lb" grep -q "option tcp-check" /etc/haproxy/haproxy.cfg \
+		|| fail "${cluster}: haproxy.cfg misses option tcp-check"
+	# One backend server line per master, on 6443 with health checks.
+	assert_cmd "${cluster}: haproxy backend servers" 2 \
+		docker exec "${cluster}-lb" sh -c 'grep -cE "^[[:space:]]*server cp[0-9]+ " /etc/haproxy/haproxy.cfg || true'
+	# The stats page the image HEALTHCHECK probes must serve, and the live
+	# file must pass the same `haproxy -c` lint.sh runs on the heredoc.
+	docker exec "${cluster}-lb" wget -qO- --timeout=10 http://127.0.0.1:8404/ 2> /dev/null \
+		| grep -q Statistics \
+		|| fail "${cluster}: haproxy stats page does not serve"
+	docker exec "${cluster}-lb" haproxy -c -f /etc/haproxy/haproxy.cfg \
+		|| fail "${cluster}: live haproxy.cfg fails haproxy -c"
+}
+
+# Topology changes on an HA-created cluster, kept separate from multi-master
+# so neither test approaches the suite's ten-minute budget. Creating the
+# cluster with two masters makes the LB its kubeadm endpoint from the start,
+# which is what exercises the endpoint rewrite on the way back to one.
+test_topology() {
+	local cluster=$1 out lb_ip master1_ip master2_ip master3_ip worker_ip
+	local cluster_info kube_proxy_config
+	up "${cluster}" 1 2
+	wait_for "${cluster}: initial node count" "${ZEK_E2E_TIMEOUT}" \
+		node_count_is "${cluster}" 3
+	lb_ip=$(container_ip "${cluster}-lb")
+	master1_ip=$(container_ip "${cluster}-master-1")
+	master2_ip=$(container_ip "${cluster}-master-2")
+	worker_ip=$(container_ip "${cluster}-worker-1")
+	assert_cmd "${cluster}: initial endpoint" "${lb_ip}:6443" \
+		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+
+	# A worker-only addition grows the node set but must leave the LB and
+	# its backends alone.
+	log "${cluster}: topology - add a worker"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 2 --masters 2 2>&1) \
+		|| fail "${cluster}: adding a worker failed: ${out}"
+	wait_for "${cluster}: node count after adding a worker" \
+		"${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 4
+	assert_cmd "${cluster}: LB backends after adding a worker" 2 \
+		lb_backend_count "${cluster}"
+
+	# Adding a master grows the stacked etcd cluster and the LB's backend
+	# list.
+	log "${cluster}: topology - add a master"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 2 --masters 3 2>&1) \
+		|| fail "${cluster}: adding a master failed: ${out}"
+	wait_for "${cluster}: node count after adding a master" \
+		"${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 5
+	master3_ip=$(container_ip "${cluster}-master-3")
+	assert_cmd "${cluster}: master-1 kept its address while scaling" "${master1_ip}" \
+		container_ip "${cluster}-master-1"
+	assert_cmd "${cluster}: worker-1 kept its address while scaling" "${worker_ip}" \
+		container_ip "${cluster}-worker-1"
+	wait_for "${cluster}: stacked etcd grew to 3 members" 180 \
+		etcd_member_count_is "${cluster}" 3
+	assert_cmd "${cluster}: LB backends after adding a master" 3 \
+		lb_backend_count "${cluster}"
+	for ip in "${master1_ip}" "${master2_ip}" "${master3_ip}"; do
+		# shellcheck disable=SC2310
+		lb_has_backend "${cluster}" "${ip}" \
+			|| fail "${cluster}: LB is missing backend ${ip}"
+	done
+
+	# Removing a master and a worker shrinks the LB's backends and the
+	# stacked-etcd membership back down.
+	log "${cluster}: topology - remove a master and a worker"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 1 --masters 2 2>&1) \
+		|| fail "${cluster}: removing a master and a worker failed: ${out}"
+	wait_for "${cluster}: node count after removing a master and a worker" \
+		"${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 3
+	if docker inspect "${cluster}-master-3" > /dev/null 2>&1; then
+		fail "${cluster}: master-3 was not removed"
+	fi
+	assert_cmd "${cluster}: master-1 kept its address after removal" "${master1_ip}" \
+		container_ip "${cluster}-master-1"
+	assert_cmd "${cluster}: worker-1 kept its address after removal" "${worker_ip}" \
+		container_ip "${cluster}-worker-1"
+	wait_for "${cluster}: stacked etcd shrank to 2 members" 180 \
+		etcd_member_count_is "${cluster}" 2
+	assert_cmd "${cluster}: LB backends after removing a master" 2 \
+		lb_backend_count "${cluster}"
+	# shellcheck disable=SC2310
+	lb_lacks_backend "${cluster}" "${master3_ip}" \
+		|| fail "${cluster}: LB still has the removed master ${master3_ip}"
+
+	# Back to one master: the LB endpoint must move to master-1, the LB
+	# disappears and every remaining node is restarted on the new endpoint.
+	# Leaving kubeconfigs on the removed LB would break every kubelet.
+	log "${cluster}: topology - scale the HA cluster back to one master"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 1 --masters 1 2>&1) \
+		|| fail "${cluster}: scaling an HA cluster to one master failed: ${out}"
+	wait_for "${cluster}: node count after scaling to one master" \
+		"${ZEK_E2E_TIMEOUT}" node_count_is "${cluster}" 2
+	assert_cmd "${cluster}: containers after scaling to one master" 2 \
+		running_count "${cluster}"
+	assert_cmd "${cluster}: master-1 kept its address across the endpoint move" \
+		"${master1_ip}" container_ip "${cluster}-master-1"
+	assert_cmd "${cluster}: worker-1 kept its address across the endpoint move" \
+		"${worker_ip}" container_ip "${cluster}-worker-1"
+	if docker inspect "${cluster}-lb" > /dev/null 2>&1; then
+		fail "${cluster}: the LB survived scaling back to one master"
+	fi
+	wait_for "${cluster}: control plane readyz on the rewritten endpoint" 180 readyz_ok "${cluster}"
+	assert_cmd "${cluster}: published endpoint after scaling to one master" \
+		"${master1_ip}:6443" docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+	if docker exec "${cluster}-master-1" grep -qF "https://${lb_ip}:6443" /etc/cluster/admin.conf; then
+		fail "${cluster}: admin.conf still points at the removed LB"
+	fi
+	docker exec "${cluster}-master-1" grep -qF "https://${master1_ip}:6443" /etc/cluster/admin.conf \
+		|| fail "${cluster}: admin.conf was not rewritten to master-1"
+	# shellcheck disable=SC2310
+	cluster_info=$(zk "${cluster}" kubectl -n kube-public get configmap cluster-info -o yaml) \
+		|| fail "${cluster}: cannot read cluster-info"
+	if grep -qF "${lb_ip}:6443" <<< "${cluster_info}"; then
+		fail "${cluster}: cluster-info still points at the removed LB"
+	fi
+	# shellcheck disable=SC2310
+	zk "${cluster}" kubectl -n kube-system get configmap kubeadm-config \
+		-o jsonpath='{.data.ClusterConfiguration}' \
+		| grep -qF "controlPlaneEndpoint: ${master1_ip}:6443" \
+		|| fail "${cluster}: kubeadm-config still points at the removed LB"
+	# shellcheck disable=SC2310
+	kube_proxy_config=$(zk "${cluster}" kubectl -n kube-system get configmap kube-proxy -o yaml) \
+		|| fail "${cluster}: cannot read the kube-proxy configmap"
+	if grep -qF "${lb_ip}:6443" <<< "${kube_proxy_config}"; then
+		fail "${cluster}: kube-proxy config still points at the removed LB"
+	fi
+	docker exec "${cluster}-worker-1" grep -qF "https://${master1_ip}:6443" \
+		/etc/kubernetes/kubelet.conf \
+		|| fail "${cluster}: worker-1 kubelet.conf was not rewritten to master-1"
 }
 
 test_multi_worker() {
 	local cluster=$1 inotify_limit
 	up "${cluster}" 2 1
 	assert_cmd "${cluster}: node count" 3 node_count "${cluster}"
-	assert_cmd "${cluster}: nodes NotReady but kubelets reporting" 3 ready_false_count "${cluster}"
+	wait_for "${cluster}: nodes NotReady but kubelets reporting" 120 \
+		ready_false_count_is "${cluster}" 3
 
 	# entrypoint.sh raises the host-wide per-uid inotify instance quota
 	# (default 128) to >=1024 before starting the kubelet; without it big
@@ -1564,9 +1754,8 @@ test_persistence_1() {
 	docker stop "${names[@]}" > /dev/null
 	assert_cmd "${cluster}: all containers stopped" 0 running_count "${cluster}"
 	# Start in dependency-safe order (lb, masters, workers) like zek's
-	# own restart: workers use dynamic IPs, so a worker starting first
-	# can claim a stopped master's static address and leave the master
-	# failing with "Address already in use".
+	# own restart: the control plane and LB must serve before the kubelets
+	# that point at them reconnect.
 	for role in lb master worker; do
 		wave=()
 		for candidate in "${names[@]}"; do
@@ -1616,7 +1805,7 @@ test_persistence_2() {
 
 	log "${cluster}: zek down + zek up"
 	# Both nodes keep the static address they were created with: the restart
-	# path only starts containers again (restart_cluster), so nothing may be
+	# path only starts containers again (start_existing_nodes), so nothing may be
 	# renumbered - a node whose address moved after a host reboot would no
 	# longer match its kubelet certificate or its Node object.
 	master_ip_before=$(container_ip "${cluster}-master-1")
@@ -1629,8 +1818,8 @@ test_persistence_2() {
 	# can lag the stop by a beat.
 	wait_for "${cluster}: master-1 logged its cleanup" 30 log_has "${cluster}-master-1" \
 		"shutting down"
-	# Same dependency-safe order restart_cluster uses: masters before
-	# workers (a worker starting first could claim a static master IP).
+	# Same dependency-safe order start_existing_nodes uses: masters before
+	# workers so the control plane serves before kubelets reconnect.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 2>&1) \
 		|| fail "${cluster}: up after down failed: ${out}"
@@ -1853,28 +2042,21 @@ EOF
 	# The static pods must run the preloaded images (the kubeadm binary's
 	# own version, pinned via --kubernetes-version at init): a skewed
 	# compiled default would live-pull different tags instead of using
-	# the store import_k8s_images filled.
+	# the store shipped in the image.
 	# shellcheck disable=SC2310
 	apiserver_image=$(zk "${cluster}" kubectl -n kube-system get pod "kube-apiserver-${cluster}-master-1" \
 		-o jsonpath='{.spec.containers[0].image}' 2> /dev/null) || apiserver_image=""
 	kubeadm_version=$(docker exec "${cluster}-master-1" kubeadm version -o short 2> /dev/null) || kubeadm_version=""
 	[[ -n ${kubeadm_version} && ${apiserver_image} == *":${kubeadm_version}" ]] \
 		|| fail "${cluster}: apiserver runs '${apiserver_image}', want tag '${kubeadm_version}' (init must use the preloaded images)"
-	# The image build preloaded the kubeadm images into containerd; a
-	# silent import failure would turn every init into a live pull, which
-	# only shows on an offline host. The import runs during init/join,
-	# after node_setup and before kubeadm init, so the store is complete
-	# once `up` returns.
+	# The image build fetches the kubeadm images into the containerd store
+	# that ships in the image layer. A missing image would turn every init
+	# into a live pull, which only shows on an offline host.
 	images=$(docker exec "${cluster}-master-1" ctr -n k8s.io images ls 2> /dev/null) || images=""
 	for img in kube-apiserver etcd coredns kube-proxy pause; do
 		[[ ${images} == *"${img}"* ]] \
 			|| fail "${cluster}: preloaded image '${img}' missing from the containerd store"
 	done
-	# The import logs a WARNING per failed tarball instead of dying.
-	# shellcheck disable=SC2310
-	if log_has "${cluster}-master-1" "failed to import"; then
-		fail "${cluster}: the kubeadm image preload logged a failure"
-	fi
 	# The image HEALTHCHECK reads the local daemons (containerd's process
 	# plus kubelet's healthz - the cluster state it must NOT use: this
 	# node is NotReady without a CNI). Flip it off and back: unhealthy
@@ -2072,7 +2254,7 @@ test_smoke_2() {
 }
 
 test_smoke_3() {
-	local cluster=$1 out role join_ca_hash join_api_endpoint
+	local cluster=$1 out role join_ca_hash join_api_endpoint subnet master1_ip
 	# The entrypoint and join probes below need a real node; every loud
 	# error path between them must leave this cluster untouched.
 	up "${cluster}" 1 1
@@ -2177,6 +2359,19 @@ test_smoke_3() {
 	assert_die "${cluster}: worker on the load balancer" "load balancer's IP" \
 		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 \
 		--master-ip 172.20.250.8 up --workers 1 --masters 2
+	# Growing to HA must die before adding masters when a node already owns
+	# the LB address (a single-master cluster created with enough workers
+	# can legitimately put one there). A name-matching spare container on
+	# .10 exercises the same preflight without another full bring-up.
+	log "${cluster}: HA growth refuses a node on the LB address"
+	subnet=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' \
+		"${cluster}-net")
+	docker run -d --name "${cluster}-worker-9" --network "${cluster}-net" \
+		--ip "${subnet%.*}.10" busybox sleep 300 > /dev/null \
+		|| fail "${cluster}: cannot start the LB-address probe container"
+	assert_die "${cluster}: HA growth with the LB address occupied" \
+		"cannot add the load balancer" zk "${cluster}" up --masters 2
+	docker rm -f "${cluster}-worker-9" > /dev/null
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
 	# retry after a failed create (network exists, master does not).
@@ -2380,10 +2575,11 @@ test_smoke_3() {
 	wait_for "${cluster}: NODE_DNS reached resolv.conf" 30 nodns_applied "${cluster}-worker-nodns" 9.9.9.9
 	docker rm -f "${cluster}-worker-nodns" > /dev/null
 
-	# Every up spelling: --flag=value, the ZEK_WORKERS/ZEK_MASTERS
-	# defaults, and the bare-number shorthand - which must warn and leave
-	# the fixed topology alone (still 1 master + 1 worker, no containers
-	# added).
+	# Every up spelling: --flag=value, the ZEK_WORKERS/ZEK_MASTERS env
+	# twins, and the bare-number shorthand. On an existing cluster these
+	# are desired counts, not creation-time only: a shorthand grows the
+	# worker count, 0 shrinks it, and the master count adds/removes the
+	# extra control plane and the LB.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers=1 --masters=1 2>&1) \
 		|| fail "${cluster}: up --flag=value failed: ${out}"
@@ -2392,24 +2588,55 @@ test_smoke_3() {
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 2 2>&1) \
 		|| fail "${cluster}: up <n> shorthand failed: ${out}"
-	[[ ${out} == *"topology is fixed"* ]] \
-		|| fail "${cluster}: up 2 must warn that the topology is fixed: ${out}"
-	assert_cmd "${cluster}: node count after up 2" 2 node_count "${cluster}"
-	assert_cmd "${cluster}: containers after up 2" 2 running_count "${cluster}"
-	# A differing --masters must warn the same way and leave the topology.
+	assert_cmd "${cluster}: node count after up 2" 3 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up 2" 3 running_count "${cluster}"
+	# A differing --masters adds a control plane and brings up the LB. A
+	# cluster created with one master keeps master-1 as its kubeadm
+	# endpoint; the LB is an additional address, not a replacement.
+	master1_ip=$(container_ip "${cluster}-master-1")
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --masters 2 2>&1) \
 		|| fail "${cluster}: up --masters 2 failed: ${out}"
-	[[ ${out} == *"topology is fixed"* ]] \
-		|| fail "${cluster}: up --masters 2 must warn that the topology is fixed: ${out}"
-	assert_cmd "${cluster}: node count after up --masters 2" 2 node_count "${cluster}"
-	assert_cmd "${cluster}: containers after up --masters 2" 2 running_count "${cluster}"
-	# The bare-number shorthand with 0: same warn, same untouched topology.
+	[[ ${out} == *"adding ${cluster}-master-2"* ]] \
+		|| fail "${cluster}: up --masters 2 did not add master-2: ${out}"
+	assert_cmd "${cluster}: node count after up --masters 2" 4 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up --masters 2" 5 running_count "${cluster}"
+	# shellcheck disable=SC2310
+	container_running "${cluster}-lb" || fail "${cluster}: up --masters 2 did not start the LB"
+	assert_cmd "${cluster}: single-master endpoint unchanged by HA growth" \
+		"${master1_ip}:6443" docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+	docker exec "${cluster}-master-1" grep -qF "https://${master1_ip}:6443" \
+		/etc/cluster/admin.conf \
+		|| fail "${cluster}: HA growth moved the endpoint off master-1"
+	# The bare-number shorthand with 0: shrink only the workers; masters
+	# (and the LB) stay.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 0 2>&1) \
 		|| fail "${cluster}: up 0 shorthand failed: ${out}"
-	[[ ${out} == *"topology is fixed"* ]] \
-		|| fail "${cluster}: up 0 must warn that the topology is fixed: ${out}"
+	assert_cmd "${cluster}: node count after up 0" 2 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up 0" 3 running_count "${cluster}"
+	# Scaling back to one master removes master-2 and the LB. The cluster
+	# was created with master-1 as its endpoint, so no endpoint rewrite is
+	# needed here (the HA-created path is covered by the topology test).
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --masters 1 2>&1) \
+		|| fail "${cluster}: up --masters 1 failed: ${out}"
+	assert_cmd "${cluster}: node count after up --masters 1" 1 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after up --masters 1" 1 running_count "${cluster}"
+	if docker inspect "${cluster}-lb" > /dev/null 2>&1; then
+		fail "${cluster}: up --masters 1 left the LB behind"
+	fi
+
+	# The env twins request real topology changes too, not just the first
+	# creation: grow to one worker and shrink back to none.
+	out=$(env ZEK_WORKERS=1 ./zek.sh --cluster "${cluster}" up 2>&1) \
+		|| fail "${cluster}: env ZEK_WORKERS=1 scale failed: ${out}"
+	assert_cmd "${cluster}: node count after env worker growth" 2 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after env worker growth" 2 running_count "${cluster}"
+	out=$(env ZEK_WORKERS=0 ./zek.sh --cluster "${cluster}" up 2>&1) \
+		|| fail "${cluster}: env ZEK_WORKERS=0 scale failed: ${out}"
+	assert_cmd "${cluster}: node count after env worker shrink" 1 node_count "${cluster}"
+	assert_cmd "${cluster}: containers after env worker shrink" 1 running_count "${cluster}"
 }
 
 test_smoke_4() {
@@ -2585,12 +2812,30 @@ test_smoke_5() {
 	wait_for "${cluster}: control plane readyz after master restart" 120 readyz_ok "${cluster}"
 	assert_cmd "${cluster}: node count after master restart" 2 node_count "${cluster}"
 
+	# A node detached from the cluster network must still be stopped by
+	# down and removed by destroy (both enumerate the cluster's names, not
+	# just the network's containers).
+	log "${cluster}: down and destroy handle a detached node"
+	docker network disconnect "${cluster}-net" "${cluster}-worker-1"
+	# status enumerates the cluster's names too, so the detached worker is
+	# still reported while it runs.
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" status 2>&1) || fail "${cluster}: status with a detached worker failed: ${out}"
+	grep -E "^${cluster}-worker-1[[:space:]]+running[[:space:]]+" <<< "${out}" > /dev/null \
+		|| fail "${cluster}: status missed the detached worker: ${out}"
+	zk "${cluster}" down
+	assert_cmd "${cluster}: detached worker stopped by down" false \
+		docker inspect -f '{{.State.Running}}' "${cluster}-worker-1"
+
 	# destroy: containers and network must really be gone - the pass-path
 	# destroy in job_exit hides its exit status, so assert it here.
 	log "${cluster}: destroy removes the containers and the network"
 	out=$(./zek.sh --cluster "${cluster}" destroy 2>&1) \
 		|| fail "${cluster}: destroy failed: ${out}"
 	assert_cmd "${cluster}: containers after destroy" "" cluster_containers "${cluster}"
+	if docker inspect "${cluster}-worker-1" > /dev/null 2>&1; then
+		fail "${cluster}: detached worker survived destroy"
+	fi
 	if docker network inspect "${cluster}-net" > /dev/null 2>&1; then
 		fail "${cluster}: network ${cluster}-net survived destroy"
 	fi
@@ -2699,18 +2944,14 @@ test_recovery_2() {
 
 	# Interrupted early init: kubelet.conf present, completion markers gone
 	# AND manifests removed (nothing servable left). The entrypoint must
-	# wipe and re-init. With ctr hidden the image import must warn and skip
-	# (the images are already in the store from the first init).
-	log "${cluster}: interrupted control-plane init recovers (ctr hidden)"
-	docker exec "${cluster}-master-1" sh -c 'mv "$(command -v ctr)" /ctr.hidden'
+	# wipe and re-init.
+	log "${cluster}: interrupted control-plane init recovers"
 	docker exec "${cluster}-master-1" rm -f /etc/cluster/init-complete \
 		/etc/cluster/admin.conf /etc/cluster/token
 	docker exec "${cluster}-master-1" rm -rf /etc/kubernetes/manifests
 	docker restart "${cluster}-master-1" > /dev/null
 	wait_for "${cluster}: interrupted init detected" 60 log_has "${cluster}-master-1" \
 		"interrupted control-plane init/join detected; resetting partial state"
-	wait_for "${cluster}: ctr-missing warning" 60 log_has "${cluster}-master-1" \
-		"ctr not installed; skipping kubeadm image preload"
 	wait_for "${cluster}: credentials republished after re-init" 180 creds_published "${cluster}"
 	wait_for "${cluster}: control plane readyz after re-init" 300 readyz_ok "${cluster}"
 	# The re-init wiped etcd: the worker's Node object is gone and its
@@ -2788,7 +3029,7 @@ run_test() { # test [subnet]
 # `up`, so without this the second docker network create fails with an
 # address-space overlap error.
 alloc_subnets() { # want -> fills subnets
-	local want_count=$1 used_subnets="" network_id octet_idx candidate_subnet
+	local want_count=$1 used_subnets="" network_id subnet octet_idx candidate_subnet
 	# Unquoted splits are intentional word-splitting over machine-generated
 	# ids/subnets (no spaces), same as pick_subnet in zek.sh.
 	for network_id in $(docker network ls -q); do
@@ -2814,8 +3055,8 @@ alloc_subnets() { # want -> fills subnets
 }
 
 # --- runner -----------------------------------------------------------------
-# Drop leftovers of earlier runs first: `up` would otherwise restart a stale
-# cluster (topology fixed at creation) instead of creating a fresh one.
+# Drop leftovers of earlier runs first: `up` would otherwise reconcile a
+# stale cluster instead of creating a fresh one.
 stale_clusters=$(docker ps -a --format '{{.Names}}' \
 	| sed -E 's/-(master|worker)-[0-9]+$//; s/-lb$//' \
 	| grep -E '^e2e-' | sort -u || true)

@@ -253,7 +253,7 @@
            # the pin placeholders are substituted by the runner before this\n\
            # script runs and are version strings validated in prepare.\n\
            cat >pr-body.md <<'EOF'\n\
-           Automated version bump. `./lint.sh` and `make build` passed with the new pins.\n\
+           Automated version bump. `make build` and the full e2e matrix passed with the new pins; `./lint.sh` passed on the base tree (this bump only changes the Makefile pins).\n\
            \n\
            | Pin                | before                                   | after                               |\n\
            | ------------------ | ---------------------------------------- | ----------------------------------- |\n\

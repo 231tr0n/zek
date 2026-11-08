@@ -49,7 +49,9 @@
 # (e.g. "from 6 sh files") so the body language stays unambiguous.
 #
 # Fix locally with:  make format  (the formatters above, in place; heredoc
-#                    bodies stay hand-maintained)  |
+#                    bodies stay hand-maintained). A bare host also needs
+#                    shfmt, shellcheck, dockerfmt and prettier/npx; the
+#                    extra tools are:  |
 #                    dnf install haproxy make python3-pip  |
 #                    go install sigs.k8s.io/yaml/yamlfmt@latest  |
 #                    go install github.com/rhysd/actionlint/cmd/actionlint@latest  |

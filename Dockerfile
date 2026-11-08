@@ -37,10 +37,10 @@ for bin in kubectl kubeadm kubelet; do
 	curl -fsSL --retry 5 --retry-all-errors -o "/usr/local/bin/${bin}" "https://dl.k8s.io/release/${KUBERNETES_VERSION}/bin/linux/${TARGETARCH}/${bin}"
 	chmod +x "/usr/local/bin/${bin}"
 done
-# Preload the kubeadm images so init/join needs no registry at runtime.
-# containerd (apk) starts fine unprivileged; content fetch + export are plain
-# file operations, so no unpacking/mounting happens inside this build step.
-mkdir -p /opt/zek/images
+# Preload the kubeadm images so init/join needs no registry at runtime. The
+# containerd store built here stays in the image layer; every node container
+# starts containerd against it. containerd (apk) starts fine unprivileged and
+# content fetch is plain file I/O, so no unpacking/mounting happens here.
 # Minimal config for the build-time image preload only; at runtime
 # entrypoint.sh reuses this file and applies its own tweaks (CNI bin_dirs,
 # native unpack_config) on top, so only the snapshotter matters here.
@@ -56,12 +56,11 @@ done
 images=$(kubeadm config images list --kubernetes-version "${KUBERNETES_VERSION}") || exit 1
 # Unquoted split on purpose: the image list is machine-generated refs
 # without spaces, one per line.
-# ctr draws its download/export progress on stdout (ANSI escapes and
-# carriage returns, unreadable in a log): drop it and keep stderr, which
-# is where a failed fetch publishes its reason.
+# ctr draws its download progress on stdout (ANSI escapes and carriage
+# returns, unreadable in a log): drop it and keep stderr, which is where a
+# failed fetch publishes its reason.
 for image in ${images}; do
 	ctr --namespace k8s.io content fetch --platform "linux/${TARGETARCH}" "${image}" > /dev/null
-	ctr --namespace k8s.io images export --platform "linux/${TARGETARCH}" "/opt/zek/images/$(basename "${image}").tar" "${image}" > /dev/null
 done
 kill "${CONTAINERD_PID}"
 kubeadm version -o short
@@ -73,16 +72,18 @@ COPY entrypoint.sh /entrypoint.sh
 # reporting unhealthy (restart policies ignore it; only Swarm/compose
 # consumes it), so .State-driven logic and `docker ps` running/exited are
 # unaffected. It probes the local daemons, never the cluster: a node is
-# NotReady until the user installs a CNI, workers hold no kubeconfig, and
-# an API outage would label healthy containers bad. lb -> haproxy's stats
+# NotReady until the user installs a CNI, workers hold no admin kubeconfig,
+# and an API outage would label healthy containers bad. lb -> haproxy's stats
 # page; nodes -> containerd alive AND kubelet's healthz (both started by
 # entrypoint.sh, kubelet under its supervisor). The 120s start period
-# covers kubeadm init/join before kubelet answers its healthz.
+# covers daemon startup; a slow kubeadm init/join can still take longer,
+# and the verdict is advisory. Node checks come first so a process bound to
+# :8404 inside a node cannot mask a dead containerd/kubelet.
 # The continuation lines stay indented: dockerfmt -i 0 would otherwise
 # unindent them along with the heredoc bodies.
 # dockerfmt-ignore
 HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \
-    CMD curl -sf -m 2 http://127.0.0.1:8404/ > /dev/null || \
-    { pgrep -x containerd > /dev/null && curl -sf -m 2 http://127.0.0.1:10248/healthz > /dev/null; }
+    CMD { pgrep -x containerd > /dev/null && curl -sf -m 2 http://127.0.0.1:10248/healthz > /dev/null; } || \
+    curl -sf -m 2 http://127.0.0.1:8404/ > /dev/null
 
 ENTRYPOINT ["/entrypoint.sh"]
