@@ -649,19 +649,21 @@ nodns_applied() { # container ip
 	docker exec "$1" grep -q "^nameserver $2$" /etc/resolv.conf 2> /dev/null
 }
 
-# A node container's resolv.conf was rewritten by node_setup ("search .")
-# and has at least one nameserver, none empty and none Docker's loopback
-# stub. Checking the rewrite marker matters when the node was started with
-# --dns: Docker would otherwise supply a non-loopback nameserver before
-# node_setup ever runs.
+# A node container's resolv.conf was rewritten by node_setup and has at
+# least one nameserver, none empty and none Docker's loopback stub. The
+# rewrite truncates the file to "search ." plus nameserver lines, so the
+# absence of Docker's comment header proves node_setup ran. That matters
+# when the node was started with --dns: Docker pre-populates a non-loopback
+# nameserver (and even "search .") before node_setup ever runs.
 resolv_dns_ok() { # container
 	docker exec "$1" awk '
+		/^#/ { docker = 1 }
 		$0 == "search ." { rewritten = 1 }
 		$1 == "nameserver" {
 			if (NF < 2 || $2 ~ /^127\./) bad = 1
 			found = 1
 		}
-		END { exit !(rewritten && found && !bad) }
+		END { exit !(rewritten && found && !bad && !docker) }
 	' /etc/resolv.conf 2> /dev/null
 }
 
@@ -1061,11 +1063,11 @@ ensure_cilium() {
 		-w '%{url_effective}' https://github.com/cilium/cilium-cli/releases/latest) || url=""
 	tag=${url##*/}
 	[[ -n ${tag} ]] || tag=${fallback}
-	if ! curl -fsSL --connect-timeout 5 --max-time 15 --retry 1 --retry-all-errors \
+	if ! curl -fsSL --connect-timeout 5 --max-time 60 \
 		-o "${WORK_DIR}/cilium.tar.gz" \
 		"https://github.com/cilium/cilium-cli/releases/download/${tag}/cilium-linux-${ARCH}.tar.gz"; then
-		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --connect-timeout 5 --max-time 15 \
-			--retry 1 --retry-all-errors -o "${WORK_DIR}/cilium.tar.gz" \
+		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --connect-timeout 5 --max-time 60 \
+			-o "${WORK_DIR}/cilium.tar.gz" \
 			"https://github.com/cilium/cilium-cli/releases/download/${fallback}/cilium-linux-${ARCH}.tar.gz"; then
 			tag=${fallback}
 		else
@@ -2515,17 +2517,26 @@ test_smoke_3() {
 		"not enough free addresses" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 14
 	./zek.sh --cluster "${cluster}--tiny" destroy > /dev/null 2>&1 || true
-	# A single-master cluster has no LB, so .10 is a normal host address:
-	# seven workers fill .3-.9, and the next worker must take .10. The
-	# preflight must not keep reserving the address for a nonexistent LB.
+	# A single-master cluster has no LB, so .10 is a normal host address.
+	# Occupy .4-.9 with containers on the network (they count as reserved
+	# addresses without paying for six more node registrations), then the
+	# next real worker must take .10. The preflight must not keep reserving
+	# the address for a nonexistent LB. destroy removes the placeholders
+	# because it removes every container on the cluster network.
 	log "${cluster}: single-master scaling may use the LB address"
 	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" --subnet 172.20.249.0/28 \
-		--master-ip 172.20.249.2 up --workers 7 --masters 1 \
+		--master-ip 172.20.249.2 up --workers 1 --masters 1 \
 		> /dev/null 2>&1 || fail "${cluster}: cannot create the .10 probe cluster"
-	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" up --workers 8 \
+	for octet in 4 5 6 7 8 9; do
+		docker run -d --name "${cluster}--tiny10-hold-${octet}" \
+			--network "${cluster}--tiny10-net" --ip "172.20.249.${octet}" \
+			busybox:latest sleep 300 > /dev/null \
+			|| fail "${cluster}: cannot reserve 172.20.249.${octet}"
+	done
+	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" up --workers 2 \
 		|| fail "${cluster}: single-master growth to .10 failed"
 	assert_cmd "${cluster}: single-master worker used .10" "172.20.249.10" \
-		container_ip "${cluster}--tiny10-worker-8"
+		container_ip "${cluster}--tiny10-worker-2"
 	./zek.sh --cluster "${cluster}--tiny10" destroy > /dev/null 2>&1 || true
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
