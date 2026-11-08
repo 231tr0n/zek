@@ -806,24 +806,18 @@ run_kubectl() {
 parse_role_flags() {
 	ROLE_ARGS=()
 	while [[ $# -gt 0 ]]; do
-		# Reject empty values in both spellings before a flag can put an
-		# empty path/name/CIDR into effect. Only known entrypoint flags are
-		# checked here: kubectl passthrough flags with empty values remain
-		# kubectl's business.
+		# Reject an empty --flag=value before it can put an empty
+		# path/name/CIDR into effect. Only value flags are listed: boolean
+		# flags with a value fall through to their dedicated error, and
+		# kubectl passthrough flags with empty values remain kubectl's
+		# business. The space-separated spelling (including --flag "") is
+		# checked per flag below, which also reports the env twin.
 		case "$1" in
 			--cluster-dir=* | --node-name=* | --pod-cidr=* | --node-dns=* | \
 				--api-endpoint=* | --join-token=* | --join-ca-hash=* | \
 				--join-api-endpoint=* | --join-cert-key=* | --lb-backends=* | \
-				--kubeconfig=* | --master-join=* | --no-host-modules=*)
+				--kubeconfig=*)
 				[[ -n ${1#*=} ]] || die "${1%%=*} needs a value"
-				;;
-			*) ;;
-		esac
-		case "$1" in
-			--cluster-dir | --node-name | --pod-cidr | --node-dns | --api-endpoint | \
-				--join-token | --join-ca-hash | --join-api-endpoint | --join-cert-key | \
-				--lb-backends | --kubeconfig)
-				[[ -n ${2:-} ]] || die "$1 needs a value"
 				;;
 			*) ;;
 		esac

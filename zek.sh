@@ -480,11 +480,15 @@ alloc_node_ip() { # <subnet> <lb-ip>
 			*" ${ip} "*) continue ;;
 			*) ;;
 		esac
-		require_host_ip "${ip}" "${subnet}" "new node"
+		# The master's prefix spans a whole /24, but --subnet may be
+		# narrower or offset: skip candidates outside its host range
+		# instead of dying on the first one.
+		# shellcheck disable=SC2310
+		is_usable_host_ip "${ip}" "${subnet}" || continue
 		printf '%s\n' "${ip}"
 		return 0
 	done
-	die "no free address left in the master's /24 for another node (destroy and recreate the cluster with a different --master-ip)"
+	die "no free host address left near ${MASTER_IP} for another node (destroy and recreate the cluster with a different --master-ip)"
 }
 
 # Number of addresses alloc_node_ip could hand out before it runs out. A
@@ -1095,6 +1099,12 @@ reconcile_cluster() {
 	MASTER_IP=$(node_address "${MASTER_NAME}")
 	MASTER_IP="${MASTER_IP:-${NET_SUBNET%.*}.2}"
 	lb_ip=$(lb_node_ip "${NET_SUBNET}")
+	# A narrow or offset subnet can put the derived LB address outside its
+	# usable host range; refuse before adding nodes or creating the LB,
+	# which would otherwise die halfway through the scale.
+	if [[ ${desired_masters} -gt 1 ]]; then
+		require_host_ip "${lb_ip}" "${NET_SUBNET}" "load balancer"
+	fi
 	# Refuse an impossible scale before adding anything: a failure halfway
 	# through leaves a partially changed topology behind.
 	if [[ ${desired_masters} -gt ${existing_masters} ]]; then
@@ -1107,7 +1117,7 @@ reconcile_cluster() {
 	if [[ ${needed} -gt 0 ]]; then
 		free=$(count_free_node_ips "${NET_SUBNET}" "${lb_ip}")
 		[[ ${free} -ge ${needed} ]] \
-			|| die "not enough free addresses for ${needed} new node(s): only ${free} available in the master's /24 (lower --workers/--masters or change --master-ip)"
+			|| die "not enough free addresses for ${needed} new node(s): only ${free} usable in ${NET_SUBNET} (lower --workers/--masters or recreate the cluster with a different --master-ip)"
 	fi
 	# A single-master cluster created with enough workers can have one on
 	# the LB's reserved address (the creation-time formula only checks that

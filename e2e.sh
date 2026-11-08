@@ -649,6 +649,18 @@ nodns_applied() { # container ip
 	docker exec "$1" grep -q "^nameserver $2$" /etc/resolv.conf 2> /dev/null
 }
 
+# A node container's resolv.conf was rewritten by node_setup: it has at
+# least one nameserver, none of them empty and none Docker's loopback stub.
+resolv_dns_ok() { # container
+	docker exec "$1" awk '
+		$1 == "nameserver" {
+			if (NF < 2 || $2 ~ /^127\./) bad = 1
+			found = 1
+		}
+		END { exit !(found && !bad) }
+	' /etc/resolv.conf 2> /dev/null
+}
+
 # Is the apiserver inside a master container serving? (no CNI needed)
 master_readyz() { # cluster master-index
 	docker exec "${1}-master-${2}" curl -skf -m 5 https://127.0.0.1:6443/readyz 2> /dev/null \
@@ -1008,13 +1020,18 @@ EOF
 apply_flannel() {
 	# GitHub's release-asset CDN intermittently returns 504 for the
 	# `latest/download` alias; the tagged raw manifest is the same file and
-	# is stable. Fall back to master only if the pinned tag ever moves.
+	# is stable. Fall back to master only if the pinned tag ever moves, and
+	# say so: an unpinned manifest is not what this suite normally tests.
 	local manifest flannel_version=v0.28.10
-	manifest=$(curl -fsSL --retry 5 --retry-all-errors --max-time 60 \
-		"https://raw.githubusercontent.com/flannel-io/flannel/${flannel_version}/Documentation/kube-flannel.yml") \
-		|| manifest=$(curl -fsSL --retry 5 --retry-all-errors --max-time 60 \
+	if ! manifest=$(curl -fsSL --connect-timeout 5 --max-time 20 \
+		--retry 2 --retry-all-errors \
+		"https://raw.githubusercontent.com/flannel-io/flannel/${flannel_version}/Documentation/kube-flannel.yml"); then
+		log "WARNING: pinned flannel ${flannel_version} manifest unavailable; falling back to master"
+		manifest=$(curl -fsSL --connect-timeout 5 --max-time 20 \
+			--retry 2 --retry-all-errors \
 			https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml) \
-		|| die "flannel manifest download failed"
+			|| die "flannel manifest download failed"
+	fi
 	# "configured/created" on stdout repeats what we log ourselves; only
 	# kubectl's errors (stderr) are worth keeping in the output.
 	zk "$1" kubectl apply -f - > /dev/null <<< "${manifest}"
@@ -1036,21 +1053,25 @@ ensure_cilium() {
 	# binary from the published CLI container image (quay.io), which is
 	# pulled from a different CDN. Explicit returns keep a failure from
 	# aborting the suite: this runs as the left side of ||.
-	url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-		https://github.com/cilium/cilium-cli/releases/latest) || url=""
+	url=$(curl -fsSLI --connect-timeout 5 --max-time 15 -o /dev/null \
+		-w '%{url_effective}' https://github.com/cilium/cilium-cli/releases/latest) || url=""
 	tag=${url##*/}
 	[[ -n ${tag} ]] || tag=${fallback}
-	if ! curl -fsSL --retry 3 --retry-all-errors \
+	if ! curl -fsSL --connect-timeout 5 --max-time 20 --retry 2 --retry-all-errors \
 		-o "${WORK_DIR}/cilium.tar.gz" \
 		"https://github.com/cilium/cilium-cli/releases/download/${tag}/cilium-linux-${ARCH}.tar.gz"; then
-		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --retry 3 --retry-all-errors \
-			-o "${WORK_DIR}/cilium.tar.gz" \
+		if [[ ${tag} != "${fallback}" ]] && curl -fsSL --connect-timeout 5 --max-time 20 \
+			--retry 2 --retry-all-errors -o "${WORK_DIR}/cilium.tar.gz" \
 			"https://github.com/cilium/cilium-cli/releases/download/${fallback}/cilium-linux-${ARCH}.tar.gz"; then
 			tag=${fallback}
 		else
 			rm -f "${WORK_DIR}/cilium.tar.gz"
-			for tag in "${tag}" "${fallback}"; do
-				docker pull "quay.io/cilium/cilium-cli:${tag}" > /dev/null 2>&1 || continue
+			local -a tags=("${tag}")
+			[[ ${tag} == "${fallback}" ]] || tags+=("${fallback}")
+			log "WARNING: cilium GitHub assets unavailable; extracting the CLI from quay.io"
+			for tag in "${tags[@]}"; do
+				timeout 120 docker pull "quay.io/cilium/cilium-cli:${tag}" \
+					> /dev/null 2>&1 || continue
 				cid=$(docker create --entrypoint /usr/local/bin/cilium \
 					"quay.io/cilium/cilium-cli:${tag}" version) || continue
 				if docker cp "${cid}:/usr/local/bin/cilium" "${BIN_DIR}/cilium"; then
@@ -1359,9 +1380,9 @@ EOF
 
 # HA restart recovery, split out of multi-master so both entries stay below
 # the suite's ten-minute budget. Two masters are enough for the LB endpoint,
-# restart ordering, kubeconfig persistence and live haproxy config; the
-# interrupted control-plane join needs a third etcd member and stays in
-# multi-master.
+# restart ordering, kubeconfig persistence, live haproxy config and the
+# endpoint-migration failure/retry; the interrupted control-plane join needs
+# a third etcd member and stays in multi-master.
 test_multi_master_recovery() {
 	local cluster=$1 out lb_ip cluster_config cluster_status migration_ip
 	local -a create_args=()
@@ -1414,9 +1435,16 @@ test_multi_master_recovery() {
 	log "${cluster}: endpoint migration failure keeps the LB and can retry"
 	cluster_config=$(zk "${cluster}" kubectl -n kube-system get configmap kubeadm-config \
 		-o jsonpath='{.data.ClusterConfiguration}')
+	[[ -n ${cluster_config} ]] \
+		|| fail "${cluster}: kubeadm-config has no ClusterConfiguration to restore"
+	# The ConfigMap has no ClusterStatus until a join writes one; that is
+	# not a failure, but a failed read should not masquerade as "missing".
 	# shellcheck disable=SC2310
-	cluster_status=$(zk "${cluster}" kubectl -n kube-system get configmap kubeadm-config \
-		-o jsonpath='{.data.ClusterStatus}' 2> /dev/null || true)
+	if ! cluster_status=$(zk "${cluster}" kubectl -n kube-system get configmap kubeadm-config \
+		-o jsonpath='{.data.ClusterStatus}' 2> /dev/null); then
+		log "${cluster}: WARNING: cannot read kubeadm-config ClusterStatus; restoring only ClusterConfiguration"
+		cluster_status=""
+	fi
 	zk "${cluster}" kubectl -n kube-system patch configmap kubeadm-config \
 		--type merge -p '{"immutable":true}' > /dev/null
 	# shellcheck disable=SC2310
@@ -2451,16 +2479,25 @@ test_smoke_3() {
 	assert_die "${cluster}: HA growth with the LB address occupied" \
 		"cannot add the load balancer" zk "${cluster}" up --masters 2
 	docker rm -f "${cluster}-worker-9" > /dev/null
-	# Scaling refuses an impossible address-space growth before touching the
-	# topology: a /28 leaves only ten allocatable hosts with the master at
-	# .2 (gateway .1 and the reserved LB .10 excluded).
-	log "${cluster}: scaling refuses address-space exhaustion"
-	./zek.sh --cluster "${cluster}--tiny" --subnet 172.20.248.0/28 \
-		--master-ip 172.20.248.2 up --workers 1 --masters 1 \
+	# A successful scale inside an offset /28 proves the allocator walks past
+	# addresses outside the subnet instead of dying on the first candidate:
+	# master .18, worker-1 .19, so the new worker-2 must get .20. Then the
+	# same /28 refuses an impossible growth before touching the topology:
+	# it has thirteen hosts (.18-.30); with .18/.19/.20 taken only ten are
+	# left, fewer than the twelve new workers a scale to 14 needs. env -u
+	# drops this job's pre-allocated ZEK_SUBNET (the main cluster's /24,
+	# which would otherwise override the probe's subnet).
+	log "${cluster}: scaling in a narrow, offset subnet"
+	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" --subnet 172.20.248.16/28 \
+		--master-ip 172.20.248.18 up --workers 1 --masters 1 \
 		> /dev/null 2>&1 || fail "${cluster}: cannot create the tiny-subnet probe cluster"
+	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 2 \
+		|| fail "${cluster}: growing inside the tiny subnet failed"
+	assert_cmd "${cluster}: tiny-subnet worker followed the master" "172.20.248.20" \
+		container_ip "${cluster}--tiny-worker-2"
 	assert_die "${cluster}: scale beyond the free address range" \
 		"not enough free addresses" \
-		./zek.sh --cluster "${cluster}--tiny" up --workers 13
+		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 14
 	./zek.sh --cluster "${cluster}--tiny" destroy > /dev/null 2>&1 || true
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
@@ -2563,6 +2600,12 @@ test_smoke_3() {
 		docker exec "${cluster}-master-1" /entrypoint.sh master --master-join=2
 	assert_die "${cluster}: entrypoint --no-host-modules=0" "is a boolean" \
 		docker exec "${cluster}-master-1" /entrypoint.sh worker --no-host-modules=0
+	# An empty value is still a value: booleans must give the boolean error,
+	# not the value-flag "needs a value" error.
+	for flag in --master-join --no-host-modules; do
+		assert_die "${cluster}: entrypoint ${flag}= empty" "is a boolean" \
+			docker exec "${cluster}-master-1" /entrypoint.sh kubectl "${flag}="
+	done
 	assert_die "${cluster}: entrypoint unknown argument on master" "unknown argument" \
 		docker exec "${cluster}-master-1" /entrypoint.sh master --bogus-flag
 	out=$(docker exec "${cluster}-master-1" /entrypoint.sh kubectl \
@@ -2668,6 +2711,18 @@ test_smoke_3() {
 		"${ZEK_IMAGE}" worker > /dev/null
 	wait_for "${cluster}: NODE_DNS reached resolv.conf" 30 nodns_applied "${cluster}--worker-nodns" 9.9.9.9
 	docker rm -f "${cluster}--worker-nodns" > /dev/null
+	# A whitespace-only NODE_DNS is not an upstream list: node_setup must
+	# fall back to the resolv.conf scan instead of writing an empty
+	# "nameserver " line.
+	log "${cluster}: whitespace-only NODE_DNS falls back"
+	docker run -d --name "${cluster}--worker-nodns-blank" \
+		--hostname "${cluster}--worker-nodns-blank" \
+		--restart=no "${CLONE_ARGS[@]}" \
+		-e "NODE_DNS=   " \
+		"${ZEK_IMAGE}" worker > /dev/null
+	wait_for "${cluster}: whitespace-only NODE_DNS used the fallback" 30 \
+		resolv_dns_ok "${cluster}--worker-nodns-blank"
+	docker rm -f "${cluster}--worker-nodns-blank" > /dev/null
 
 	# Every up spelling: --flag=value, the ZEK_WORKERS/ZEK_MASTERS env
 	# twins, and the bare-number shorthand. On an existing cluster these
