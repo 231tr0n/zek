@@ -270,7 +270,7 @@ choice. Nodes transition to `Ready` once the CNI daemonsets run.
 
 ```sh
 # flannel (vxlan backend; matches the default ZEK_POD_CIDR=10.244.0.0/16)
-./zek.sh kubectl apply -f - < <(curl -fsSL https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml)
+./zek.sh kubectl apply -f - < <(curl -fsSL https://raw.githubusercontent.com/flannel-io/flannel/v0.28.10/Documentation/kube-flannel.yml)
 
 # cilium (example pin; e2e.sh resolves the release tested against the
 # running k8s - see resolve_cilium_version)

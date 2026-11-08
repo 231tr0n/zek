@@ -184,6 +184,9 @@ ensure_resolv_conf() {
 	# The loop splits on whitespace on purpose: upstreams is a
 	# space-separated IP list (single env value), never paths.
 	upstream_ips="${NODE_DNS:-}"
+	# A whitespace-only override is not an upstream list; fall through to
+	# the resolv.conf scan instead of writing an empty nameserver line.
+	[[ -n ${upstream_ips//[[:space:]]/} ]] || upstream_ips=""
 	if [[ -z ${upstream_ips} ]]; then
 		upstream_ips="$(awk '$1 == "nameserver" && $2 !~ /^127\.|^169\.254\./ { print $2 }' /etc/resolv.conf \
 			| sort -u | tr '\n' ' ')" || true
@@ -803,6 +806,27 @@ run_kubectl() {
 parse_role_flags() {
 	ROLE_ARGS=()
 	while [[ $# -gt 0 ]]; do
+		# Reject empty values in both spellings before a flag can put an
+		# empty path/name/CIDR into effect. Only known entrypoint flags are
+		# checked here: kubectl passthrough flags with empty values remain
+		# kubectl's business.
+		case "$1" in
+			--cluster-dir=* | --node-name=* | --pod-cidr=* | --node-dns=* | \
+				--api-endpoint=* | --join-token=* | --join-ca-hash=* | \
+				--join-api-endpoint=* | --join-cert-key=* | --lb-backends=* | \
+				--kubeconfig=* | --master-join=* | --no-host-modules=*)
+				[[ -n ${1#*=} ]] || die "${1%%=*} needs a value"
+				;;
+			*) ;;
+		esac
+		case "$1" in
+			--cluster-dir | --node-name | --pod-cidr | --node-dns | --api-endpoint | \
+				--join-token | --join-ca-hash | --join-api-endpoint | --join-cert-key | \
+				--lb-backends | --kubeconfig)
+				[[ -n ${2:-} ]] || die "$1 needs a value"
+				;;
+			*) ;;
+		esac
 		case "$1" in
 			--)
 				# forward the delimiter: `kubectl exec POD -- CMD` needs it

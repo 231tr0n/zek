@@ -487,6 +487,26 @@ alloc_node_ip() { # <subnet> <lb-ip>
 	die "no free address left in the master's /24 for another node (destroy and recreate the cluster with a different --master-ip)"
 }
 
+# Number of addresses alloc_node_ip could hand out before it runs out. A
+# scale operation checks this first so it cannot die halfway through,
+# leaving a partially changed topology behind.
+count_free_node_ips() { # <subnet> <lb-ip>
+	local subnet=$1 lb_ip=$2 prefix="${MASTER_IP%.*}" used ip candidate free=0
+	used=" $(used_node_ips | tr '\n' ' ') "
+	for candidate in $(seq 2 254); do
+		ip="${prefix}.${candidate}"
+		[[ ${ip} == "${lb_ip}" ]] && continue
+		case " ${used} " in
+			*" ${ip} "*) continue ;;
+			*) ;;
+		esac
+		# shellcheck disable=SC2310
+		is_usable_host_ip "${ip}" "${subnet}" || continue
+		free=$((free + 1))
+	done
+	echo "${free}"
+}
+
 # Every node is a container on the cluster's network running an entrypoint
 # role.
 run_node() {
@@ -707,6 +727,23 @@ ip_in_cidr() { # <ip> <cidr>
 	netn=$(ip_to_int "${cidr%/*}")
 	mask=$(((0xFFFFFFFF << (32 - 10#${prefix})) & 0xFFFFFFFF))
 	(((ipn & mask) == (netn & mask)))
+}
+
+# True when $1 is a usable host address inside CIDR $2 (in range and not
+# the network, gateway or broadcast address). Non-fatal counterpart of
+# require_host_ip, used to count free addresses before a scale operation.
+is_usable_host_ip() { # <ip> <cidr>
+	local ip=$1 cidr=$2
+	local prefix=${cidr##*/}
+	local ipn netn mask gateway broadcast
+	# shellcheck disable=SC2310
+	ip_in_cidr "${ip}" "${cidr}" || return 1
+	ipn=$(ip_to_int "${ip}")
+	netn=$(ip_to_int "${cidr%/*}")
+	mask=$(((0xFFFFFFFF << (32 - 10#${prefix})) & 0xFFFFFFFF))
+	gateway=$((netn + 1))
+	broadcast=$((netn | (~mask & 0xFFFFFFFF)))
+	((ipn != netn && ipn != gateway && ipn != broadcast))
 }
 
 # Die unless $1 is a usable host address inside CIDR $2: in range and not
@@ -1036,6 +1073,7 @@ reconcile_cluster() {
 	local workers="$1" masters="$2" workers_set="$3" masters_set="$4"
 	local existing_masters existing_workers desired_masters desired_workers
 	local name address node_addr i idx lb_ip backends worker_list master_list node_list
+	local add_masters=0 add_workers=0 needed free
 	local -a current_workers=() current_masters=()
 	existing_masters=$(count_masters)
 	existing_workers=$(count_workers)
@@ -1057,6 +1095,20 @@ reconcile_cluster() {
 	MASTER_IP=$(node_address "${MASTER_NAME}")
 	MASTER_IP="${MASTER_IP:-${NET_SUBNET%.*}.2}"
 	lb_ip=$(lb_node_ip "${NET_SUBNET}")
+	# Refuse an impossible scale before adding anything: a failure halfway
+	# through leaves a partially changed topology behind.
+	if [[ ${desired_masters} -gt ${existing_masters} ]]; then
+		add_masters=$((desired_masters - existing_masters))
+	fi
+	if [[ ${desired_workers} -gt ${existing_workers} ]]; then
+		add_workers=$((desired_workers - existing_workers))
+	fi
+	needed=$((add_masters + add_workers))
+	if [[ ${needed} -gt 0 ]]; then
+		free=$(count_free_node_ips "${NET_SUBNET}" "${lb_ip}")
+		[[ ${free} -ge ${needed} ]] \
+			|| die "not enough free addresses for ${needed} new node(s): only ${free} available in the master's /24 (lower --workers/--masters or change --master-ip)"
+	fi
 	# A single-master cluster created with enough workers can have one on
 	# the LB's reserved address (the creation-time formula only checks that
 	# collision when the LB already exists). Refuse the HA transition
