@@ -3,8 +3,8 @@
 # e2e - end-to-end tests for the zek image.
 #
 # Builds nothing: point it at an image that already exists (make build).
-# Every test creates its own main cluster (e2e-<test>), asserts, then
-# destroys it; a few tests also create short-lived helper clusters/networks.
+# Most tests create their own main cluster (e2e-<test>), assert, then
+# destroy it; a few tests also create short-lived helper clusters/networks.
 #
 # Usage:
 #   ./e2e.sh [flags] [test ...]   run the given tests, or all of them
@@ -42,14 +42,15 @@
 #   multi-master-recovery
 #                  2 masters + 1 worker: `zek down`/`up` restarts in
 #                  dependency order incl. the LB and its live haproxy
-#                  config
+#                  config, and workers scale with the LB present
 #   topology       one master + LB created with --lb (the LB is the kubeadm
 #                  endpoint): growing to two masters adds an etcd member and
 #                  a backend line; scaling down to one keeps the LB and its
-#                  endpoint (kubeconfigs untouched) and shrinks the
-#                  backends; a removed LB container is recreated by a bare
-#                  up via master-1's creation marker, and workers still
-#                  scale with the LB present
+#                  endpoint (admin.conf and the cluster records untouched)
+#                  and shrinks the
+#                  backends; a removed or misplaced LB container is
+#                  recreated by a bare up, and the cluster grows back after
+#                  the scale-down
 #   multi-worker   1 master + 2 workers: every node's kubelet/containerd
 #                  work (hostNetwork DaemonSet lands on all 3 nodes), the
 #                  inotify instance quota was raised for big clusters, each
@@ -76,13 +77,16 @@
 #                  worker
 #   smoke-3        loud error paths (host/network/gateway/broadcast/
 #                  outside IPs for masters and workers, workers landing on
-#                  the LB address with and without --lb, subnet reuse, size
+#                  the LB address with multiple masters or --lb, subnet
+#                  reuse, size
 #                  bounds, trailing args, e2e selection incl. ZEK_TIMEOUT),
 #                  entrypoint flags incl. node `--` and the kubectl wait
 #                  timeout, the creds-less/bad-token join paths, every up
 #                  spelling (including scaling workers up and back down),
-#                  and the refusal to scale masters without an LB or to
-#                  retrofit --lb onto an existing cluster
+#                  the refusal to scale masters without an LB or to
+#                  retrofit --lb onto an existing cluster, leftover-LB
+#                  cleanup on a no-LB create, the live-cluster --subnet
+#                  mismatch, and entrypoint env-twin validation
 #   smoke-4        the --timeout bound (a dead API and a node that never
 #                  registers), static-IP start retries while the address
 #                  is held, status/down on a stopped cluster (`-` health
@@ -109,16 +113,17 @@
 #                  interrupted control-plane join on a second master is
 #                  covered in multi-master instead
 #
-# Tests run in parallel: ZEK_E2E_JOBS tests at a time (each owns its main
-# cluster and pre-allocated subnet; helper clusters/networks are
-# short-lived). They share one scratch dir - only result/diag/kubeconfig
-# files are per-test - and one docker daemon. Failures never abort the
-# pool - all requested tests run, then diagnostics and the verdict are
-# printed.
+# Tests run in parallel: ZEK_E2E_JOBS tests at a time (each requested test
+# owns a pre-allocated subnet, and most create their own main cluster;
+# helper clusters/networks are short-lived). They share one scratch dir -
+# only result/diag/kubeconfig files are per-test - and one docker daemon.
+# Failures never abort the pool - all requested tests run, then diagnostics
+# and the verdict are printed.
 # ZEK_E2E_JOBS/ZEK_E2E_TIMEOUT/ZEK_TIMEOUT are validated before the
 # stale-cluster sweep runs, so a bad value dies without destroying
 # anything. ZEK_SUBNET is not an e2e flag: the runner pre-allocates one
-# subnet per test and passes it through to zek.sh (parallel `up` calls
+# subnet per requested test (when ZEK_E2E_JOBS > 1) and passes it through to
+# zek.sh (parallel `up` calls
 # would otherwise race pick_subnet). ZEK_WORKERS/ZEK_MASTERS likewise
 # pass straight through to `zek up` when set.
 #
@@ -126,15 +131,15 @@
 # wins when both are set; value flags take --flag value or --flag=value):
 #   --image IMAGE            image under test (ZEK_IMAGE, default zek:latest)
 #   --timeout SECONDS        per-wait budget inside zek.sh (ZEK_TIMEOUT,
-#                            default 360)
+#                            1-86400, default 360)
 #   --e2e-timeout SECONDS    budget for kubectl waits (ZEK_E2E_TIMEOUT,
-#                            default 360: leaves time for bring-up and
-#                            cleanup inside the 10-minute CI job)
+#                            1-86400, default 360: leaves time for bring-up
+#                            and cleanup inside the 10-minute CI job)
 #   --e2e-tests LIST         comma separated test list (ZEK_E2E_TESTS; same
 #                            as the args; cannot be combined with positional
 #                            test names)
 #   --e2e-jobs N             tests to run in parallel (ZEK_E2E_JOBS,
-#                            default 2; 1 = serial)
+#                            1-64, default 2; 1 = serial)
 #   --e2e-keep-on-fail       leave the failed cluster running for debugging
 #                            (ZEK_E2E_KEEP_ON_FAIL=1; bare or =1)
 #   --cilium-version VER     cilium version to install (ZEK_CILIUM_VERSION;
@@ -1268,7 +1273,7 @@ test_multi_master() {
 		|| fail "${cluster}: aborted create did not create the load balancer"
 	lb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster}-lb")
 	# Only the LB and the network stay behind, like a create that died
-	# after its first node. All four names are removed defensively.
+	# after its first node. The three master names are removed defensively.
 	docker rm -f "${cluster}-master-1" "${cluster}-master-2" "${cluster}-master-3" \
 		> /dev/null 2>&1 || true
 	# shellcheck disable=SC2310
@@ -1371,15 +1376,12 @@ EOF
 	log "${cluster}: HA - stop master-3, the cluster must keep serving"
 	docker stop "${cluster}-master-3" > /dev/null
 	wait_for "${cluster}: API serves with master-3 stopped (etcd quorum)" 120 readyz_ok "${cluster}"
-	start_containers "${cluster}-master-3"
-	wait_for "${cluster}: apiserver on master-3 serving again" 300 master_readyz "${cluster}" 3
-	wait_for "${cluster}: control plane readyz after restart" 120 readyz_ok "${cluster}"
 
-	# Losing 2 of 3 breaks quorum: readyz must stop answering (proving
-	# the single-stop survival above was quorum, not luck), then both
-	# masters rejoin and the cluster serves again.
-	log "${cluster}: HA - stop master-2 and master-3, quorum must break"
-	docker stop "${cluster}-master-2" "${cluster}-master-3" > /dev/null
+	# Losing 2 of 3 breaks quorum: keep master-3 down and stop master-2.
+	# readyz must stop answering (proving the single-stop survival above
+	# was quorum, not luck), then both masters rejoin and it serves again.
+	log "${cluster}: HA - stop master-2 with master-3 down, quorum must break"
+	docker stop "${cluster}-master-2" > /dev/null
 	wait_for "${cluster}: API stops answering without etcd quorum" 120 readyz_down "${cluster}"
 	start_containers "${cluster}-master-2" "${cluster}-master-3"
 	wait_for "${cluster}: apiserver on master-2 serving again" 300 master_readyz "${cluster}" 2
@@ -1402,8 +1404,8 @@ EOF
 	wait_for "${cluster}: live etcd membership after join recovery" 180 \
 		etcd_member_count_is "${cluster}" 3
 	# A joining master must never rotate the published credentials on
-	# resume: nothing of the set may exist on its layer, and its logs
-	# must not show a republish.
+	# resume: the token must not exist on its layer, and its logs must not
+	# show a republish.
 	docker exec "${cluster}-master-2" test ! -f /etc/cluster/token \
 		|| fail "${cluster}: join-master published credentials it must not rotate"
 	# shellcheck disable=SC2310
@@ -1414,11 +1416,11 @@ EOF
 
 # HA restart recovery, split out of multi-master so both entries stay below
 # the suite's ten-minute budget. Two masters are enough for the LB endpoint,
-# restart ordering, kubeconfig persistence and the live haproxy config; the
-# interrupted control-plane join needs a third etcd member and stays in
-# multi-master.
+# restart ordering, kubeconfig persistence, live haproxy config and worker
+# scaling with an LB; the interrupted control-plane join needs a third etcd
+# member and stays in multi-master.
 test_multi_master_recovery() {
-	local cluster=$1 out lb_ip
+	local cluster=$1 out lb_ip worker_ip
 	up "${cluster}" 1 2
 	wait_for "${cluster}: initial node count" "${ZEK_E2E_TIMEOUT}" \
 		node_count_is "${cluster}" 3
@@ -1445,6 +1447,12 @@ test_multi_master_recovery() {
 	container_running "${cluster}-lb" || fail "${cluster}: load balancer not running after down/up"
 	assert_cmd "${cluster}: endpoint after down/up" "${lb_ip}:6443" \
 		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+	docker exec "${cluster}-master-1" grep -qF "https://${lb_ip}:6443" \
+		/etc/kubernetes/admin.conf \
+		|| fail "${cluster}: admin.conf lost the LB after down/up"
+	docker exec "${cluster}-worker-1" grep -qF "https://${lb_ip}:6443" \
+		/etc/kubernetes/kubelet.conf \
+		|| fail "${cluster}: worker kubelet.conf lost the LB after down/up"
 	# The LB config carries the long-lived stream timeouts port-forward
 	# needs; assert them on the live file, not just via the stream in
 	# multi-master.
@@ -1462,16 +1470,40 @@ test_multi_master_recovery() {
 		|| fail "${cluster}: haproxy stats page does not serve"
 	docker exec "${cluster}-lb" haproxy -c -f /etc/haproxy/haproxy.cfg \
 		|| fail "${cluster}: live haproxy.cfg fails haproxy -c"
+
+	# Workers scale with the LB present, without changing its backends or
+	# moving the surviving worker.
+	log "${cluster}: workers scale with the LB present"
+	worker_ip=$(container_ip "${cluster}-worker-1")
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 2 2>&1) \
+		|| fail "${cluster}: adding a worker with an LB failed: ${out}"
+	wait_for "${cluster}: node count after adding a worker" "${ZEK_E2E_TIMEOUT}" \
+		node_count_is "${cluster}" 4
+	assert_cmd "${cluster}: LB backends after adding a worker" 2 \
+		lb_backend_count "${cluster}"
+	assert_cmd "${cluster}: worker-1 kept its address while scaling" "${worker_ip}" \
+		container_ip "${cluster}-worker-1"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --workers 1 2>&1) \
+		|| fail "${cluster}: removing a worker with an LB failed: ${out}"
+	wait_for "${cluster}: node count after removing a worker" "${ZEK_E2E_TIMEOUT}" \
+		node_count_is "${cluster}" 3
+	assert_cmd "${cluster}: LB backends after removing a worker" 2 \
+		lb_backend_count "${cluster}"
+	assert_cmd "${cluster}: worker-1 kept its address after removal" "${worker_ip}" \
+		container_ip "${cluster}-worker-1"
+	wait_for "${cluster}: control plane readyz after worker scaling" 120 readyz_ok "${cluster}"
 }
 
 # Topology and LB recovery on a cluster created with one master plus an LB
 # (--lb): the LB is the kubeadm endpoint from init, so the control plane can
 # be scaled both ways. Creating it with one master avoids a join; one grow,
-# one shrink and one LB recreate keep this within the CI budget. Worker
-# scaling is covered by the other cluster tests and costs a full node join
-# here.
+# one shrink, the removed/misplaced-LB rebuilds and the final re-grow keep
+# this within the CI budget. Worker scaling with an LB lives in
+# multi-master-recovery; smoke-3 covers the no-LB case.
 test_topology() {
-	local cluster=$1 out lb_ip master1_ip master2_ip subnet_prefix
+	local cluster=$1 out lb_ip master1_ip master2_ip subnet_prefix marker_env
 	./zek.sh --cluster "${cluster}" --lb up --workers 0 --masters 1 \
 		|| fail "${cluster}: creating one master with --lb failed"
 	wait_for "${cluster}: initial node count" "${ZEK_E2E_TIMEOUT}" \
@@ -1483,9 +1515,15 @@ test_topology() {
 		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
 	# The creation-time marker is what lets a later up recognise the cluster
 	# as LB-backed even when the LB container is gone.
-	docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cluster}-master-1" \
-		| grep -qF "ZEK_LB_ENDPOINT=${lb_ip}:6443" \
+	marker_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cluster}-master-1")
+	[[ ${marker_env} == *"ZEK_LB_ENDPOINT=${lb_ip}:6443"* ]] \
 		|| fail "${cluster}: master-1 misses the creation-time LB marker"
+	# --lb on a cluster that already has an LB is a no-op.
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" --lb up 2>&1) \
+		|| fail "${cluster}: --lb on an LB-backed cluster failed: ${out}"
+	assert_cmd "${cluster}: endpoint after the --lb no-op" "${lb_ip}:6443" \
+		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
 
 	# Grow into HA: the second master joins behind the LB and its etcd
 	# member and backend line appear.
@@ -1526,6 +1564,8 @@ test_topology() {
 		|| fail "${cluster}: LB is missing the surviving master"
 	wait_for "${cluster}: control plane readyz after scaling to one master" \
 		180 readyz_ok "${cluster}"
+	assert_cmd "${cluster}: etcd members after scaling to one master" 1 \
+		etcd_member_count "${cluster}"
 	# Nothing rewrote the endpoint: admin.conf and the cluster records
 	# still name the LB. A regression to the old master-1 migration (which
 	# turned the LB off on scale-down) would fail one of these.
@@ -1541,6 +1581,10 @@ test_topology() {
 	zk "${cluster}" kubectl -n kube-public get configmap cluster-info -o yaml \
 		| grep -qF "${lb_ip}:6443" \
 		|| fail "${cluster}: cluster-info stopped pointing at the LB"
+	# shellcheck disable=SC2310
+	zk "${cluster}" kubectl -n kube-system get configmap kube-proxy -o yaml \
+		| grep -qF "${lb_ip}:6443" \
+		|| fail "${cluster}: kube-proxy stopped pointing at the LB"
 
 	# Recovery: removing the LB container must not lock the master count.
 	# The marker keeps the cluster LB-backed, so a bare up recreates it.
@@ -1549,6 +1593,9 @@ test_topology() {
 	if docker inspect "${cluster}-lb" > /dev/null 2>&1; then
 		fail "${cluster}: could not remove the LB for the recovery probe"
 	fi
+	# Stop the cluster too: the marker is what keeps cluster_has_lb correct
+	# while the master is not running.
+	zk "${cluster}" down
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up 2>&1) \
 		|| fail "${cluster}: up did not recover the removed LB: ${out}"
@@ -1560,27 +1607,39 @@ test_topology() {
 		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
 	wait_for "${cluster}: control plane readyz after LB recovery" 120 readyz_ok "${cluster}"
 
-	# Workers scale with the LB present too, without changing its backends
-	# or the endpoint.
-	log "${cluster}: topology - workers scale on an LB-backed cluster"
+	# A manually moved LB is rebuilt on its reserved address instead of
+	# started where the endpoint cannot reach it.
+	log "${cluster}: topology - an LB on the wrong address is rebuilt"
+	docker network disconnect "${cluster}-net" "${cluster}-lb" > /dev/null
+	docker network connect --ip "${subnet_prefix}.11" "${cluster}-net" "${cluster}-lb" > /dev/null
 	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up --workers 1 2>&1) \
-		|| fail "${cluster}: adding a worker with an LB failed: ${out}"
-	wait_for "${cluster}: node count after adding a worker" "${ZEK_E2E_TIMEOUT}" \
+	out=$(zk "${cluster}" up 2>&1) \
+		|| fail "${cluster}: up did not rebuild the misplaced LB: ${out}"
+	assert_cmd "${cluster}: LB back on its reserved address" "${lb_ip}" \
+		container_ip "${cluster}-lb"
+	assert_cmd "${cluster}: endpoint after the LB rebuild" "${lb_ip}:6443" \
+		docker exec "${cluster}-master-1" cat /etc/cluster/api-endpoint
+	wait_for "${cluster}: control plane readyz after the LB rebuild" 120 readyz_ok "${cluster}"
+
+	# The scale-down is not one-way: with the LB still there, the cluster
+	# grows back into HA and the freed master address is reused.
+	log "${cluster}: topology - grow back after the scale-down"
+	# shellcheck disable=SC2310
+	out=$(zk "${cluster}" up --masters 2 2>&1) \
+		|| fail "${cluster}: growing back after the scale-down failed: ${out}"
+	wait_for "${cluster}: node count after growing back" "${ZEK_E2E_TIMEOUT}" \
 		node_count_is "${cluster}" 2
-	assert_cmd "${cluster}: containers after adding a worker" 3 running_count "${cluster}"
-	assert_cmd "${cluster}: worker-1 took the first free address" "${subnet_prefix}.3" \
-		container_ip "${cluster}-worker-1"
-	assert_cmd "${cluster}: LB backends after adding a worker" 1 \
-		lb_backend_count "${cluster}"
+	assert_cmd "${cluster}: containers after growing back" 3 running_count "${cluster}"
 	# shellcheck disable=SC2310
-	out=$(zk "${cluster}" up --workers 0 2>&1) \
-		|| fail "${cluster}: removing a worker with an LB failed: ${out}"
-	wait_for "${cluster}: node count after removing a worker" "${ZEK_E2E_TIMEOUT}" \
-		node_count_is "${cluster}" 1
-	assert_cmd "${cluster}: containers after removing a worker" 2 running_count "${cluster}"
-	assert_cmd "${cluster}: LB backends after removing a worker" 1 \
+	container_running "${cluster}-lb" \
+		|| fail "${cluster}: growing back removed the LB"
+	assert_cmd "${cluster}: re-added master kept its address" "${master2_ip}" \
+		container_ip "${cluster}-master-2"
+	wait_for "${cluster}: stacked etcd grew back to 2 members" 180 \
+		etcd_member_count_is "${cluster}" 2
+	assert_cmd "${cluster}: LB backends after growing back" 2 \
 		lb_backend_count "${cluster}"
+	wait_for "${cluster}: control plane readyz after growing back" 120 readyz_ok "${cluster}"
 }
 
 test_multi_worker() {
@@ -2337,6 +2396,21 @@ test_smoke_2() {
 	# seconds after registration; probe_pod_cidr_is polls for the value.
 	wait_for "${cluster}: --pod-cidr reached the node spec" 120 \
 		probe_pod_cidr_is "${probe_cluster}" "${probe_pod_cidr}"
+	# A single-master cluster has no LB, so .10 is a normal host address.
+	# Occupy .3-.9 on the probe network, then the next worker must take
+	# .10: the allocator must not reserve the address for an LB that does
+	# not exist. The holders use the node image itself (no extra pull).
+	log "${cluster}: single-master scaling may use the LB address"
+	for octet in 3 4 5 6 7 8 9; do
+		docker run -d --name "${probe_cluster}-hold-${octet}" \
+			--network "${probe_cluster}-net" --ip "172.20.250.${octet}" \
+			--entrypoint sleep "${ZEK_IMAGE}" 300 > /dev/null \
+			|| fail "${cluster}: cannot reserve 172.20.250.${octet}"
+	done
+	env -u ZEK_SUBNET ./zek.sh --cluster "${probe_cluster}" up --workers 1 \
+		|| fail "${cluster}: single-master growth to .10 failed"
+	assert_cmd "${cluster}: single-master worker used .10" "172.20.250.10" \
+		container_ip "${probe_cluster}-worker-1"
 	./zek.sh --cluster "${probe_cluster}" destroy > /dev/null 2>&1 || true
 	assert_eq "${cluster}: --subnet reached the network" "${probe_subnet}" "${actual_subnet}"
 	assert_eq "${cluster}: --master-ip reached the master" "${probe_master_ip}" "${actual_ip}"
@@ -2346,10 +2420,11 @@ test_smoke_2() {
 	# master .18, worker-1 .19, so the new worker-2 must get .20. Then the
 	# same /28 refuses an impossible growth before touching the topology:
 	# it has thirteen hosts (.18-.30); with .18/.19/.20 taken only ten are
-	# left, fewer than the twelve new workers a scale to 14 needs. The
-	# creation's explicit --subnet wins over this job's pre-allocated
-	# ZEK_SUBNET (the main cluster's /24), but the later scalings do not
-	# repeat the flag, so env -u is what keeps them on the tiny subnet.
+	# left, fewer than the twelve new workers a scale to 14 needs. The probe
+	# commands unset this job's pre-allocated ZEK_SUBNET (env -u): the
+	# creation passes --subnet explicitly, and the later scalings would
+	# otherwise inherit this job's pre-allocated /24 instead of the tiny
+	# subnet.
 	log "${cluster}: scaling in a narrow, offset subnet"
 	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" --subnet 172.20.248.16/28 \
 		--master-ip 172.20.248.18 up --workers 1 --masters 1 \
@@ -2366,38 +2441,17 @@ test_smoke_2() {
 		"cannot scale masters without a load balancer" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --masters 2
 	assert_die "${cluster}: HA create with an unusable LB address" \
-		"load balancer" \
+		"is outside the cluster subnet" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny-lb" \
 		--subnet 172.20.248.16/28 --master-ip 172.20.248.18 up --masters 2
 	assert_die "${cluster}: scale beyond the free address range" \
 		"not enough free addresses" \
 		env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny" up --workers 14
 	./zek.sh --cluster "${cluster}--tiny" destroy > /dev/null 2>&1 || true
-	# A single-master cluster has no LB, so .10 is a normal host address.
-	# Occupy .4-.9 with containers on the network (they count as reserved
-	# addresses without paying for six more node registrations), then the
-	# next real worker must take .10. The preflight must not keep reserving
-	# the address for a nonexistent LB. destroy removes the placeholders
-	# because it removes every container on the cluster network.
-	log "${cluster}: single-master scaling may use the LB address"
-	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" --subnet 172.20.249.0/28 \
-		--master-ip 172.20.249.2 up --workers 1 --masters 1 \
-		> /dev/null 2>&1 || fail "${cluster}: cannot create the .10 probe cluster"
-	for octet in 4 5 6 7 8 9; do
-		docker run -d --name "${cluster}--tiny10-hold-${octet}" \
-			--network "${cluster}--tiny10-net" --ip "172.20.249.${octet}" \
-			busybox:latest sleep 300 > /dev/null \
-			|| fail "${cluster}: cannot reserve 172.20.249.${octet}"
-	done
-	env -u ZEK_SUBNET ./zek.sh --cluster "${cluster}--tiny10" up --workers 2 \
-		|| fail "${cluster}: single-master growth to .10 failed"
-	assert_cmd "${cluster}: single-master worker used .10" "172.20.249.10" \
-		container_ip "${cluster}--tiny10-worker-2"
-	./zek.sh --cluster "${cluster}--tiny10" destroy > /dev/null 2>&1 || true
 }
 
 test_smoke_3() {
-	local cluster=$1 out role join_ca_hash join_api_endpoint master1_ip main_subnet other_subnet
+	local cluster=$1 out role join_ca_hash join_api_endpoint master1_ip main_subnet other_subnet marker_env
 	# The entrypoint and join probes below need a real node; every loud
 	# error path between them must leave this cluster untouched.
 	up "${cluster}" 1 1
@@ -2421,6 +2475,12 @@ test_smoke_3() {
 		./zek.sh --subnet 172.020.0.0/24 status
 	assert_die "${cluster}: leading-zero prefix" "invalid subnet" \
 		./zek.sh --subnet 172.20.0.0/08 status
+	assert_die "${cluster}: /0 subnet" "invalid subnet" \
+		./zek.sh --subnet 0.0.0.0/0 status
+	assert_die "${cluster}: non-canonical subnet" "expected the network address" \
+		./zek.sh --subnet 10.99.0.5/24 status
+	assert_die "${cluster}: non-canonical pod CIDR" "expected the network address" \
+		./zek.sh --pod-cidr 10.244.0.5/16 status
 	assert_die "${cluster}: master colliding with the LB IP" "load balancer's IP" \
 		env ZEK_MASTERS=9 ./zek.sh --cluster "${cluster}-lbcol" up
 	assert_die "${cluster}: duplicate test names" "requested twice" \
@@ -2443,12 +2503,20 @@ test_smoke_3() {
 		env ZEK_E2E_JOBS=99 ./e2e.sh
 	assert_die "${cluster}: oversized ZEK_E2E_TIMEOUT" "ZEK_E2E_TIMEOUT must be an integer 1-86400" \
 		env ZEK_E2E_TIMEOUT=999999 ./e2e.sh
+	assert_die "${cluster}: oversized ZEK_TIMEOUT" "ZEK_TIMEOUT must be an integer 1-86400" \
+		env ZEK_TIMEOUT=99999 ./e2e.sh
+	assert_die "${cluster}: overflowing ZEK_E2E_JOBS" "ZEK_E2E_JOBS must be an integer 1-64" \
+		env ZEK_E2E_JOBS=9223372036854775808 ./e2e.sh
 	assert_die "${cluster}: empty --image" "--image needs a value" \
 		./zek.sh --image= status
+	assert_die "${cluster}: empty --cluster" "--cluster needs a cluster name" \
+		./zek.sh --cluster= status
+	assert_die "${cluster}: empty --timeout" "--timeout needs a number of seconds" \
+		./zek.sh --timeout= status
 	assert_die "${cluster}: invalid --timeout" "invalid timeout" \
 		./zek.sh --timeout abc status
 	assert_die "${cluster}: oversized --timeout" "invalid timeout" \
-		./zek.sh --timeout 999999 status
+		./zek.sh --timeout 99999 status
 	assert_die "${cluster}: invalid cluster name" "invalid cluster name" \
 		./zek.sh --cluster "bad name" status
 	# The up-only numbers are validated in cmd_up after the flag > env
@@ -2479,8 +2547,6 @@ test_smoke_3() {
 		assert_die "${cluster}: ${flag}= with an empty value" "needs a value" \
 			./zek.sh "${flag}="
 	done
-	assert_die "${cluster}: --image= with an empty value" "--image needs a value" \
-		./zek.sh --image= status
 	assert_die "${cluster}: --workers non-numeric" "invalid workers 'abc'" \
 		zk "${cluster}" up --workers abc
 	assert_die "${cluster}: --masters non-numeric" "invalid masters 'abc'" \
@@ -2524,6 +2590,14 @@ test_smoke_3() {
 	assert_die "${cluster}: --lb master on the load balancer" "load balancer's IP" \
 		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 \
 		--master-ip 172.20.250.10 --lb up --workers 0 --masters 1
+	assert_die "${cluster}: ZEK_LB reserves the load balancer IP" "load balancer's IP" \
+		env ZEK_LB=1 ./zek.sh --cluster "${cluster}-nope" --subnet 172.20.250.0/24 \
+		--master-ip 172.20.250.10 up --workers 0 --masters 1
+	# The derived address must be a real dotted quad: on a /16 the walk can
+	# overflow the last octet, which must die before a network is created.
+	assert_die "${cluster}: worker octet overflow" "invalid worker 2" \
+		./zek.sh --cluster "${cluster}-nope" --subnet 172.20.0.0/16 \
+		--master-ip 172.20.0.254 up --workers 2 --masters 1
 	# Reusing an existing network with a disagreeing --subnet must die
 	# instead of deriving container IPs from the wrong subnet: simulate a
 	# retry after a failed create (network exists, master does not).
@@ -2552,18 +2626,20 @@ test_smoke_3() {
 	docker network create --driver bridge --subnet 172.31.251.0/24 "${cluster}--stale-net" > /dev/null \
 		|| fail "${cluster}: cannot create stale-LB network (subnet taken?)"
 	docker run -d --name "${cluster}--stale-lb" --network "${cluster}--stale-net" \
-		--ip 172.31.251.3 busybox:latest sleep 60 > /dev/null \
+		--ip 172.31.251.3 --entrypoint sleep "${ZEK_IMAGE}" 300 > /dev/null \
 		|| fail "${cluster}: cannot create the stale LB container"
 	docker run -d --name "${cluster}--stale-hold" --network "${cluster}--stale-net" \
-		--ip 172.31.251.2 busybox:latest sleep 60 > /dev/null \
+		--ip 172.31.251.2 --entrypoint sleep "${ZEK_IMAGE}" 300 > /dev/null \
 		|| fail "${cluster}: cannot hold the master address"
+	# The held IP triggers the retryable error; timeout 15 bounds that
+	# budget and the removal log proves remove_lb ran first.
 	assert_die "${cluster}: no-LB create removes the leftover LB" \
-		"Address already in use" \
-		./zek.sh --cluster "${cluster}--stale" --subnet 172.31.251.0/24 up --workers 0 --masters 1
+		"removing ${cluster}--stale-lb" \
+		timeout 15 ./zek.sh --cluster "${cluster}--stale" --subnet 172.31.251.0/24 up --workers 0 --masters 1
 	if docker inspect "${cluster}--stale-lb" > /dev/null 2>&1; then
 		fail "${cluster}: no-LB create kept the leftover LB"
 	fi
-	docker rm -f "${cluster}--stale-hold" > /dev/null
+	docker rm -f "${cluster}--stale-master-1" "${cluster}--stale-hold" > /dev/null 2>&1 || true
 	docker network rm "${cluster}--stale-net" > /dev/null 2>&1 || true
 	# Up-only size bounds: range, leading zeros (octal trap) and empty.
 	assert_die "${cluster}: --workers out of range" "out of range" \
@@ -2667,6 +2743,10 @@ test_smoke_3() {
 		docker exec -e NO_HOST_MODULES=2 "${cluster}-master-1" /entrypoint.sh kubectl get nodes
 	assert_die "${cluster}: WAIT_TIMEOUT env is validated" "invalid WAIT_TIMEOUT" \
 		docker exec -e WAIT_TIMEOUT=0 "${cluster}-master-1" /entrypoint.sh kubectl get nodes
+	assert_die "${cluster}: non-numeric WAIT_TIMEOUT env" "invalid WAIT_TIMEOUT" \
+		docker exec -e WAIT_TIMEOUT=abc "${cluster}-master-1" /entrypoint.sh kubectl get nodes
+	assert_die "${cluster}: oversized WAIT_TIMEOUT env" "invalid WAIT_TIMEOUT" \
+		docker exec -e WAIT_TIMEOUT=99999 "${cluster}-master-1" /entrypoint.sh kubectl get nodes
 	out=$(docker exec -e MASTER_JOIN=2 -e NO_HOST_MODULES=2 "${cluster}-master-1" \
 		/entrypoint.sh kubectl --master-join --no-host-modules \
 		--kubeconfig /etc/cluster/admin.conf get nodes 2>&1) \
@@ -2796,8 +2876,8 @@ test_smoke_3() {
 	# twins, and the bare-number shorthand. On an existing cluster these
 	# are desired counts, not creation-time only: a shorthand grows the
 	# worker count and 0 shrinks it. This cluster was created with one
-	# master, so HA growth must be refused (below); master add/remove on
-	# an HA-created cluster is covered by topology.
+	# master, so master scaling must be refused (below); master scaling on
+	# an LB-backed cluster is covered by topology.
 	# shellcheck disable=SC2310
 	out=$(zk "${cluster}" up --workers=1 --masters=1 2>&1) \
 		|| fail "${cluster}: up --flag=value failed: ${out}"
@@ -2826,8 +2906,19 @@ test_smoke_3() {
 	assert_cmd "${cluster}: containers after env worker shrink" 1 running_count "${cluster}"
 	# A single-master cluster without an LB has its master count locked:
 	# the refusal must leave the cluster exactly as it was, while workers
-	# stay scalable (exercised above).
+	# stay scalable (exercised above). A flag must be able to override a
+	# bad env twin (boolean or value), so these succeed.
+	out=$(env ZEK_LATEST=2 ./zek.sh --latest --cluster "${cluster}" status 2>&1) \
+		|| fail "${cluster}: --latest did not override a bad ZEK_LATEST: ${out}"
+	out=$(env ZEK_LB=2 ./zek.sh --lb --cluster "${cluster}" status 2>&1) \
+		|| fail "${cluster}: --lb did not override a bad ZEK_LB: ${out}"
+	out=$(env ZEK_TIMEOUT=abc ./zek.sh --timeout 60 --cluster "${cluster}" status 2>&1) \
+		|| fail "${cluster}: --timeout did not override a bad ZEK_TIMEOUT: ${out}"
 	master1_ip=$(container_ip "${cluster}-master-1")
+	marker_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cluster}-master-1")
+	if [[ ${marker_env} == *$'\nZEK_LB_ENDPOINT='* || ${marker_env} == ZEK_LB_ENDPOINT=* ]]; then
+		fail "${cluster}: no-LB master carries the LB marker"
+	fi
 	assert_die "${cluster}: single-master cluster refuses master scaling" \
 		"cannot scale masters without a load balancer" \
 		zk "${cluster}" up --masters 2
@@ -3280,6 +3371,10 @@ alloc_subnets() { # want -> fills subnets
 			used_subnets="${used_subnets} ${subnet}"
 		done
 	done
+	# The tiny /28 is invisible to this exact-match /24 scan; the .250
+	# probe and .253 mismatch helper /24s are excluded up front so a helper
+	# created later cannot overlap an already-running main cluster.
+	used_subnets+=" 172.20.248.0/24 172.20.250.0/24 172.20.253.0/24"
 	subnets=()
 	for octet_idx in $(seq 0 254); do
 		candidate_subnet="172.20.${octet_idx}.0/24"

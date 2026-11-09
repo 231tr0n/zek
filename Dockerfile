@@ -77,8 +77,9 @@ COPY entrypoint.sh /entrypoint.sh
 # page; nodes -> containerd alive AND kubelet's healthz (both started by
 # entrypoint.sh, kubelet under its supervisor). The 120s start period
 # covers daemon startup; a slow kubeadm init/join can still take longer,
-# and the verdict is advisory. Node checks come first so a process bound to
-# :8404 inside a node cannot mask a dead containerd/kubelet.
+# and the verdict is advisory. Node checks run first; the :8404 stats
+# fallback is what makes the lb healthy, so a node process bound to :8404
+# can still satisfy it (the verdict stays advisory).
 # The continuation lines stay indented: dockerfmt -i 0 would otherwise
 # unindent them along with the heredoc bodies.
 # dockerfmt-ignore

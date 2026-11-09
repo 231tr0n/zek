@@ -85,10 +85,10 @@ updated by the build — check them when the bump fails or behaves oddly:
   logs (rebuild is the fix).
 
 Smoke-test the bump end-to-end on a clean host with
-`./zek.sh --cluster bump up --masters 2 --workers 1`: it exercises `kubeadm
-init`, a control-plane join (certificate key), a worker join, the load
-balancer and the published credentials in one run. Destroy it afterwards
-with `./zek.sh --cluster bump destroy`.
+`ZEK_IMAGE=zek:latest ./zek.sh --cluster bump up --masters 2 --workers 1`: it
+exercises `kubeadm init`, a control-plane join (certificate key), a worker
+join, the load balancer and the published credentials in one run. Destroy it
+afterwards with `./zek.sh --cluster bump destroy`.
 
 ## Quick start
 
@@ -182,8 +182,8 @@ network create loudly instead of overlapping.
 
 Every node gets a **static** address on the cluster network. At creation the
 masters walk up from `--master-ip` (default `<subnet>.2`) and the workers
-follow the last master, so `<subnet>.3` and `<subnet>.4` for the default
-one-master cluster.
+follow the last master, so `<subnet>.3` for the default one-master/one-worker
+cluster (`<subnet>.4` once a second worker is added).
 Without that, docker's dynamic pool would pick the addresses — and it hands
 them out in its own order after a host reboot, which moves a node out from
 under its kubelet certificate and its `Node` object. With an LB (more than one
@@ -205,7 +205,7 @@ variable. The flag wins when both are set. Global flags go before the command
 | Variable        | Flag          | Effect                                                                                                       |
 | --------------- | ------------- | ------------------------------------------------------------------------------------------------------------ |
 | `ZEK_CLUSTER`   | `--cluster`   | Cluster name (default `zek`)                                                                                 |
-| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (default `600`)                                                                       |
+| `ZEK_TIMEOUT`   | `--timeout`   | Wait budget in seconds (1-86400, default `600`)                                                              |
 | `ZEK_IMAGE`     | `--image`     | Node image (default: release-pinned GHCR image)                                                              |
 | `ZEK_LATEST`    | `--latest`    | Use the `latest` tag of the selected image repository (`0`/`1`, default `0`)                                 |
 | `ZEK_LB`        | `--lb`        | Create the LB even with one master, enabling later master scaling (`0`/`1`, default `0`; creation-time only) |
@@ -227,6 +227,10 @@ ZEK_MOUNTS="/srv/data:/mnt/data" ./zek.sh up # same, via environment
 Like `--image` and `--dns`, it only affects containers created afterwards —
 nodes added by a scaling `up`, `clean`, and a recreated LB. Existing
 containers are not recreated with these options.
+
+Both `--subnet` and `--pod-cidr` must be canonical network addresses: host
+bits zero, prefix 1-32, no leading zeros (`10.0.0.5/24` and `0.0.0.0/0` are
+rejected). `--timeout` accepts 1-86400 seconds.
 
 ## High availability (multiple masters, or `--lb`)
 
@@ -274,9 +278,9 @@ takes it out of rotation within seconds; `docker start` brings it back and
 it rejoins the cluster.
 
 The apiserver is also reachable directly at `https://<master-ip>:6443`, but
-the certificate covers the endpoint and each control-plane node's own
-address, not an arbitrary address on the cluster network, so use the
-endpoint — or `curl -k` — for direct checks.
+the serving certificate covers the control-plane endpoint and the address of
+the node it was issued for, not an arbitrary address on the cluster network,
+so use the endpoint — or `curl -k` — for direct checks.
 
 ## Install a CNI
 

@@ -11,8 +11,9 @@
 #   lb       haproxy in front of the control-plane nodes (started by the
 #            manager when the cluster has an LB: multiple masters, or --lb)
 #
-# Flags: every input env var can also be passed as a flag after the role
-# (the name in lower case with '_' as '-', e.g. POD_CIDR -> --pod-cidr); the
+# Flags: every input env var except WAIT_TIMEOUT can also be passed as a
+# flag after the role (the name in lower case with '_' as '-', e.g.
+# POD_CIDR -> --pod-cidr); the
 # flag wins when both are set (value flags take --flag value or
 # --flag=value; --master-join and --no-host-modules are bare booleans, also
 # accepted as --flag=1). Unknown arguments die on the node roles - only the
@@ -297,7 +298,7 @@ patch_kube_proxy() {
 # only reads its feature gates from this file): zek hands every node
 # container the host's cgroup hierarchy (--cgroupns=host in zek.sh), so the
 # kubelet's cgroup reads are not isolated to the pod it is looking at. With
-# the gate on (its default since k8s 1.34) the kubelet publishes the pod
+# the gate on (its default) the kubelet publishes the pod
 # cgroup's bogus actuated `cpu` - a constant read from the shared cgroup, not
 # the pod's - in every pod's status and then counts it in the node's own
 # admission accounting, where it grows past the node's capacity until every
@@ -327,8 +328,9 @@ ensure_kubelet_config() {
 # Keep kubelet alive and restart it when it exits. kubeadm writes its config
 # and flags file, and without systemd we feed the kubeconfig args ourselves.
 # The kubelet config appears mid-init (kubelet-start phase), not when init
-# completes; kubelet.conf marks a finished init/join. Init does not put
-# kubelet.conf on kubelet's default path, so it must always be passed on.
+# completes; kubelet.conf is written in the kubeconfig phase and marks the
+# node as configured. Init does not put kubelet.conf on kubelet's default
+# path, so it must always be passed on.
 kubelet_supervisor() {
 	trap 'exit 0' TERM INT
 	while :; do
@@ -808,7 +810,8 @@ run_kubectl() {
 }
 
 # Consume the configuration flags for the current role; every input env var
-# has a flag twin of the same name (see the header). What is left -
+# except WAIT_TIMEOUT has a flag twin of the same name (see the header). What
+# is left -
 # everything unrecognized, plus `--` and everything after it - stays in
 # ROLE_ARGS: for the kubectl role that is how kubectl arguments (and the
 # `--` delimiter itself, which kubectl needs for exec/attach) pass through;

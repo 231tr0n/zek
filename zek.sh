@@ -85,7 +85,8 @@ die() {
 # Shape-check an IPv4 value before it reaches docker (network create,
 # --dns) or shell arithmetic (master octet + index). Empty passes (the
 # caller's default applies); anything else must be four decimal octets
-# 0-255, with a /0-32 prefix required for cidr and forbidden for addr.
+# 0-255, with a canonical /1-32 prefix required for cidr and forbidden for
+# addr.
 # A typo dies here - called as a plain statement, before any container
 # exists - instead of mid-create leaving partial state behind.
 require_ipv4() { # <value> cidr|addr <label>
@@ -110,9 +111,11 @@ require_ipv4() { # <value> cidr|addr <label>
 	if [[ ${value} == */* ]]; then
 		local prefix=${value##*/}
 		# docker reads /08 as /8; reject the ambiguous spelling instead
-		# of silently creating a much larger network.
+		# of silently creating a much larger network. /0 is not a usable
+		# cluster network either (docker replaces it with its default
+		# pool), so require 1-32.
 		[[ ${prefix} != 0[0-9]* ]] || die "invalid ${label} '${value}' (${hint})"
-		((10#${prefix} <= 32)) || die "invalid ${label} '${value}' (${hint})"
+		((10#${prefix} >= 1 && 10#${prefix} <= 32)) || die "invalid ${label} '${value}' (${hint})"
 	fi
 	local -a parts=()
 	local octet
@@ -125,6 +128,17 @@ require_ipv4() { # <value> cidr|addr <label>
 			|| die "invalid ${label} '${value}' (${hint})"
 		((10#${octet} <= 255)) || die "invalid ${label} '${value}' (${hint})"
 	done
+	if [[ ${kind} == cidr ]]; then
+		# A CIDR whose address is not the network address (10.0.0.5/24)
+		# makes the network/gateway/broadcast math wrong, and docker
+		# rejects it only later with an unrelated message.
+		local net_int mask
+		net_int=$(((10#${parts[0]} << 24) | (10#${parts[1]} << 16) | (\
+			10#${parts[2]} << 8) | 10#${parts[3]}))
+		mask=$(((0xFFFFFFFF << (32 - 10#${value##*/})) & 0xFFFFFFFF))
+		(((net_int & mask) == net_int)) \
+			|| die "invalid ${label} '${value}' (expected the network address, e.g. 10.0.0.0/24)"
+	fi
 }
 
 # Script release version, independent of the pinned image version. Bump this
@@ -352,9 +366,12 @@ for mount_spec in "${mount_entries[@]}"; do
 done
 
 net_exists() { docker network inspect "${NET_NAME}" > /dev/null 2>&1; }
+# The network's IPv4 subnet (docker can list more than one IPAM config when
+# IPv6 is enabled; node addresses are IPv4 only).
 net_subnet_of() {
-	docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' \
-		"${NET_NAME}" 2> /dev/null || true
+	docker network inspect -f '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' \
+		"${NET_NAME}" 2> /dev/null \
+		| awk -F/ 'NF && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }' || true
 }
 # An existing network's subnet must be the requested --subnet: silently
 # deriving container addresses from a different subnet later would move a
@@ -382,6 +399,14 @@ ensure_net() {
 	fi
 	docker network create --driver bridge --subnet "${new_subnet}" "${NET_NAME}" > /dev/null \
 		|| die "cannot create network ${NET_NAME} with subnet ${new_subnet} (address space overlapping another network? pass --subnet/ZEK_SUBNET)"
+	# Never derive node addresses from a subnet docker silently replaced
+	# with its default pool.
+	local actual_subnet
+	actual_subnet=$(net_subnet_of)
+	if [[ ${actual_subnet} != "${new_subnet}" ]]; then
+		docker network rm "${NET_NAME}" > /dev/null 2>&1 || true
+		die "docker created network ${NET_NAME} with subnet ${actual_subnet:-none}, not ${new_subnet}"
+	fi
 }
 
 # First free 172.20.X.0/24 (or --subnet/ZEK_SUBNET when set) so parallel
@@ -429,8 +454,19 @@ cluster_has_lb() {
 	if node_exists "${LB_NAME}"; then
 		return 0
 	fi
-	docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${MASTER_NAME}" 2> /dev/null \
-		| grep -q '^ZEK_LB_ENDPOINT='
+	# Clusters created before the marker existed are treated as LB-backed
+	# when they have more than one master: the alternative would lock a
+	# multi-master cluster's control plane.
+	local masters
+	masters=$(count_masters)
+	if [[ ${masters} -gt 1 ]]; then
+		return 0
+	fi
+	# Capture the env first: piping a large inspect payload into `grep -q`
+	# can SIGPIPE the producer under pipefail and misclassify the cluster.
+	local envs
+	envs=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${MASTER_NAME}" 2> /dev/null) || return 1
+	[[ ${envs} == *$'\nZEK_LB_ENDPOINT='* || ${envs} == ZEK_LB_ENDPOINT=* ]]
 }
 
 # Containers attached to this cluster's network (running or stopped).
@@ -550,16 +586,12 @@ used_node_ips() {
 	done <<< "${container_list}"
 }
 
-# First free usable host address in the master's last octet for a new node.
-# Existing nodes keep their addresses, so this walks past everything already
-# reserved and, when a load balancer exists (non-empty $2), leaves its
-# address free too.
 # Free usable host addresses for a new node near MASTER_IP, one per line in
 # allocation order: existing reservations and the LB's address (non-empty
 # $2) are skipped, and candidates outside a narrower or offset --subnet are
-# ignored.
-free_node_ips() { # <subnet> <lb-ip>
-	local subnet=$1 lb_ip=$2 prefix="${MASTER_IP%.*}" used ip candidate
+# ignored. $3 limits the output (allocation needs only the first).
+free_node_ips() { # <subnet> <lb-ip> [max]
+	local subnet=$1 lb_ip=$2 max=${3:-254} prefix="${MASTER_IP%.*}" used ip candidate count=0
 	used=" $(used_node_ips | tr '\n' ' ') "
 	for candidate in $(seq 2 254); do
 		ip="${prefix}.${candidate}"
@@ -574,13 +606,16 @@ free_node_ips() { # <subnet> <lb-ip>
 		# shellcheck disable=SC2310
 		is_usable_host_ip "${ip}" "${subnet}" || continue
 		printf '%s\n' "${ip}"
+		count=$((count + 1))
+		[[ ${count} -ge ${max} ]] && return 0
 	done
+	return 0
 }
 
 # First free address alloc_node_ip can hand out.
 alloc_node_ip() { # <subnet> <lb-ip>
 	local ips first
-	ips=$(free_node_ips "$1" "$2")
+	ips=$(free_node_ips "$1" "$2" 1)
 	[[ -n ${ips} ]] \
 		|| die "no free host address left near ${MASTER_IP} for another node (destroy and recreate the cluster with a different --master-ip)"
 	first=${ips%%$'\n'*}
@@ -608,17 +643,23 @@ run_node() {
 # Create a node, retrying the same way: a removed container's static
 # endpoint can still be held by docker's async cleanup for a moment.
 run_node_retry() { # name role [args...]
-	local name=$1 i
+	local name=$1 i out last=""
 	shift
 	for i in {1..10}; do
 		# shellcheck disable=SC2310
-		if run_node "${name}" "$@"; then
+		if out=$(run_node "${name}" "$@" 2>&1); then
 			return 0
 		fi
+		last=${out}
+		# Drop whatever the failed attempt left behind (a run can fail
+		# after creating the container), then retry only the static-IP
+		# cleanup race; a bad image, mount or name is deterministic.
 		docker rm -f "${name}" > /dev/null 2>&1 || true
+		[[ ${last} == *"Address already in use"* ]] || break
 		sleep 2
 	done
-	log "failed to create ${name} after 10 tries"
+	printf '%s\n' "${last}" >&2
+	log "failed to create ${name} after ${i} attempt(s)"
 	return 1
 }
 
@@ -924,7 +965,8 @@ create_cluster() {
 	ensure_net "${net_subnet}"
 	if [[ ${use_lb} -eq 1 ]]; then
 		# ensure_lb reuses a container left behind by an earlier failed
-		# create and recreates one whose backend list no longer matches.
+		# create and recreates one whose backend list or address no longer
+		# matches.
 		# shellcheck disable=SC2310
 		if node_exists "${LB_NAME}"; then
 			log "reusing ${LB_NAME} (${lb_ip}) from an earlier failed create"
@@ -944,14 +986,14 @@ create_cluster() {
 	# cluster, so the endpoint on a cluster whose master happens to use
 	# <subnet>.10 is not mistaken for an LB.
 	[[ ${use_lb} -eq 1 ]] && master_env+=(--env "ZEK_LB_ENDPOINT=${lb_ip}:6443")
-	run_node "${MASTER_NAME}" master --ip "${MASTER_IP}" "${master_env[@]}"
+	run_node_retry "${MASTER_NAME}" master --ip "${MASTER_IP}" "${master_env[@]}"
 	wait_for_api
 	read_join_credentials
 
 	for i in $(seq 2 "${masters}"); do
 		master_addr=$(master_node_ip "${i}")
 		log "creating ${CLUSTER}-master-${i} (${master_addr}) as control-plane"
-		run_node "${CLUSTER}-master-${i}" master --ip "${master_addr}" \
+		run_node_retry "${CLUSTER}-master-${i}" master --ip "${master_addr}" \
 			--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
 		wait_for_master_ready "${CLUSTER}-master-${i}"
 		wait_for_nodes "${i}"
@@ -959,7 +1001,7 @@ create_cluster() {
 
 	for i in $(seq 1 "${workers}"); do
 		log "creating ${CLUSTER}-worker-${i} (${worker_addrs[i - 1]})"
-		run_node "${CLUSTER}-worker-${i}" worker --ip "${worker_addrs[i - 1]}" "${CRED_ARGS[@]}"
+		run_node_retry "${CLUSTER}-worker-${i}" worker --ip "${worker_addrs[i - 1]}" "${CRED_ARGS[@]}"
 	done
 	wait_for_nodes "$((masters + workers))"
 
@@ -1007,10 +1049,11 @@ lb_env_backends() {
 		| sed -n 's/^LB_BACKENDS=//p' || true
 }
 
-# Create the LB, or recreate it when its backend list changed. A recreate is
-# how a live haproxy picks up an added/removed master without teaching the
-# entrypoint a reload protocol; the fixed --ip keeps the endpoint stable.
-# The retry waits out docker's endpoint cleanup for the same address.
+# Create the LB, or recreate it when its backend list or its address
+# changed. A recreate is how a live haproxy picks up an added/removed master
+# without teaching the entrypoint a reload protocol; the fixed --ip keeps the
+# endpoint stable. The retry waits out docker's endpoint cleanup for the same
+# address.
 ensure_lb() { # <space separated backends>
 	local backends=$1 lb_ip current current_ip
 	lb_ip=$(lb_node_ip "${NET_SUBNET}")
@@ -1025,7 +1068,11 @@ ensure_lb() { # <space separated backends>
 			start_node "${LB_NAME}"
 			return 0
 		fi
-		log "updating ${LB_NAME} backends to: ${backends}"
+		if [[ ${current} != "${backends}" ]]; then
+			log "updating ${LB_NAME} backends to: ${backends}"
+		else
+			log "recreating ${LB_NAME} on ${lb_ip} (was ${current_ip:-an unknown address})"
+		fi
 		docker rm -f "${LB_NAME}" > /dev/null
 	else
 		log "creating ${LB_NAME} (${lb_ip}) in front of: ${backends}"
@@ -1101,11 +1148,11 @@ reconcile_cluster() {
 	if [[ ${desired_masters} -gt 1 ]]; then
 		require_host_ip "${lb_ip}" "${NET_SUBNET}" "load balancer"
 	fi
-	# Keep the LB's address out of the allocator whenever the cluster has
-	# (or is about to get) an LB. A no-LB cluster may legitimately use
-	# .10, and a missing LB is recreated at .10 before any node is added.
+	# Keep the LB's address out of the allocator while the cluster has an
+	# LB (a missing one is recreated at .10 before any node is added). A
+	# no-LB cluster may legitimately use .10.
 	reserve_lb_ip=""
-	if [[ ${desired_masters} -gt 1 ]] || [[ ${has_lb} -eq 1 ]]; then
+	if [[ ${has_lb} -eq 1 ]]; then
 		reserve_lb_ip=${lb_ip}
 	fi
 	# Refuse an impossible scale before adding anything: a failure halfway
@@ -1146,7 +1193,7 @@ reconcile_cluster() {
 			name="${CLUSTER}-master-${idx}"
 			address=$(alloc_node_ip "${NET_SUBNET}" "${reserve_lb_ip}")
 			log "adding ${name} (${address}) as control-plane"
-			run_node "${name}" master --ip "${address}" \
+			run_node_retry "${name}" master --ip "${address}" \
 				--env MASTER_JOIN=1 "${CRED_ARGS[@]}"
 			wait_for_master_ready "${name}"
 		done
@@ -1158,7 +1205,7 @@ reconcile_cluster() {
 			name="${CLUSTER}-worker-${idx}"
 			address=$(alloc_node_ip "${NET_SUBNET}" "${reserve_lb_ip}")
 			log "adding ${name} (${address})"
-			run_node "${name}" worker --ip "${address}" "${CRED_ARGS[@]}"
+			run_node_retry "${name}" worker --ip "${address}" "${CRED_ARGS[@]}"
 		done
 	fi
 
@@ -1422,6 +1469,16 @@ cmd_clean() {
 		fi
 		masters=$(count_masters)
 		worker_addr=$(worker_node_ip "${name##*-}" "${masters}" "${net_subnet}" "${lb_ip}" "${use_lb}")
+		# The formula describes the initial topology; after a scale it can
+		# point at another node. Refuse before deleting the worker.
+		local other other_addr container_list
+		container_list=$(cluster_container_names)
+		while read -r other; do
+			[[ -n ${other} && ${other} != "${name}" ]] || continue
+			other_addr=$(node_address "${other}")
+			[[ ${other_addr} != "${worker_addr}" ]] \
+				|| die "cannot recreate ${name}: ${worker_addr} is used by ${other}; recreate the cluster instead"
+		done <<< "${container_list}"
 	fi
 
 	# A node's netns lives on its container; a fresh container is the only

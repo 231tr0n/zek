@@ -29,10 +29,10 @@
       uses: "./.github/workflows/ci.yml",
     },
     push: {
-      # Publish only when the image content inputs changed (Dockerfile,
-      # entrypoint.sh, Makefile or format.sh) and e2e was required; image
-      # inputs are a subset of e2e inputs, and `needs: ci` ensures tests
-      # passed.
+      # Publish only when the publish gate fired (Dockerfile, entrypoint.sh,
+      # Makefile or format.sh changed) and e2e was required; format.sh has
+      # no image content but joins the gate, image inputs are a subset of
+      # e2e inputs, and `needs: ci` ensures tests passed.
       # Rebuilds the same commit, so the pushed image is what the tests
       # validated. Without an image change there is nothing new to publish.
       needs: "ci",
