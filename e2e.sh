@@ -2306,6 +2306,8 @@ test_smoke_1() {
 	out=$(./zek.sh --help) || fail "${cluster}: --help failed: ${out}"
 	[[ ${out} == *"Usage:"* && ${out} == *"destroy"* && ${out} == *"--workers"* ]] \
 		|| fail "${cluster}: --help output misses the usage summary: ${out}"
+	out=$(./zek.sh -h) || fail "${cluster}: -h failed: ${out}"
+	[[ ${out} == *"Usage:"* ]] || fail "${cluster}: -h output misses the usage summary: ${out}"
 	up_cluster "${cluster}" 1 1
 	# status prints the HEALTHCHECK verdict as its own column, so the
 	# master's first successful probe has to land before the read.
