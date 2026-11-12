@@ -45,6 +45,7 @@
 #   twin and can be written as --flag value or --flag=value; when both are
 #   set the flag wins:
 #   --version               print the zek.sh version
+#   --help, -h              print this help and exit
 #   --latest                use the latest tag of the selected image
 #                           repository (ZEK_LATEST=1; by default, the
 #                           release-pinned image's repository)
@@ -81,6 +82,14 @@ warn() { echo "[zek] WARNING: $*" >&2; }
 die() {
 	log "ERROR: $*"
 	exit 1
+}
+
+# Print the header comment block (the canonical user-facing help) without
+# duplicating it in a second string that would drift out of sync. BASH_SOURCE
+# keeps this working when the script is invoked through a symlink or sourced.
+help() {
+	sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" \
+		| sed -e 's/^# \{0,1\}//' -e '/^set -euo pipefail$/d'
 }
 
 # Shape-check an IPv4 value before it reaches docker (network create,
@@ -144,7 +153,7 @@ require_ipv4() { # <value> cidr|addr <label>
 
 # Script release version, independent of the pinned image version. Bump this
 # when cutting a zek.sh release; --version prints it.
-ZEK_VERSION="0.3.0"
+ZEK_VERSION="0.4.0"
 # Image a released zek.sh uses by default. The version pair is pinned so the
 # script does not silently move to different Alpine/Kubernetes versions.
 # ZEK_IMAGE/--image override it, e.g. ZEK_IMAGE=zek:latest for a local build.
@@ -302,6 +311,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--version)
 			printf 'zek %s\n' "${ZEK_VERSION}"
+			exit 0
+			;;
+		--help | -h)
+			help
 			exit 0
 			;;
 		*) break ;;
@@ -1583,7 +1596,7 @@ cmd_destroy() {
 }
 
 usage() {
-	die "usage: $0 [--version] [--latest] [--lb] [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy}"
+	die "usage: $0 [--help] [--version] [--latest] [--lb] [--cluster name] [--timeout seconds] [--image img] [--subnet cidr] [--master-ip ip] [--dns ip] [--pod-cidr cidr] [--mounts 'src:dst ...'] {up [--workers N] [--masters M]|down|clean <name>|status|kubectl <args>|logs <name>|destroy} (run '$0 --help' for details)"
 }
 
 # Global flags are only parsed before the command (see the header), so a

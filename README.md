@@ -93,6 +93,7 @@ afterwards with `./zek.sh --cluster bump destroy`.
 ## Quick start
 
 ```sh
+./zek.sh --help                        # full command and flag reference
 ./zek.sh up --workers 2 --masters 1    # create: 1 master + 2 workers
 ./zek.sh status                        # node containers (state + health) + cluster nodes
 ./zek.sh kubectl get nodes
@@ -197,8 +198,9 @@ cannot fit is refused before any node is added.
 
 ### Flags and environment
 
-Every setting except `--version` exists twice: as a flag and as an environment
-variable. The flag wins when both are set. Global flags go before the command
+Every setting except `--version` and `--help` exists twice: as a flag and as
+an environment variable. The flag wins when both are set. Global flags go
+before the command
 (`./zek.sh --image zek:dev up`); `--workers`/`--masters` follow `up`.
 
 | Variable        | Flag          | Effect                                                                                                       |

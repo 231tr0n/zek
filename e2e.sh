@@ -64,7 +64,8 @@
 #                  cluster DNS and external DNS forwarding
 #   cilium         same with cilium (cilium CLI downloaded on demand,
 #                  version matched to the cluster's k8s release)
-#   smoke-1        the basic zek.sh surface: status, logs, kubectl exec
+#   smoke-1        the basic zek.sh surface: --version/--help, status,
+#                  logs, kubectl exec
 #                  (the `--` delimiter and stdin with -i), and the value
 #                  flags in both spellings plus flag > env precedence
 #   smoke-2        the functional --subnet/--master-ip/--pod-cidr probe
@@ -2297,11 +2298,14 @@ EOF
 
 test_smoke_1() {
 	local cluster=$1 out
-	# --version is the one action that must work without a cluster or
-	# Docker: it prints the release version and exits during flag parsing.
+	# --version and --help are the actions that must work without a
+	# cluster or Docker: both print during flag parsing and exit.
 	out=$(./zek.sh --version) || fail "${cluster}: --version failed: ${out}"
 	[[ ${out} =~ ^zek[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] \
 		|| fail "${cluster}: --version output: want 'zek <x.y.z>', got '${out}'"
+	out=$(./zek.sh --help) || fail "${cluster}: --help failed: ${out}"
+	[[ ${out} == *"Usage:"* && ${out} == *"destroy"* && ${out} == *"--workers"* ]] \
+		|| fail "${cluster}: --help output misses the usage summary: ${out}"
 	up_cluster "${cluster}" 1 1
 	# status prints the HEALTHCHECK verdict as its own column, so the
 	# master's first successful probe has to land before the read.
