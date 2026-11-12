@@ -74,13 +74,15 @@ SUPERVISOR_PID=""
 MASTER_JOIN="${MASTER_JOIN:-0}"
 NO_HOST_MODULES="${NO_HOST_MODULES:-0}"
 declare -A SYSCTL_BEFORE=()
-# Modules the host already had before preflight_host ran (space separated):
-# cleanup only unloads the ones NOT in this list. HOST_SETUP_DONE is set at
-# the end of preflight_host so cleanup can tell "we never set the host up"
-# (an early die) from "we loaded something" - an empty list must never
-# trigger rmmod.
+# Modules the host already had before preflight_host ran (space separated).
+# cleanup unloads only the modules NOT listed here; an empty list with
+# HOST_PREFLIGHT_DONE=1 means we loaded all of them.
+HOST_MODULES=(br_netfilter vxlan)
 HOST_MODULES_PREEXISTING=""
-HOST_SETUP_DONE=0
+# Set once preflight_host runs to completion (0 when NO_HOST_MODULES=1 or a
+# flag-validation die happened first), so cleanup can tell "we ran host
+# setup" from "we never touched the host".
+HOST_PREFLIGHT_DONE=0
 
 log() { echo "[zek] $*" >&2; }
 warn() { echo "[zek] WARNING: $*" >&2; }
@@ -88,11 +90,10 @@ die() {
 	log "ERROR: $*"
 	exit 1
 }
-if [[ -n ${WAIT_TIMEOUT:-} ]]; then
-	{ [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] && [[ ${#WAIT_TIMEOUT} -le 5 ]] \
-		&& ((10#${WAIT_TIMEOUT} <= 86400)); } \
-		|| die "invalid WAIT_TIMEOUT '${WAIT_TIMEOUT}' (expected seconds 1-86400)"
-fi
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
+{ [[ ${WAIT_TIMEOUT} =~ ^[1-9][0-9]*$ ]] && [[ ${#WAIT_TIMEOUT} -le 5 ]] \
+	&& ((10#${WAIT_TIMEOUT} <= 86400)); } \
+	|| die "invalid WAIT_TIMEOUT '${WAIT_TIMEOUT}' (expected seconds 1-86400)"
 
 # Run a command with its output captured to a log file; on failure surface
 # the log on stderr and die. kubeadm's preflight/cert chatter is one-shot
@@ -125,11 +126,11 @@ cleanup() {
 		[[ -n ${SYSCTL_BEFORE[${sysctl_key}]} ]] && sysctl -w "${sysctl_key}=${SYSCTL_BEFORE[${sysctl_key}]}" > /dev/null 2>&1 || true
 	done
 	# Only touch host modules when preflight_host actually ran: die() can
-	# fire before that (flag parsing, kubeadm failures on a first start),
-	# and an empty "loaded by us" list would otherwise rmmod modules the
-	# host itself was using.
-	if [[ ${HOST_SETUP_DONE:-0} -eq 1 ]]; then
-		for kernel_module in br_netfilter vxlan; do
+	# fire before that, and without the guard we could rmmod modules the
+	# host itself was using. HOST_MODULES_PREEXISTING names the ones we
+	# must leave loaded (cleanup unloads only what this container added).
+	if [[ ${HOST_PREFLIGHT_DONE} -eq 1 ]]; then
+		for kernel_module in "${HOST_MODULES[@]}"; do
 			case " ${HOST_MODULES_PREEXISTING} " in
 				*" ${kernel_module} "*) ;;
 				*) rmmod "${kernel_module}" 2> /dev/null || true ;;
@@ -137,10 +138,11 @@ cleanup() {
 		done
 	fi
 }
-# Run cleanup exactly once on every exit path: docker stop sends TERM
+# Run cleanup on normal exits and graceful stops: docker stop sends TERM
 # (converted to exit 0 so the stop is not reported as a failure), and
 # die()/kubeadm failures reach it through the EXIT trap with their status
-# intact.
+# intact. The exec paths (lb, kubectl, interactive bash) and SIGKILL
+# (docker rm -f, `zek destroy`) deliberately bypass it.
 trap 'exit 0' TERM INT
 trap cleanup EXIT
 
@@ -150,7 +152,7 @@ preflight_host() {
 	# modules (e.g. they were already loaded at boot).
 	local module sysctl_key
 	[[ ${NO_HOST_MODULES} -eq 1 ]] && return 0
-	for module in br_netfilter vxlan; do
+	for module in "${HOST_MODULES[@]}"; do
 		if [[ -d "/sys/module/${module}" ]]; then
 			HOST_MODULES_PREEXISTING="${HOST_MODULES_PREEXISTING} ${module}"
 		else
@@ -175,7 +177,7 @@ preflight_host() {
 	# Marked only on the fall-through path: with NO_HOST_MODULES=1 the
 	# early return above leaves it 0 (the default), and cleanup then keeps
 	# its hands off the host's modules.
-	HOST_SETUP_DONE=1
+	HOST_PREFLIGHT_DONE=1
 }
 
 ensure_resolv_conf() {
@@ -201,6 +203,9 @@ ensure_resolv_conf() {
 	fi
 	[[ -n ${upstream_ips} ]] || upstream_ips="1.1.1.1 8.8.8.8"
 	{
+		# kubelet copies this file into every pod sandbox. Drop any
+		# container-specific search domain/options rather than leaking
+		# them into pods; pods get their own search path from DNS policy.
 		echo "search ."
 		for upstream_ip in ${upstream_ips}; do echo "nameserver ${upstream_ip}"; done
 	} > /etc/resolv.conf
@@ -335,7 +340,15 @@ kubelet_supervisor() {
 	trap 'exit 0' TERM INT
 	while :; do
 		if [[ -f ${KUBELET_CONFIG} ]]; then
-			ensure_kubelet_config
+			# kubeadm writes these files non-atomically during init/join
+			# and removes them during reset; a transient read failure must
+			# leave the supervisor alive instead of exiting the node
+			# (this function inherits set -e).
+			# shellcheck disable=SC2310  # failure is handled by the retry
+			ensure_kubelet_config || {
+				sleep 2
+				continue
+			}
 			local -a kubelet_args=()
 			if [[ -f ${KUBEADM_FLAGS} ]]; then
 				# kubeadm generates this file at runtime, so shellcheck
@@ -343,7 +356,10 @@ kubelet_supervisor() {
 				# so every kubelet restart starts from a clean value.
 				local KUBELET_KUBEADM_ARGS=""
 				# shellcheck source=/dev/null
-				source "${KUBEADM_FLAGS}"
+				source "${KUBEADM_FLAGS}" 2> /dev/null || {
+					sleep 2
+					continue
+				}
 				# Drop any deprecated CLI copy kubeadm may still ship
 				# in KUBELET_KUBEADM_ARGS; the config file carries
 				# the setting now. Intentional word-splitting: the file
@@ -369,12 +385,13 @@ kubelet_supervisor() {
 			# multi-line `...=<` block with a tab-indented body and a
 			# lone `>` closer that carry no I-prefix - awk drops those
 			# with the header. fflush() keeps the sparse output
-			# in real time through the pipe; wait returns the awk pid, so
-			# if awk ever died while kubelet was still alive, the pkill
-			# keeps the start below from ever running two kubelets.
-			# Kill by command line, not comm: gcompat runs the glibc
-			# kubelet through musl's loader, so comm is ld-musl-x86_64,
-			# and a comm match never finds it.
+			# in real time through the pipe; wait returns the awk pid.
+			# Kill a leftover kubelet by command line, not comm: gcompat
+			# runs the glibc kubelet through musl's loader, so comm is
+			# ld-musl-x86_64, and a comm match never finds it. This is
+			# best effort (pkill does not wait), so a truly stuck process
+			# could overlap the fresh start briefly; it dies with the
+			# container namespace.
 			pkill -f "/usr/local/bin/kubelet" > /dev/null 2>&1 || true
 			# cgroupfs matches containerd's default (SystemdCgroup=false);
 			# switching this to systemd also requires flipping containerd's
@@ -455,7 +472,6 @@ publish_cluster_credentials() {
 	local join_token="" join_cert_key="" join_ca_hash="" upload_ok=""
 	API_ENDPOINT="${API_ENDPOINT:-$(node_ip):6443}"
 	mkdir -p "${CLUSTER_DIR}"
-	[[ -n ${KUBECONFIG:-} ]] || export KUBECONFIG=/etc/kubernetes/admin.conf
 	# Explicit check: the resume path calls this from the right of || where
 	# errexit is off, and a failed hash would only surface later as a
 	# confusing "could not extract the join credentials".
@@ -589,7 +605,7 @@ complete_interrupted_init() {
 	log "published credentials incomplete; republishing"
 	# WAIT_TIMEOUT rides in from zek.sh (--timeout); default like the
 	# kubectl role's wait below when running outside it.
-	local tail_version advertise_ip deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
+	local tail_version advertise_ip deadline=$((SECONDS + WAIT_TIMEOUT))
 	until curl -skf --connect-timeout 2 --max-time 5 \
 		https://127.0.0.1:6443/readyz 2> /dev/null | grep -qx ok; do
 		[[ ${SECONDS} -lt ${deadline} ]] || return 1
@@ -648,9 +664,11 @@ run_master() {
 	#   cluster-info. The same holds for an interrupted control-plane
 	#   join: its kubelet.conf also appears before the etcd member add
 	#   and static-pod write finish. Without completion evidence (the
-	#   init-complete marker, which both init and join write last, or
-	#   published credentials, which only exist after a completed init)
-	#   wipe and start over - the interrupted run is then redone below.
+	#   init-complete marker, written when the kubeadm phases finish, or a
+	#   fully published credential set, whose admin.conf is written last)
+	#   a non-resumable run is wiped; a first-master init that still has
+	#   manifests and admin.conf is handed to complete_interrupted_init
+	#   instead of being reset.
 	if [[ ! -f /etc/kubernetes/kubelet.conf ]] && [[ -f /etc/kubernetes/pki/ca.crt ]]; then
 		log "interrupted control-plane setup detected; resetting partial state"
 		kubeadm reset --force --ignore-preflight-errors=all > /dev/null 2>&1 || true
@@ -795,7 +813,7 @@ run_kubectl() {
 			# Bounded by WAIT_TIMEOUT (zek.sh passes --timeout through,
 			# default 600s) so a dead master fails this call instead of
 			# hanging every `zek kubectl` poll for ten minutes.
-			local deadline=$((SECONDS + ${WAIT_TIMEOUT:-600}))
+			local deadline=$((SECONDS + WAIT_TIMEOUT))
 			while [[ ${SECONDS} -lt ${deadline} ]]; do
 				[[ -s "${CLUSTER_DIR}/admin.conf" ]] && break
 				sleep 2
@@ -920,8 +938,8 @@ parse_role_flags() {
 			*)
 				# Only the kubectl role forwards arguments. A stray
 				# argument on a node role would otherwise vanish
-				# silently - e.g. `master --master-join=1` used to
-				# quietly run kubeadm init instead of a join.
+				# silently - e.g. a typo like `master --node-nam=x`
+				# used to be ignored and start the node anyway.
 				[[ ${ENTRYPOINT_ROLE} == kubectl ]] \
 					|| die "unknown argument '${1}' for role ${ENTRYPOINT_ROLE} (only the kubectl role takes passthrough arguments)"
 				ROLE_ARGS+=("$1")

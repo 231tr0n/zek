@@ -97,7 +97,7 @@ afterwards with `./zek.sh --cluster bump destroy`.
 ./zek.sh status                        # node containers (state + health) + cluster nodes
 ./zek.sh kubectl get nodes
 ./zek.sh logs <cluster>-worker-1       # follow a node's logs (docker logs -f; Ctrl-C to stop)
-./zek.sh down                          # stop everything (state is kept)
+./zek.sh down                          # stop the nodes (state is kept)
 ./zek.sh up                            # restart the same topology
 ./zek.sh destroy                       # remove the containers and network
 ```
@@ -173,12 +173,12 @@ ZEK_TIMEOUT=120 ./zek.sh up # same, via environment
 ```
 
 The `--cluster` flag (or `ZEK_CLUSTER`, default `zek`) selects the cluster for
-every command. All containers and the Docker network carry the cluster name as
-prefix (`prod-master-1`, `prod-worker-1`, `prod-lb`, `prod-net`). Each cluster
-gets its own subnet — the first free `172.20.X.0/24`, scanned from the live
-docker networks so concurrent clusters running with defaults don't collide. A
-race or an explicit `--subnet`/`ZEK_SUBNET` that is already in use fails the
-network create loudly instead of overlapping.
+every command. All zek containers and the Docker network carry the cluster
+name as prefix (`prod-master-1`, `prod-worker-1`, `prod-lb`, `prod-net`). Each
+cluster gets its own subnet — the first free `172.20.X.0/24`, scanned from the
+live docker networks so concurrent clusters running with defaults don't
+collide. A race or an explicit `--subnet`/`ZEK_SUBNET` that is already in use
+fails the network create loudly instead of overlapping.
 
 Every node gets a **static** address on the cluster network. At creation the
 masters walk up from `--master-ip` (default `<subnet>.2`) and the workers
@@ -189,12 +189,11 @@ them out in its own order after a host reboot, which moves a node out from
 under its kubelet certificate and its `Node` object. With an LB (more than one
 master, or `--lb`) the load balancer owns `<subnet>.10` (see below), and a
 worker that would land on it is refused before anything is created. Nodes
-added by a later `up` take
-the first free usable host address in that range, so scaling never moves an
-existing node off the address its kubelet certificate and `Node` object were
-built on. Narrow and offset subnets are handled the same way: unusable
-candidates are skipped, and a scale that cannot fit is refused before any
-node is added.
+added by a later `up` take the first free usable host address in that range,
+so scaling never moves an existing node off the address its kubelet
+certificate and `Node` object were built on. Narrow and offset subnets are
+handled the same way: unusable candidates are skipped, and a scale that
+cannot fit is refused before any node is added.
 
 ### Flags and environment
 
@@ -350,6 +349,32 @@ and the node re-initialises or re-joins from scratch, while a first-master
 init that already reached a serving control plane is completed in place by
 the resume path. Completed nodes are never reset.
 
+### Teardown and containers on the cluster network
+
+`down` stops only zek's own containers (`<cluster>-master-N`,
+`<cluster>-worker-N`, `<cluster>-lb`). A container you attach to
+`<cluster>-net` for the cluster — an NFS server backing PVCs, a registry, ... —
+keeps running; it is not part of the cluster lifecycle. `status` likewise
+lists only the cluster's own containers, not user services.
+
+`destroy` removes the zek containers first, then any other container still
+attached to the network, then the network. The order matters: a node with a
+live NFS mount cannot be killed after its server disappears, and `docker rm
+-f` then fails with `tried to kill container, but did not receive an exit
+event`. If a node cannot be removed, `destroy` stops before touching the
+network or the external service, so the server stays available for a retry.
+
+If that error appears anyway (for example after removing the storage server
+by hand), start the server again on the same address and retry the removal.
+If the mounts cannot recover, restart the Docker daemon or reboot the host:
+the stuck NFS client threads live in the kernel and survive container
+removal.
+
+`destroy` uses `docker rm -f`, so it skips the entrypoint's graceful
+shutdown cleanup (host sysctl/module restore and the `shutting down` log).
+Run `down` first if you need that cleanup to run; the host setup is in-memory
+and a reboot clears it anyway.
+
 ## Notes
 
 - **`--cgroupns=host` is mandatory.** With the private cgroup namespace the kubelet fails to move itself into the right cgroup (`cgroup.procs` write returns `ENOENT`).
@@ -357,7 +382,8 @@ the resume path. Completed nodes are never reset.
 - Node addresses are static (at creation the masters walk up from `--master-ip` and the workers follow the last master; nodes added by later scaling take the first free address; the load balancer, when the cluster has one, owns `<subnet>.10`), which is what keeps a node at the same address across a Docker daemon restart or a host reboot. `clean` recreates a worker on the address it already had.
 - **`--privileged`** is required for containerd's mounts and the CNI networking.
 - The nodes are prepared so CNI daemonsets "just work": `/etc/cni/net.d` and the CNI bin dir are pre-created world-writable (some installers run as non-root), `/`, `/sys`, `/run` are made shared mounts so eBPF setups can mount fs types into pods, and `bpffs` is pre-mounted at `/sys/fs/bpf`.
-- The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on shutdown. Nothing is written to disk. Set `NO_HOST_MODULES=1` (or pass `--no-host-modules`) on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); no host modules or sysctls are touched then, though the mandatory host cgroup namespace remains in use.
+- The node loads kernel modules `br_netfilter` and `vxlan` (only if the host lacks them) with `modprobe` and attempts to unload them again on a graceful stop (`down`/`docker stop`; `destroy` force-removes the containers and skips cleanup). Nothing is written to disk. Set `NO_HOST_MODULES=1` (or pass `--no-host-modules`) on the container to skip all host kernel setup (e.g. if the modules are already loaded at boot); no host modules or sysctls are touched then, though the mandatory host cgroup namespace remains in use.
+- That host setup is shared: stopping one node restores the host sysctls and may unload modules while other zek nodes are still running. Stop the whole cluster together (`down`) or use `NO_HOST_MODULES=1` when that matters.
 - The node also raises the host-wide `fs.inotify.max_user_instances` quota to 1024 (all node containers share the per-uid quota) and leaves it raised on exit, since running containers still need it. With `NO_HOST_MODULES=1` this is skipped too.
 - `kube-proxy`'s automatic conntrack table tuning is disabled via its ConfigMap because the global `nf_conntrack_max` sysctl is not writable from a container netns.
 - Containerd's CNI plugin search path is set to `['/opt/cni/bin', '/usr/libexec/cni']` since CNI providers install their plugin binary into `/opt/cni/bin`.

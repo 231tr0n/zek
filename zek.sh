@@ -8,7 +8,7 @@
 # names and addresses of surviving nodes never change - `clean` recreates a
 # worker with a fresh netns). `down` stops it and `destroy` removes it. Several
 # clusters can coexist - the --cluster flag (or ZEK_CLUSTER) selects one,
-# and every container and network is prefixed with the cluster name.
+# and every zek container and the network are prefixed with the cluster name.
 #
 # All state lives on the node containers' own writable layer: the cluster
 # survives docker stop/start, docker restart and host reboots, and is gone
@@ -38,7 +38,8 @@
 #                               piped manifests)
 #   ./zek.sh [flags] logs <name>
 #                               tail a node container's logs
-#   ./zek.sh [flags] destroy    remove the cluster's containers and network
+#   ./zek.sh [flags] destroy    remove the cluster's containers (before any
+#                               other container on its network) and the network
 #
 #   Global flags go before the command. Flags that take a value have an env
 #   twin and can be written as --flag value or --flag=value; when both are
@@ -472,40 +473,14 @@ cluster_has_lb() {
 # Containers attached to this cluster's network (running or stopped).
 network_container_names() { docker ps -a --format '{{.Names}}' -f network="${NET_NAME}" 2> /dev/null || true; }
 
-# Containers belonging to this cluster: the network's containers plus every
-# container carrying one of the cluster's node names, deduplicated, so a node
-# temporarily detached from the network is still stoppable/removable.
-cluster_container_names() {
-	local name network_list node_list
-	local -a names=()
-	local -A seen=()
-	network_list=$(network_container_names)
-	node_list=$(all_node_names)
-	while read -r name; do
-		[[ -n ${name} && -z ${seen[${name}]:-} ]] || continue
-		seen[${name}]=1
-		names+=("${name}")
-	done <<< "${network_list}
-${node_list}"
-	# shellcheck disable=SC2310
-	if node_exists "${LB_NAME}" && [[ -z ${seen[${LB_NAME}]:-} ]]; then
-		names+=("${LB_NAME}")
-	fi
-	if ((${#names[@]})); then
-		printf '%s\n' "${names[@]}"
-	fi
-	return 0
-}
-
-# Running containers of this cluster: everything still attached to the
-# network plus the cluster's own node names (so `down` also stops a node
-# detached from the network). Deduplicated.
-running_cluster_names() {
-	local net_list named_list
-	net_list=$(docker ps --format '{{.Names}}' -f network="${NET_NAME}" 2> /dev/null) || net_list=""
-	named_list=$(docker ps --format '{{.Names}}' 2> /dev/null \
-		| grep -E "^${CLUSTER}-(master-[0-9]+|worker-[0-9]+|lb)$" || true)
-	printf '%s\n%s\n' "${net_list}" "${named_list}" | sed '/^$/d' | sort -u
+# Running containers zek owns for this cluster: the node names and the load
+# balancer. A node detached from the network is still included by name;
+# containers a user attached to the network (NFS server, registry, ...) are
+# not, so `down` never takes an external service down with the cluster.
+running_owned_container_names() {
+	docker ps --format '{{.Names}}' 2> /dev/null \
+		| grep -E "^${CLUSTER}-(master-[0-9]+|worker-[0-9]+|lb)$" \
+		| sort -u || true
 }
 
 # Masters are named <cluster>-master-1, <cluster>-master-2, ...; workers are
@@ -537,6 +512,29 @@ count_workers() { count_role_names worker; }
 all_node_names() {
 	master_names
 	worker_names
+}
+
+# Containers zek created for this cluster: the node names (including nodes
+# detached from the network) plus the load balancer. Other containers a user
+# attached to the network (NFS server, registry, ...) are deliberately not
+# included: teardown must not remove an external service before the nodes.
+owned_container_names() {
+	all_node_names
+	# shellcheck disable=SC2310
+	if node_exists "${LB_NAME}"; then
+		printf '%s\n' "${LB_NAME}"
+	fi
+}
+
+# Every address currently held on the cluster network, for allocation: the
+# network's containers plus zek's own containers, so a node temporarily
+# detached from the network still reserves its address. Docker container
+# names are unique, so sort -u is the deduplication.
+network_address_holders() {
+	local network_list owned_list
+	network_list=$(network_container_names)
+	owned_list=$(owned_container_names)
+	printf '%s\n%s\n' "${network_list}" "${owned_list}" | sed '/^$/d' | sort -u
 }
 
 # Lowest index not used by a container of this role. Normally this is the
@@ -577,9 +575,9 @@ node_address() { # container
 # must never hand a new node an address that is already taken.
 used_node_ips() {
 	local name container_list
-	# cluster_container_names covers the network's containers, the cluster's
+	# network_address_holders covers the network's containers, the cluster's
 	# named nodes (even when detached) and the LB.
-	container_list=$(cluster_container_names)
+	container_list=$(network_address_holders)
 	while read -r name; do
 		[[ -n ${name} ]] || continue
 		node_address "${name}"
@@ -1325,7 +1323,7 @@ cmd_up() {
 cmd_down() {
 	local -a names=()
 	local name container_list
-	container_list=$(running_cluster_names)
+	container_list=$(running_owned_container_names)
 	if [[ -n ${container_list} ]]; then
 		mapfile -t names <<< "${container_list}"
 	fi
@@ -1472,7 +1470,7 @@ cmd_clean() {
 		# The formula describes the initial topology; after a scale it can
 		# point at another node. Refuse before deleting the worker.
 		local other other_addr container_list
-		container_list=$(cluster_container_names)
+		container_list=$(network_address_holders)
 		while read -r other; do
 			[[ -n ${other} && ${other} != "${name}" ]] || continue
 			other_addr=$(node_address "${other}")
@@ -1495,7 +1493,9 @@ cmd_clean() {
 
 cmd_status() {
 	local running_total=0 name container_list state health
-	container_list=$(cluster_container_names)
+	# Only zek's own containers: a user's NFS server or registry on the
+	# cluster network is not a node and must not be counted as one.
+	container_list=$(owned_container_names)
 	# A cluster normally has its network, but a partially cleaned-up one may
 	# still have containers to report.
 	# shellcheck disable=SC2310
@@ -1528,23 +1528,48 @@ cmd_status() {
 
 cmd_destroy() {
 	local -a names=()
-	local container_list removed=0 containers_removed=0 network_removed=0
-	container_list=$(cluster_container_names)
+	local name container_list containers_removed=0 network_removed=0
+	# Remove zek's own containers first, while any user-attached service on
+	# the network (an NFS server backing PVCs, a registry, ...) is still
+	# running. A node with a live mount on a server that has already gone
+	# away cannot be killed: `docker rm -f` fails with "did not receive an
+	# exit event" and the network namespace never tears down. If a node
+	# cannot be removed, stop before touching the rest so the external
+	# service stays available for a retry.
+	container_list=$(owned_container_names)
 	if [[ -n ${container_list} ]]; then
 		mapfile -t names <<< "${container_list}"
 	fi
-	if [[ ${#names[@]} -gt 0 ]]; then
-		docker rm -f "${names[@]}" > /dev/null
-		removed=1
+	for name in "${names[@]}"; do
+		log "removing ${name}"
+		if ! docker rm -f "${name}" > /dev/null; then
+			die "failed to remove ${name}; left ${NET_NAME} and the remaining containers intact (restart any external storage server, then retry destroy)"
+		fi
 		containers_removed=1
+	done
+	# With every node gone, the remaining network containers (a user's NFS
+	# server, registry, ...) can be removed safely. They would otherwise
+	# keep the network from being removed.
+	names=()
+	container_list=$(network_container_names)
+	if [[ -n ${container_list} ]]; then
+		mapfile -t names <<< "${container_list}"
 	fi
+	for name in "${names[@]}"; do
+		log "removing ${name} (attached to ${NET_NAME})"
+		if ! docker rm -f "${name}" > /dev/null; then
+			die "failed to remove ${name}; left ${NET_NAME} and the remaining containers intact"
+		fi
+		containers_removed=1
+	done
 	# shellcheck disable=SC2310
 	if net_exists; then
-		docker network rm "${NET_NAME}" > /dev/null
-		removed=1
+		if ! docker network rm "${NET_NAME}" > /dev/null; then
+			die "failed to remove network ${NET_NAME}; containers may still be attached (inspect with: docker network inspect ${NET_NAME})"
+		fi
 		network_removed=1
 	fi
-	if [[ ${removed} -eq 0 ]]; then
+	if [[ ${containers_removed} -eq 0 && ${network_removed} -eq 0 ]]; then
 		log "no cluster named ${CLUSTER}"
 		return 0
 	fi
