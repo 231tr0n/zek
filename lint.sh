@@ -27,7 +27,7 @@
 #                       one synthetic backend server, checked with
 #                       haproxy -c -f /dev/stdin, and style-checked for
 #                       tab-only indentation and trailing whitespace
-#   lint Dockerfile:    dockerfmt -s -n -i 0 --check (space redirects,
+#   lint Dockerfile:    dockerfmt -s -n -t --check (space redirects,
 #                       trailing newline, tab indentation matching shfmt);
 #                       every RUN heredoc body is a shell script,
 #                       so it is also checked with shellcheck (sh dialect,
@@ -651,7 +651,7 @@ if [[ ${#yaml_files[@]} -gt 0 ]]; then
 	run_check "yamlfmt" lint_yamlfmt "${yaml_files[@]}"
 fi
 if [[ ${#docker_files[@]} -gt 0 ]]; then
-	run_check "dockerfmt -s -n -i 0" dockerfmt -s -n -i 0 --check "${docker_files[@]}"
+	run_check "dockerfmt -s -n -t" dockerfmt -s -n -t --check "${docker_files[@]}"
 	run_check --from-files "RUN heredoc: shell" lint_dockerfile_heredocs "${docker_files[@]}"
 fi
 if [[ ${#make_files[@]} -gt 0 ]]; then

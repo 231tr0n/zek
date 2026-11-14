@@ -25,7 +25,7 @@
       # its Fedora package is orphaned. The toolchain floats :latest on
       # purpose (Dependabot sees none of the go/pip tools, nor the workflow
       # `container:` image), so a toolchain breakage is fixed here by hand.
-      # dockerfmt runs with -i 0 (tabs) in ./lint.sh and ./format.sh so its
+      # dockerfmt runs with -t (tabs) in ./lint.sh and ./format.sh so its
       # RUN heredoc indentation matches shfmt's tab style.
       # prettier resolves via npx (latest in lint.sh); yamlfmt
       # (sigs.k8s.io/yaml) formats the repo YAML files and lints the inline

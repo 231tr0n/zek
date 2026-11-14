@@ -80,7 +80,7 @@ COPY entrypoint.sh /entrypoint.sh
 # and the verdict is advisory. Node checks run first; the :8404 stats
 # fallback is what makes the lb healthy, so a node process bound to :8404
 # can still satisfy it (the verdict stays advisory).
-# The continuation lines stay indented: dockerfmt -i 0 would otherwise
+# The continuation lines stay indented: dockerfmt -t would otherwise
 # unindent them along with the heredoc bodies.
 # dockerfmt-ignore
 HEALTHCHECK --interval=10s --timeout=5s --start-period=120s --retries=3 \

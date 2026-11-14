@@ -9,7 +9,7 @@
 #   format yaml:   yamlfmt -o=kyaml output written back byte for byte
 #                  (*.yml/*.yaml; ./lint.sh compares the repo files to
 #                  exactly this profile)
-#   format Docker: dockerfmt -s -n -i 0 -w (*Dockerfile*)
+#   format Docker: dockerfmt -s -n -t -w (*Dockerfile*)
 #   format Make:   mbake format --config .bake.toml (Makefile)
 #
 # Written to be run directly on a host with the lint toolset. `make format`
@@ -119,7 +119,7 @@ if [[ ${#yaml_files[@]} -gt 0 ]]; then
 	format_yaml "${yaml_files[@]}"
 fi
 if [[ ${#docker_files[@]} -gt 0 ]]; then
-	dockerfmt -s -n -i 0 -w "${docker_files[@]}"
+	dockerfmt -s -n -t -w "${docker_files[@]}"
 fi
 if [[ ${#make_files[@]} -gt 0 ]]; then
 	mbake format --config .bake.toml "${make_files[@]}"
